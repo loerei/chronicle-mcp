@@ -1,0 +1,21 @@
+{
+  "name": "chronicle-mcp",
+  "version": "1.0.0",
+  "description": "Unified session history and local semantic search MCP server",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "node --test dist/__tests__/search.test.js dist/__tests__/SessionParser.test.js dist/__tests__/HistoryStore.test.js dist/__tests__/EmbeddingClient.test.js dist/__tests__/Benchmarking.test.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.1",
+    "js-tiktoken": "^1.0.21"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.3.3"
+  }
+}
