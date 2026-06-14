@@ -5,16 +5,40 @@ description: >
   Use when analyzing previous agent conversations, subagent trees, or failed tool calls.
 ---
 
-Do NOT read raw JSONL log files directly. Use chronicle-mcp tools to access history cleanly.
+# Chronicle MCP History Exploration
 
-## Core Rules
+Do NOT read raw JSONL log files directly. Use chronicle-mcp tools to access history cleanly to avoid context bloat.
 
-1. **Context Bloat Prevention**: Never call `view_file` or filesystem read tools on `transcript.jsonl`, `transcript_full.jsonl`, or Cursor state databases. Doing so is extremely token-inefficient and causes prompt truncation.
-2. **Search First**:
-   - Use `search_history` to query semantic concepts.
-   - Use `search_steps` to find specific keywords, tools, or status codes.
-3. **Inspect Details**:
-   - Use `get_session_details` to read clean conversation markdown.
-   - Use `get_step_details` to inspect raw JSON step details.
-4. **Identify Errors**:
-   - To retrieve failed tool calls or command errors, call `search_steps` with `status: "ERROR"` and `type: "MCP_TOOL"` (or `type: "COMMAND"`).
+## Quick Start
+
+### Find Failed Tool Calls
+To retrieve failed tool calls across history using `search_steps`:
+```json
+{
+  "status": "ERROR",
+  "type": "MCP_TOOL"
+}
+```
+
+### Slice Dialogue History
+To retrieve a clean range of conversation history using `get_session_details`:
+```json
+{
+  "sessionId": "target-session-uuid",
+  "includeToolCalls": false,
+  "startStep": 10,
+  "endStep": 20
+}
+```
+
+## Workflows
+
+### Traversing Agent History
+- [ ] Call `list_sessions` or search with `search_history` to identify relevant previous sessions.
+- [ ] Slice steps via `get_session_details` with `startStep` and `endStep` to inspect logs without exceeding context limits.
+- [ ] If subagents were spawned, look for the `Subagents Spawned` section in the session details and traverse to parent/child IDs.
+
+### Inspecting Errors
+- [ ] Call `search_steps` with `status: "ERROR"` to extract failed executions.
+- [ ] Pass specific `type` filters (e.g., `MCP_TOOL`, `COMMAND`) to narrow down the target.
+- [ ] Use `get_step_details` with `sessionId` and `stepIndex` to inspect the raw JSON and call traces of the failure.
