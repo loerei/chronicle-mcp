@@ -1,0 +1,6 @@
+# Cursor Rules for chronicle-mcp
+
+## History & Session Analysis
+- Do NOT read raw log files (*.jsonl) under brain/ directory directly.
+- Use chronicle-mcp tools (list_sessions, get_session_details, search_steps, get_session_benchmarks, search_history) to retrieve conversation logs and execution steps.
+- To inspect failed tool calls or command errors, call search_steps with status="ERROR" and type="MCP_TOOL" (or "COMMAND").
