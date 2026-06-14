@@ -1,9 +1,9 @@
-# 🤖 Chronicle MCP Agent Guidelines (AGENTS.md)
+# Chronicle MCP Agent Guidelines (AGENTS.md)
 
 > [!IMPORTANT]
 > This file is the source of truth for any agent operating in this repository. All agents must read and strictly adhere to these rules.
 
-## 🎯 Code Intelligence & History Exploration Rules
+## Code Intelligence & History Exploration Rules
 
 ### 1. Do NOT Read Raw Log Files Directly
 - NEVER call `view_file` or filesystem read tools on raw log files (such as `transcript.jsonl`, `transcript_full.jsonl`, or Cursor state SQLite databases).
