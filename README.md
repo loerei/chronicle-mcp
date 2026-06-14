@@ -1,6 +1,10 @@
 # chronicle-mcp
 
-Developer agents operating across multiple workspaces often lack a unified, searchable history of past execution steps, subagent hierarchies, and token usage metrics, leading to redundant context re-explanation and untracked API costs.
+Developer agents operating across multiple sessions and workspaces often struggle to reuse past execution history due to three limitations in raw log analysis:
+
+1. **Context Bloat**: Reading raw JSONL transcripts dumps system metadata, duplicate tool outputs, and execution schemas into the prompt, causing context truncation.
+2. **High Noise Ratio**: Actual developer-agent dialogue is buried within raw JSON logs, requiring parsing to extract clean context.
+3. **No Cross-Session Search**: Finding past solutions or specific execution errors (such as failed tool calls) across multiple workspaces is impossible without reading log files sequentially.
 
 This local Model Context Protocol (MCP) server indexes, synchronizes, and exposes agent conversation logs, tool execution steps, subagent hierarchies, and execution benchmarks from **Antigravity** and **Cursor** workspaces. It provides vector search capabilities, BPE token analysis, and prompt caching simulations over transactional SQLite storage.
 
