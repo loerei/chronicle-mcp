@@ -11,7 +11,7 @@ import os from "node:os";
 import { getStore, getDb } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
 import { getEmbeddingClient } from "./embeddings.js";
-import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks } from "./search.js";
+import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks, getToolUsageStats } from "./search.js";
 
 let activeSync: Promise<void> | null = null;
 let lastSyncTime = 0;
@@ -164,6 +164,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "string",
             description: "Filter sessions by project workspace directory path",
           },
+          scope: {
+            type: "string",
+            enum: ["workspace", "all"],
+            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            default: "all"
+          },
         },
       },
     },
@@ -194,6 +200,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           endStep: {
             type: "number",
             description: "End step index (inclusive) for slicing the history",
+          },
+          excludeContent: {
+            type: "boolean",
+            description: "Whether to exclude large content and thinking fields from retrieved steps to avoid token bloat",
+            default: false,
           },
         },
         required: ["sessionId"],
@@ -266,6 +277,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: "Max number of steps to return",
             default: 10,
           },
+          projectPath: {
+            type: "string",
+            description: "Filter steps by project workspace directory path",
+          },
+          scope: {
+            type: "string",
+            enum: ["workspace", "all"],
+            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            default: "all"
+          },
+          toolName: {
+            type: "string",
+            description: "Filter steps by a specific tool execution name",
+          },
+          serverName: {
+            type: "string",
+            description: "Filter steps by a specific MCP server name",
+          },
+          excludeContent: {
+            type: "boolean",
+            description: "Whether to exclude large content and thinking fields from retrieved steps to avoid token bloat",
+            default: false,
+          },
         },
       },
     },
@@ -288,8 +322,38 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "string",
             description: "Filter matches by project workspace directory path",
           },
+          scope: {
+            type: "string",
+            enum: ["workspace", "all"],
+            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            default: "all"
+          },
         },
         required: ["query"],
+      },
+    },
+    {
+      name: "get_tool_usage_stats",
+      description: "Retrieve tool execution statistics (counts) across recent sessions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "number",
+            description: "Number of recent sessions to analyze",
+            default: 30,
+          },
+          projectPath: {
+            type: "string",
+            description: "Filter sessions by project workspace directory path",
+          },
+          scope: {
+            type: "string",
+            enum: ["workspace", "all"],
+            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            default: "all"
+          },
+        },
       },
     },
     {
@@ -358,11 +422,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const adapter = args?.adapter as string | undefined;
       const limit = (args?.limit as number) || 10;
       const projectPath = args?.projectPath as string | undefined;
+      const scope = args?.scope as "workspace" | "all" | undefined;
 
       const store = getStore();
       const result = store.query({
         adapter,
         projectPath,
+        scope,
         limit
       });
 
@@ -386,18 +452,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-        if (name === "get_session_details") {
+    if (name === "get_session_details") {
       const sessionId = args?.sessionId as string;
       const includeToolCalls = args?.includeToolCalls as boolean | undefined;
       const includeCallResults = args?.includeCallResults as boolean | undefined;
       const startStep = args?.startStep as number | undefined;
       const endStep = args?.endStep as number | undefined;
+      const excludeContent = args?.excludeContent as boolean | undefined;
 
       const details = await getSessionDetailsFromDb(sessionId, {
         includeToolCalls,
         includeCallResults,
         startStep,
         endStep,
+        excludeContent,
       });
 
       if (!details) {
@@ -594,6 +662,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const type = args?.type as string | undefined;
       const status = args?.status as string | undefined;
       const limit = (args?.limit as number) || 10;
+      const projectPath = args?.projectPath as string | undefined;
+      const scope = args?.scope as "workspace" | "all" | undefined;
+      const toolName = args?.toolName as string | undefined;
+      const serverName = args?.serverName as string | undefined;
+      const excludeContent = args?.excludeContent as boolean | undefined;
 
       const store = getStore();
       const result = store.query({
@@ -601,7 +674,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         includeSteps: true,
         stepQuery: queryText,
         stepType: type,
-        stepStatus: status
+        stepStatus: status,
+        projectPath,
+        scope,
+        toolName,
+        serverName,
+        excludeContent
       });
 
       const stepsWithSessionId: any[] = [];
@@ -614,8 +692,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: step.type,
               source: step.source,
               status: step.status,
-              content: step.content ?? null,
-              thinking: step.thinking ?? null,
+              ...(excludeContent ? {} : {
+                content: step.content ?? null,
+                thinking: step.thinking ?? null,
+              }),
               tool_calls: step.toolCalls ?? null,
               created_at: step.createdAt ?? null
             });
@@ -640,17 +720,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const query = args?.query as string;
       const limit = (args?.limit as number) || 5;
       const projectPath = args?.projectPath as string | undefined;
+      const scope = args?.scope as "workspace" | "all" | undefined;
 
       console.error(`[Chronicle MCP] Generating embedding for query: "${query}"`);
       const [queryVector] = await getEmbeddingClient().embed([query]);
 
-      const hits = await searchHistory(queryVector, limit, { projectPath });
+      const hits = await searchHistory(queryVector, limit, { projectPath, scope });
 
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(hits, null, 2),
+          },
+        ],
+      };
+    }
+
+    if (name === "get_tool_usage_stats") {
+      const limit = args?.limit as number | undefined;
+      const projectPath = args?.projectPath as string | undefined;
+      const scope = args?.scope as "workspace" | "all" | undefined;
+
+      const stats = await getToolUsageStats({ limit, projectPath, scope });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(stats, null, 2),
           },
         ],
       };

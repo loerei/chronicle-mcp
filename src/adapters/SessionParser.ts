@@ -19,6 +19,61 @@ function cleanUserRequest(text: string): string {
   return cleaned.trim();
 }
 
+function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
+  for (const call of toolCalls) {
+    if (!call) continue;
+    const args = call.args || call.arguments || {};
+    const pathsToCheck: string[] = [];
+
+    if (args.Cwd && typeof args.Cwd === "string") pathsToCheck.push(args.Cwd);
+    if (args.cwd && typeof args.cwd === "string") pathsToCheck.push(args.cwd);
+    if (args.DirectoryPath && typeof args.DirectoryPath === "string") pathsToCheck.push(args.DirectoryPath);
+    if (args.directoryPath && typeof args.directoryPath === "string") pathsToCheck.push(args.directoryPath);
+
+    if (args.Arguments && typeof args.Arguments === "object") {
+      const nested = args.Arguments;
+      if (nested.Cwd && typeof nested.Cwd === "string") pathsToCheck.push(nested.Cwd);
+      if (nested.cwd && typeof nested.cwd === "string") pathsToCheck.push(nested.cwd);
+      if (nested.DirectoryPath && typeof nested.DirectoryPath === "string") pathsToCheck.push(nested.DirectoryPath);
+      if (nested.directoryPath && typeof nested.directoryPath === "string") pathsToCheck.push(nested.directoryPath);
+      if (nested.target_file && typeof nested.target_file === "string") pathsToCheck.push(nested.target_file);
+      if (nested.TargetFile && typeof nested.TargetFile === "string") pathsToCheck.push(nested.TargetFile);
+      if (nested.AbsolutePath && typeof nested.AbsolutePath === "string") pathsToCheck.push(nested.AbsolutePath);
+      if (nested.SearchPath && typeof nested.SearchPath === "string") pathsToCheck.push(nested.SearchPath);
+    }
+
+    if (args.target_file && typeof args.target_file === "string") pathsToCheck.push(args.target_file);
+    if (args.TargetFile && typeof args.TargetFile === "string") pathsToCheck.push(args.TargetFile);
+    if (args.AbsolutePath && typeof args.AbsolutePath === "string") pathsToCheck.push(args.AbsolutePath);
+    if (args.SearchPath && typeof args.SearchPath === "string") pathsToCheck.push(args.SearchPath);
+
+    for (const p of pathsToCheck) {
+      if (!p) continue;
+      const normalized = p.replaceAll("\\", "/");
+      const projMatch = normalized.match(/^([a-zA-Z]:\/[Pp]rojects\/[a-zA-Z0-9_-]+)/);
+      if (projMatch) {
+        return projMatch[1];
+      }
+
+      const parts = normalized.split("/");
+      if (parts.length >= 3 && parts[0].match(/^[a-zA-Z]:$/)) {
+        if (parts[1].toLowerCase() === "projects" && parts[2]) {
+          return `${parts[0]}/${parts[1]}/${parts[2]}`;
+        }
+        if (parts[1].toLowerCase() === "users" && parts[2] && parts[3]) {
+          if (parts[3] === ".gemini" && parts[4]) {
+            return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
+          }
+          if (parts[3].toLowerCase() === "projects" && parts[4]) {
+            return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export class SessionParser {
   static parseAntigravity(sessionId: string, jsonlContent: string): SessionData | null {
     if (!jsonlContent) return null;
@@ -55,6 +110,12 @@ export class SessionParser {
 
         if (data.tool_calls) {
           stepToolCalls = JSON.stringify(data.tool_calls);
+          if (!projectPath && Array.isArray(data.tool_calls)) {
+            const extracted = extractProjectPathFromToolCalls(data.tool_calls);
+            if (extracted) {
+              projectPath = extracted;
+            }
+          }
         }
 
         steps.push({

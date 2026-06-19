@@ -139,7 +139,7 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         id: "session-steps",
         adapter: "antigravity",
         title: "Steps Test",
-        projectPath: "",
+        projectPath: "d:/projects/test-steps-project",
         createdAt: 1700000000000,
         firstPrompt: "",
         secondPrompt: "",
@@ -149,8 +149,8 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         ],
         steps: [
           { stepIndex: 1, type: "USER_INPUT", source: "USER", status: "DONE", content: "hello world" },
-          { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "ERROR", content: "test failed", thinking: "debugging", toolCalls: "[]" },
-          { stepIndex: 3, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "success" }
+          { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "ERROR", content: "test failed", thinking: "debugging", toolCalls: JSON.stringify([{ name: "memory/read_graph" }]) },
+          { stepIndex: 3, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "success", toolCalls: JSON.stringify([{ name: "other/do_work" }]) }
         ]
       };
 
@@ -178,6 +178,31 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       const resQuery = store.query({ includeSteps: true, sessionId: "session-steps", stepQuery: "fail" });
       assert.strictEqual(resQuery.steps.length, 1);
       assert.strictEqual(resQuery.steps[0].content, "test failed");
+
+      // Filter steps by toolName (TDD Cycle 1)
+      const resTool = store.query({ includeSteps: true, sessionId: "session-steps", toolName: "read_graph" });
+      assert.strictEqual(resTool.steps.length, 1);
+      assert.strictEqual(resTool.steps[0].stepIndex, 2);
+
+      // Filter steps by serverName (TDD Cycle 1)
+      const resServer = store.query({ includeSteps: true, sessionId: "session-steps", serverName: "memory" });
+      assert.strictEqual(resServer.steps.length, 1);
+      assert.strictEqual(resServer.steps[0].stepIndex, 2);
+
+      // Exclude step content/thinking fields (TDD Cycle 2)
+      const resExclude = store.query({ includeSteps: true, sessionId: "session-steps", excludeContent: true });
+      assert.strictEqual(resExclude.steps.length, 3);
+      assert.strictEqual(resExclude.steps[0].content, undefined);
+      assert.strictEqual(resExclude.steps[0].thinking, undefined);
+      assert.strictEqual(resExclude.steps[1].content, undefined);
+      assert.strictEqual(resExclude.steps[1].thinking, undefined);
+
+      // Filter steps by projectPath (TDD Cycle 3)
+      const resProjMatch = store.query({ includeSteps: true, projectPath: "steps-project" });
+      assert.strictEqual(resProjMatch.steps.length, 3);
+
+      const resProjMismatch = store.query({ includeSteps: true, projectPath: "other-project" });
+      assert.strictEqual(resProjMismatch.steps.length, 0);
 
       store.close();
     });
@@ -414,6 +439,71 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       const hit1 = searchRes2.find(h => h.stepIndex === 1);
       assert.ok(hit1);
       assert.ok(Math.abs(hit1.similarity - 1.0) < 0.01);
+
+      store.close();
+    });
+
+    it("should resolve active project path and apply scope workspace filter", () => {
+      const store = storeFactory();
+
+      const session1: SessionData = {
+        id: "session-s1",
+        adapter: "antigravity",
+        title: "Session S1",
+        projectPath: "d:/projects/project-s1",
+        createdAt: 1700000000000,
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [{ stepIndex: 0, text: "Chunk S1" }],
+        steps: [{ stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "S1" }]
+      };
+
+      const session2: SessionData = {
+        id: "session-s2",
+        adapter: "antigravity",
+        title: "Session S2",
+        projectPath: "d:/projects/project-s2",
+        createdAt: 1700000010000, // More recent
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [{ stepIndex: 0, text: "Chunk S2" }],
+        steps: [{ stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "S2" }]
+      };
+
+      const embeddings: SessionEmbeddings = {
+        summary: [0.5, 0.5],
+        chunks: new Map([[0, [0.5, 0.5]]])
+      };
+
+      store.save(session1, embeddings);
+      store.save(session2, embeddings);
+
+      // Verify getActiveProjectPath returns the most recent one (session2)
+      assert.strictEqual(store.getActiveProjectPath(), "d:/projects/project-s2");
+
+      // Query with scope: "workspace" (should resolve to session2's projectPath)
+      const resWorkspace = store.query({ scope: "workspace", includeSteps: true });
+      assert.strictEqual(resWorkspace.sessions.length, 1);
+      assert.strictEqual(resWorkspace.sessions[0].id, "session-s2");
+      assert.strictEqual(resWorkspace.steps.length, 1);
+      assert.strictEqual(resWorkspace.steps[0].content, "S2");
+
+      // Query with scope: "all" or omitted (should return all sessions)
+      const resAll = store.query({ scope: "all", includeSteps: true });
+      assert.ok(resAll.sessions.length >= 2);
+      
+      const resOmitted = store.query({ includeSteps: true });
+      assert.ok(resOmitted.sessions.length >= 2);
+
+      // Explicit projectPath should override/take precedence
+      const resExplicit = store.query({ scope: "workspace", projectPath: "project-s1" });
+      assert.strictEqual(resExplicit.sessions.length, 1);
+      assert.strictEqual(resExplicit.sessions[0].id, "session-s1");
+
+      // Test search with scope: "workspace"
+      const hitsWorkspace = store.search([0.5, 0.5], 10, { scope: "workspace" });
+      assert.ok(hitsWorkspace.length > 0);
+      assert.ok(hitsWorkspace.every(h => h.projectPath === "d:/projects/project-s2"));
 
       store.close();
     });

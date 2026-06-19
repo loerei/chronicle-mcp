@@ -18,7 +18,7 @@ export function dotProduct(a: number[], b: number[]): number {
 export async function searchHistory(
   queryVector: number[],
   limit = 5,
-  options: { projectPath?: string } = {}
+  options: { projectPath?: string; scope?: "workspace" | "all" } = {}
 ): Promise<SearchResult[]> {
   const store = getStore();
   return store.search(queryVector, limit, options);
@@ -31,6 +31,7 @@ export async function getSessionDetailsFromDb(
     includeCallResults?: boolean;
     startStep?: number;
     endStep?: number;
+    excludeContent?: boolean;
   } = {}
 ): Promise<any> {
   const store = getStore();
@@ -39,7 +40,8 @@ export async function getSessionDetailsFromDb(
     sessionId,
     includeSteps,
     startStep: options.startStep,
-    endStep: options.endStep
+    endStep: options.endStep,
+    excludeContent: options.excludeContent
   });
 
   const session = result.sessions[0];
@@ -225,4 +227,42 @@ export async function computeSessionBenchmarks(
   }
 
   return metricsList;
+}
+
+export async function getToolUsageStats(options: { limit?: number; projectPath?: string; scope?: "workspace" | "all" } = {}): Promise<Record<string, number>> {
+  const store = getStore();
+  const limit = options.limit ?? 30;
+  const projectPath = options.projectPath;
+  const scope = options.scope;
+
+  const result = store.query({
+    projectPath,
+    scope,
+    limit,
+    includeSteps: true
+  });
+
+  const stats: Record<string, number> = {};
+
+  for (const step of result.steps) {
+    if (step.toolCalls) {
+      try {
+        const calls = JSON.parse(step.toolCalls);
+        if (Array.isArray(calls)) {
+          for (const call of calls) {
+            let name = call.name || "unknown";
+            if (name === "call_mcp_tool" && call.args) {
+              const server = call.args.ServerName || "unknown";
+              const tool = call.args.ToolName || "unknown";
+              name = `${server}/${tool}`;
+            }
+            name = name.replace(/\\/g, "").replace(/"/g, "").trim();
+            stats[name] = (stats[name] || 0) + 1;
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return stats;
 }

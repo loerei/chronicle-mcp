@@ -4,6 +4,37 @@ import os from "os";
 import fs from "fs";
 import { SessionData, StepData, ChunkData } from "./adapters/types.js";
 
+function matchToolCall(call: any, targetServer?: string, targetTool?: string): boolean {
+  const name = call.name || "";
+  let callServer = "";
+  let callTool = "";
+
+  if (name === "call_mcp_tool" && call.args) {
+    callServer = call.args.ServerName || "";
+    callTool = call.args.ToolName || "";
+  } else {
+    const parts = name.split("/");
+    if (parts.length === 2) {
+      callServer = parts[0];
+      callTool = parts[1];
+    } else {
+      callTool = name;
+    }
+  }
+
+  let matchesTool = true;
+  let matchesServer = true;
+
+  if (targetTool !== undefined) {
+    matchesTool = callTool === targetTool || callTool.endsWith("/" + targetTool) || name === targetTool || name.endsWith("/" + targetTool);
+  }
+  if (targetServer !== undefined) {
+    matchesServer = callServer === targetServer || name.startsWith(targetServer + "/") || name.includes("_" + targetServer + "_");
+  }
+
+  return matchesTool && matchesServer;
+}
+
 const DB_DIR = path.join(os.homedir(), ".config", "chronicle-mcp");
 const DB_PATH = path.join(DB_DIR, "history.db");
 
@@ -129,6 +160,7 @@ export interface QueryOptions {
   sessionId?: string;
   adapter?: string;
   projectPath?: string;
+  scope?: "workspace" | "all";
   startStep?: number;
   endStep?: number;
   stepQuery?: string;
@@ -136,6 +168,9 @@ export interface QueryOptions {
   stepStatus?: string;
   includeSteps?: boolean;
   limit?: number;
+  toolName?: string;
+  serverName?: string;
+  excludeContent?: boolean;
 }
 
 export interface QueryResult {
@@ -157,7 +192,8 @@ export interface SearchResult {
 export interface HistoryStore {
   save(session: SessionData, embeddings: SessionEmbeddings): void;
   query(options: QueryOptions): QueryResult;
-  search(queryVector: number[], limit: number, options?: { projectPath?: string }): SearchResult[];
+  search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[];
+  getActiveProjectPath(): string | undefined;
   close(): void;
 }
 
@@ -267,8 +303,14 @@ export class InMemoryHistoryStore implements HistoryStore {
     if (options.adapter !== undefined) {
       matchedSessions = matchedSessions.filter(s => s.adapter === options.adapter);
     }
-    if (options.projectPath !== undefined) {
-      const pathFilter = options.projectPath.toLowerCase();
+    
+    let resolvedProjectPath = options.projectPath;
+    if (resolvedProjectPath === undefined && options.scope === "workspace") {
+      resolvedProjectPath = this.getActiveProjectPath();
+    }
+
+    if (resolvedProjectPath !== undefined) {
+      const pathFilter = resolvedProjectPath.toLowerCase();
       matchedSessions = matchedSessions.filter(s => 
         s.projectPath && s.projectPath.toLowerCase().includes(pathFilter)
       );
@@ -309,7 +351,23 @@ export class InMemoryHistoryStore implements HistoryStore {
             const toolCallsMatch = step.toolCalls && step.toolCalls.toLowerCase().includes(query);
             if (!contentMatch && !thinkingMatch && !toolCallsMatch) continue;
           }
-          matchedSteps.push({ ...step });
+          if (options.toolName !== undefined || options.serverName !== undefined) {
+            if (!step.toolCalls) continue;
+            try {
+              const calls = JSON.parse(step.toolCalls);
+              if (!Array.isArray(calls)) continue;
+              const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
+              if (!isMatch) continue;
+            } catch {
+              continue;
+            }
+          }
+          const stepCopy = { ...step };
+          if (options.excludeContent) {
+            delete stepCopy.content;
+            delete stepCopy.thinking;
+          }
+          matchedSteps.push(stepCopy);
         }
       }
     }
@@ -336,9 +394,27 @@ export class InMemoryHistoryStore implements HistoryStore {
             const toolCallsMatch = step.toolCalls && step.toolCalls.toLowerCase().includes(query);
             if (!contentMatch && !thinkingMatch && !toolCallsMatch) return false;
           }
+          if (options.toolName !== undefined || options.serverName !== undefined) {
+            if (!step.toolCalls) return false;
+            try {
+              const calls = JSON.parse(step.toolCalls);
+              if (!Array.isArray(calls)) return false;
+              const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
+              if (!isMatch) return false;
+            } catch {
+              return false;
+            }
+          }
           return true;
         })
-        .map(step => ({ ...step })) : undefined;
+        .map(step => {
+          const stepCopy = { ...step };
+          if (options.excludeContent) {
+            delete stepCopy.content;
+            delete stepCopy.thinking;
+          }
+          return stepCopy;
+        }) : undefined;
 
       return {
         id: s.id,
@@ -362,11 +438,16 @@ export class InMemoryHistoryStore implements HistoryStore {
     };
   }
 
-  search(queryVector: number[], limit: number, options?: { projectPath?: string }): SearchResult[] {
+  search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[] {
     let candidateSessions = Array.from(this.sessionsMap.values()).filter(s => s.summary_vector !== undefined);
     
-    if (options?.projectPath) {
-      const pathFilter = options.projectPath.toLowerCase();
+    let resolvedProjectPath = options?.projectPath;
+    if (resolvedProjectPath === undefined && options?.scope === "workspace") {
+      resolvedProjectPath = this.getActiveProjectPath();
+    }
+
+    if (resolvedProjectPath) {
+      const pathFilter = resolvedProjectPath.toLowerCase();
       candidateSessions = candidateSessions.filter(s => 
         s.projectPath && s.projectPath.toLowerCase().includes(pathFilter)
       );
@@ -405,6 +486,13 @@ export class InMemoryHistoryStore implements HistoryStore {
 
     candidateChunks.sort((a, b) => b.similarity - a.similarity);
     return candidateChunks.slice(0, limit);
+  }
+
+  getActiveProjectPath(): string | undefined {
+    const sessions = Array.from(this.sessionsMap.values())
+      .filter(s => s.projectPath)
+      .sort((a, b) => b.createdAt - a.createdAt);
+    return sessions[0]?.projectPath || undefined;
   }
 
   close(): void {}
@@ -565,9 +653,14 @@ export class SqliteHistoryStore implements HistoryStore {
       sessionWhere.push("adapter = ?");
       sessionParams.push(options.adapter);
     }
-    if (options.projectPath !== undefined) {
+    let resolvedProjectPath = options.projectPath;
+    if (resolvedProjectPath === undefined && options.scope === "workspace") {
+      resolvedProjectPath = this.getActiveProjectPath();
+    }
+
+    if (resolvedProjectPath !== undefined) {
       sessionWhere.push("project_path LIKE ?");
-      sessionParams.push(`%${options.projectPath}%`);
+      sessionParams.push(`%${resolvedProjectPath}%`);
     }
 
     if (sessionWhere.length > 0) {
@@ -609,7 +702,9 @@ export class SqliteHistoryStore implements HistoryStore {
 
     let stepsRows: any[] = [];
     if (options.includeSteps) {
-      let stepSql = `SELECT session_id, step_index, type, source, status, content, thinking, tool_calls, created_at FROM session_steps WHERE session_id IN (${placeholders})`;
+      const contentCol = options.excludeContent ? "NULL as content" : "content";
+      const thinkingCol = options.excludeContent ? "NULL as thinking" : "thinking";
+      let stepSql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at FROM session_steps WHERE session_id IN (${placeholders})`;
       const stepParams: any[] = [...sessionIds];
 
       if (options.startStep !== undefined) {
@@ -648,7 +743,6 @@ export class SqliteHistoryStore implements HistoryStore {
 
     const stepsBySession = new Map<string, StepData[]>();
     for (const row of stepsRows) {
-      const sList = stepsBySession.get(row.session_id) || [];
       const step: StepData = {
         stepIndex: row.step_index,
         type: row.type,
@@ -659,6 +753,20 @@ export class SqliteHistoryStore implements HistoryStore {
         toolCalls: row.tool_calls ?? undefined,
         createdAt: row.created_at ?? undefined
       };
+
+      if (options.toolName !== undefined || options.serverName !== undefined) {
+        if (!step.toolCalls) continue;
+        try {
+          const calls = JSON.parse(step.toolCalls);
+          if (!Array.isArray(calls)) continue;
+          const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
+          if (!isMatch) continue;
+        } catch {
+          continue;
+        }
+      }
+
+      const sList = stepsBySession.get(row.session_id) || [];
       sList.push(step);
       stepsBySession.set(row.session_id, sList);
       stepsResult.push(step);
@@ -686,7 +794,7 @@ export class SqliteHistoryStore implements HistoryStore {
     };
   }
 
-  search(queryVector: number[], limit: number, options?: { projectPath?: string }): SearchResult[] {
+  search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[] {
     const db = this.db;
 
     let sessionQuery = `
@@ -695,9 +803,15 @@ export class SqliteHistoryStore implements HistoryStore {
       WHERE summary_vector IS NOT NULL
     `;
     const sessionParams: any[] = [];
-    if (options?.projectPath) {
+    
+    let resolvedProjectPath = options?.projectPath;
+    if (resolvedProjectPath === undefined && options?.scope === "workspace") {
+      resolvedProjectPath = this.getActiveProjectPath();
+    }
+
+    if (resolvedProjectPath) {
       sessionQuery += " AND project_path LIKE ?";
-      sessionParams.push(`%${options.projectPath}%`);
+      sessionParams.push(`%${resolvedProjectPath}%`);
     }
     const sessions = db.prepare(sessionQuery).all(...sessionParams) as any[];
 
@@ -747,6 +861,19 @@ export class SqliteHistoryStore implements HistoryStore {
 
     results.sort((a, b) => b.similarity - a.similarity);
     return results.slice(0, limit);
+  }
+
+  getActiveProjectPath(): string | undefined {
+    try {
+      const row = this.db.prepare(`
+        SELECT project_path FROM sessions 
+        WHERE project_path IS NOT NULL AND project_path != '' 
+        ORDER BY created_at DESC LIMIT 1
+      `).get() as { project_path: string } | undefined;
+      return row?.project_path || undefined;
+    } catch (e) {
+      return undefined;
+    }
   }
 
   close(): void {
