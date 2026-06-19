@@ -27,6 +27,43 @@ export async function syncHistory() {
         // Check if session already indexed
         const checkResult = store.query({ sessionId: s.id });
         if (checkResult.sessions.length > 0) {
+          const existingSession = checkResult.sessions[0];
+          const existingChunkIndices = new Set(existingSession.chunks.map(c => c.stepIndex));
+
+          const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
+          const existingStepIndices = new Set(stepsResult.steps.map(step => step.stepIndex));
+
+          const newChunks = s.chunks.filter(c => !existingChunkIndices.has(c.stepIndex));
+          const newSteps = (s.steps || []).filter(step => !existingStepIndices.has(step.stepIndex));
+
+          if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
+            continue;
+          }
+
+          newCount++;
+          console.error(`[Chronicle MCP] Indexing updates for session: "${s.title}" (${s.id}) - ${newChunks.length} new chunks, ${newSteps.length} new steps`);
+
+          // Recompute summary vector if title or first prompt changed
+          let summaryVector = undefined;
+          if (existingSession.title !== s.title || existingSession.firstPrompt !== s.firstPrompt) {
+            const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
+            [summaryVector] = await getEmbeddingClient().embed([summaryText]);
+          }
+
+          // Compute Level 2 vectors only for the new chunks
+          const chunkVectors = new Map<number, number[]>();
+          if (newChunks.length > 0) {
+            const chunkTexts = newChunks.map(chunk => chunk.text);
+            const vectors = await getEmbeddingClient().embed(chunkTexts);
+            newChunks.forEach((chunk, index) => {
+              chunkVectors.set(chunk.stepIndex, vectors[index]);
+            });
+          }
+
+          store.save(s, {
+            summary: summaryVector,
+            chunks: chunkVectors
+          });
           continue;
         }
 

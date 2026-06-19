@@ -352,6 +352,69 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
       store.close();
     });
+
+    it("should incrementally save additional chunks and steps without overwriting existing ones", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "session-inc",
+        adapter: "antigravity",
+        title: "Incremental Test",
+        projectPath: "",
+        createdAt: 1700000000000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [
+          { stepIndex: 0, text: "Chunk 1" }
+        ],
+        steps: [
+          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "init" }
+        ]
+      };
+
+      store.save(session, {
+        summary: [0.5, 0.5],
+        chunks: new Map([[0, [1.0, 0.0]]])
+      });
+
+      // Save again with additional chunk and step
+      const sessionUpdated: SessionData = {
+        ...session,
+        chunks: [
+          { stepIndex: 0, text: "Chunk 1" },
+          { stepIndex: 1, text: "Chunk 2" }
+        ],
+        steps: [
+          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "init" },
+          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "response" }
+        ]
+      };
+
+      // In incremental save, we only pass vectors for NEW chunks
+      store.save(sessionUpdated, {
+        chunks: new Map([[1, [0.0, 1.0]]])
+      });
+
+      const res = store.query({ sessionId: "session-inc", includeSteps: true });
+      assert.strictEqual(res.chunks.length, 2);
+      assert.strictEqual(res.steps.length, 2);
+      
+      // Verify first chunk vector is preserved (i.e. not empty)
+      const searchRes = store.search([1.0, 0.0], 5);
+      assert.strictEqual(searchRes.length, 2);
+      // The first chunk should match query [1.0, 0.0] with 1.0 similarity
+      const hit0 = searchRes.find(h => h.stepIndex === 0);
+      assert.ok(hit0);
+      assert.ok(Math.abs(hit0.similarity - 1.0) < 0.01);
+
+      // The second chunk should match query [0.0, 1.0] with 1.0 similarity
+      const searchRes2 = store.search([0.0, 1.0], 5);
+      const hit1 = searchRes2.find(h => h.stepIndex === 1);
+      assert.ok(hit1);
+      assert.ok(Math.abs(hit1.similarity - 1.0) < 0.01);
+
+      store.close();
+    });
   });
 }
 
