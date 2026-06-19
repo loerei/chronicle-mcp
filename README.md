@@ -56,14 +56,37 @@ npm run build
 
 ## Client Configuration
 
-Add the server to your MCP client configuration (e.g. Claude Desktop at `%APPDATA%\Claude\claude_desktop_config.json`):
+Add the server to your MCP client configuration (e.g. Claude Desktop at `%APPDATA%\Claude\claude_desktop_config.json`).
+
+### Option 1: Using Command-Line Arguments (recommended)
+Add the `--auto-sync` flag to automate database synchronization before every tool execution. This ensures search queries and session listings always return the most up-to-date data without requiring manual calls to `sync_history`. When active, the manual `sync_history` tool is automatically hidden from the client to simplify the tool schema.
 
 ```json
 {
   "mcpServers": {
     "chronicle-mcp": {
       "command": "node",
-      "args": ["D:/Projects/chronicle-mcp/dist/index.js"]
+      "args": [
+        "D:/Projects/chronicle-mcp/dist/index.js",
+        "--auto-sync"
+      ]
+    }
+  }
+}
+```
+
+### Option 2: Using Environment Variables
+Alternatively, you can enable auto-syncing by setting the `CHRONICLE_AUTO_SYNC` environment variable to `"true"`:
+
+```json
+{
+  "mcpServers": {
+    "chronicle-mcp": {
+      "command": "node",
+      "args": ["D:/Projects/chronicle-mcp/dist/index.js"],
+      "env": {
+        "CHRONICLE_AUTO_SYNC": "true"
+      }
     }
   }
 }
@@ -71,7 +94,7 @@ Add the server to your MCP client configuration (e.g. Claude Desktop at `%APPDAT
 
 ## Tools
 
-- **`sync_history`**: Triggers incremental synchronization of local history logs.
+- **`sync_history`**: Triggers incremental synchronization of local history logs (hidden when auto-sync is active).
 - **`list_sessions`**: Lists synced sessions with optional filter parameters (`adapter`, `projectPath`, `limit`).
 - **`get_session_details`**: Retrieves formatted Markdown of a session's conversation history. Supports range slicing (`startStep`/`endStep`) and optional detailed blocks (`includeToolCalls`, `includeCallResults`).
 - **`get_step_details`**: Retrieves the raw JSON structure of a specific step (including thinking, tool calls, and results).

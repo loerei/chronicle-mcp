@@ -42,6 +42,34 @@ describe("SessionParser Tests", () => {
       assert.strictEqual(session.steps[0].content, "<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\\Projects\\my-project</ADDITIONAL_METADATA>");
     });
 
+    it("should extract projectPath from tool calls if not present in user input", () => {
+      const sessionId = "session-tool-path";
+      const jsonl = [
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "Run build",
+          created_at: "2026-06-14T12:00:00.000Z"
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "Running build...",
+          tool_calls: [{
+            name: "run_command",
+            arguments: {
+              CommandLine: "npm run build",
+              Cwd: "d:\\Projects\\my-cool-project"
+            }
+          }]
+        })
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      assert.strictEqual(session.projectPath, "d:/Projects/my-cool-project");
+    });
+
     it("should combine sequential PLANNER_RESPONSE steps and multiple turns into chunks", () => {
       const sessionId = "session-2";
       const jsonl = [

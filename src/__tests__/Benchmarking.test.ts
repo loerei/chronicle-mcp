@@ -132,4 +132,48 @@ describe("Benchmarking Logic", () => {
     assert.ok(m.peakContextSize > 0);
     assert.ok(m.estimatedOutputTokens > 0);
   });
+
+  it("should calculate tool usage statistics correctly", async () => {
+    const store = new InMemoryHistoryStore();
+    setStore(store);
+
+    const session: SessionData = {
+      id: "stats-session-1",
+      adapter: "antigravity",
+      title: "Stats Session",
+      projectPath: "/projects/stats",
+      createdAt: 1700000000000,
+      firstPrompt: "",
+      secondPrompt: "",
+      chunks: [],
+      steps: [
+        {
+          stepIndex: 1,
+          type: "PLANNER_RESPONSE",
+          source: "MODEL",
+          status: "DONE",
+          toolCalls: JSON.stringify([{ name: "\"memory\"/\"read_graph\"" }, { name: "gitnexus/query" }]),
+          createdAt: 1700000001000
+        },
+        {
+          stepIndex: 2,
+          type: "PLANNER_RESPONSE",
+          source: "MODEL",
+          status: "DONE",
+          toolCalls: JSON.stringify([{ name: "gitnexus/query" }]),
+          createdAt: 1700000002000
+        }
+      ]
+    };
+
+    store.save(session, { summary: [0, 0], chunks: new Map() });
+
+    const { getToolUsageStats } = await import("../search.js");
+    const stats = await getToolUsageStats({ limit: 5, projectPath: "stats" });
+
+    assert.deepStrictEqual(stats, {
+      "memory/read_graph": 1,
+      "gitnexus/query": 2
+    });
+  });
 });
