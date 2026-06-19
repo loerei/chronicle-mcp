@@ -13,49 +13,94 @@ import { ADAPTERS } from "./adapters/index.js";
 import { getEmbeddingClient } from "./embeddings.js";
 import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks } from "./search.js";
 
+let activeSync: Promise<void> | null = null;
+let lastSyncTime = 0;
+const SYNC_COOLDOWN_MS = 5000;
+
+export function isAutoSyncEnabled(): boolean {
+  return (
+    process.env.CHRONICLE_AUTO_SYNC === "true" ||
+    process.argv.includes("--auto-sync")
+  );
+}
+
 // Incremental Indexing function
-export async function syncHistory() {
-  const store = getStore();
-  console.error("[Chronicle MCP] Syncing history from registered adapters...");
+export async function syncHistory(force: boolean = false): Promise<void> {
+  const now = Date.now();
+  if (!force && now - lastSyncTime < SYNC_COOLDOWN_MS) {
+    return;
+  }
 
-  for (const adapter of ADAPTERS) {
-    try {
-      const sessions = await adapter.discoverSessions();
-      let newCount = 0;
+  if (activeSync) {
+    return activeSync;
+  }
 
-      for (const s of sessions) {
-        // Check if session already indexed
-        const checkResult = store.query({ sessionId: s.id });
-        if (checkResult.sessions.length > 0) {
-          const existingSession = checkResult.sessions[0];
-          const existingChunkIndices = new Set(existingSession.chunks.map(c => c.stepIndex));
+  activeSync = (async () => {
+    const store = getStore();
+    console.error("[Chronicle MCP] Syncing history from registered adapters...");
 
-          const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
-          const existingStepIndices = new Set(stepsResult.steps.map(step => step.stepIndex));
+    for (const adapter of ADAPTERS) {
+      try {
+        const sessions = await adapter.discoverSessions();
+        let newCount = 0;
 
-          const newChunks = s.chunks.filter(c => !existingChunkIndices.has(c.stepIndex));
-          const newSteps = (s.steps || []).filter(step => !existingStepIndices.has(step.stepIndex));
+        for (const s of sessions) {
+          // Check if session already indexed
+          const checkResult = store.query({ sessionId: s.id });
+          if (checkResult.sessions.length > 0) {
+            const existingSession = checkResult.sessions[0];
+            const existingChunkIndices = new Set(existingSession.chunks.map(c => c.stepIndex));
 
-          if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
+            const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
+            const existingStepIndices = new Set(stepsResult.steps.map(step => step.stepIndex));
+
+            const newChunks = s.chunks.filter(c => !existingChunkIndices.has(c.stepIndex));
+            const newSteps = (s.steps || []).filter(step => !existingStepIndices.has(step.stepIndex));
+
+            if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
+              continue;
+            }
+
+            newCount++;
+            console.error(`[Chronicle MCP] Indexing updates for session: "${s.title}" (${s.id}) - ${newChunks.length} new chunks, ${newSteps.length} new steps`);
+
+            // Recompute summary vector if title or first prompt changed
+            let summaryVector = undefined;
+            if (existingSession.title !== s.title || existingSession.firstPrompt !== s.firstPrompt) {
+              const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
+              [summaryVector] = await getEmbeddingClient().embed([summaryText]);
+            }
+
+            // Compute Level 2 vectors only for the new chunks
+            const chunkVectors = new Map<number, number[]>();
+            if (newChunks.length > 0) {
+              const chunkTexts = newChunks.map(chunk => chunk.text);
+              const vectors = await getEmbeddingClient().embed(chunkTexts);
+              newChunks.forEach((chunk, index) => {
+                chunkVectors.set(chunk.stepIndex, vectors[index]);
+              });
+            }
+
+            store.save(s, {
+              summary: summaryVector,
+              chunks: chunkVectors
+            });
             continue;
           }
 
           newCount++;
-          console.error(`[Chronicle MCP] Indexing updates for session: "${s.title}" (${s.id}) - ${newChunks.length} new chunks, ${newSteps.length} new steps`);
+          console.error(`[Chronicle MCP] Indexing new session: "${s.title}" (${s.id})`);
 
-          // Recompute summary vector if title or first prompt changed
-          let summaryVector = undefined;
-          if (existingSession.title !== s.title || existingSession.firstPrompt !== s.firstPrompt) {
-            const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
-            [summaryVector] = await getEmbeddingClient().embed([summaryText]);
-          }
+          // Compute Level 1 vector (Session identity)
+          const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
+          const [summaryVector] = await getEmbeddingClient().embed([summaryText]);
 
-          // Compute Level 2 vectors only for the new chunks
+          // Compute Level 2 vectors (Granular turns)
           const chunkVectors = new Map<number, number[]>();
-          if (newChunks.length > 0) {
-            const chunkTexts = newChunks.map(chunk => chunk.text);
+          if (s.chunks.length > 0) {
+            const chunkTexts = s.chunks.map(chunk => chunk.text);
             const vectors = await getEmbeddingClient().embed(chunkTexts);
-            newChunks.forEach((chunk, index) => {
+            s.chunks.forEach((chunk, index) => {
               chunkVectors.set(chunk.stepIndex, vectors[index]);
             });
           }
@@ -64,40 +109,24 @@ export async function syncHistory() {
             summary: summaryVector,
             chunks: chunkVectors
           });
-          continue;
         }
 
-        newCount++;
-        console.error(`[Chronicle MCP] Indexing new session: "${s.title}" (${s.id})`);
-
-        // Compute Level 1 vector (Session identity)
-        const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
-        const [summaryVector] = await getEmbeddingClient().embed([summaryText]);
-
-        // Compute Level 2 vectors (Granular turns)
-        const chunkVectors = new Map<number, number[]>();
-        if (s.chunks.length > 0) {
-          const chunkTexts = s.chunks.map(chunk => chunk.text);
-          const vectors = await getEmbeddingClient().embed(chunkTexts);
-          s.chunks.forEach((chunk, index) => {
-            chunkVectors.set(chunk.stepIndex, vectors[index]);
-          });
+        if (newCount > 0) {
+          console.error(`[Chronicle MCP] Indexed ${newCount} new sessions from adapter "${adapter.name}".`);
         }
-
-        store.save(s, {
-          summary: summaryVector,
-          chunks: chunkVectors
-        });
+      } catch (e: any) {
+        console.error(`[Chronicle MCP] Adapter "${adapter.name}" failed:`, e.message);
       }
-
-      if (newCount > 0) {
-        console.error(`[Chronicle MCP] Indexed ${newCount} new sessions from adapter "${adapter.name}".`);
-      }
-    } catch (e: any) {
-      console.error(`[Chronicle MCP] Adapter "${adapter.name}" failed:`, e.message);
     }
+    console.error("[Chronicle MCP] Sync completed!");
+    lastSyncTime = Date.now();
+  })();
+
+  try {
+    await activeSync;
+  } finally {
+    activeSync = null;
   }
-  console.error("[Chronicle MCP] Sync completed!");
 }
 
 // Initialize MCP Server
@@ -115,203 +144,206 @@ const server = new Server(
 
 // Register Tool Definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "list_sessions",
-        description: "List all indexed conversations and development sessions across adapters.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            adapter: {
-              type: "string",
-              description: "Filter by adapter type: 'antigravity' or 'cursor'",
-            },
-            limit: {
-              type: "number",
-              description: "Max number of sessions to return",
-              default: 10,
-            },
-            projectPath: {
-              type: "string",
-              description: "Filter sessions by project workspace directory path",
-            },
+  const tools: any[] = [
+    {
+      name: "list_sessions",
+      description: "List all indexed conversations and development sessions across adapters.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          adapter: {
+            type: "string",
+            description: "Filter by adapter type: 'antigravity' or 'cursor'",
+          },
+          limit: {
+            type: "number",
+            description: "Max number of sessions to return",
+            default: 10,
+          },
+          projectPath: {
+            type: "string",
+            description: "Filter sessions by project workspace directory path",
           },
         },
       },
-      {
-        name: "get_session_details",
-        description: "Retrieve details and conversational history/turns of a specific session.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sessionId: {
-              type: "string",
-              description: "UUID or unique ID of the session",
-            },
-            includeToolCalls: {
-              type: "boolean",
-              description: "Whether to include tool calls in the conversational history",
-              default: false,
-            },
-            includeCallResults: {
-              type: "boolean",
-              description: "Whether to include tool calls AND their execution results in the history",
-              default: false,
-            },
-            startStep: {
-              type: "number",
-              description: "Start step index (inclusive) for slicing the history",
-            },
-            endStep: {
-              type: "number",
-              description: "End step index (inclusive) for slicing the history",
-            },
+    },
+    {
+      name: "get_session_details",
+      description: "Retrieve details and conversational history/turns of a specific session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sessionId: {
+            type: "string",
+            description: "UUID or unique ID of the session",
           },
-          required: ["sessionId"],
-        },
-      },
-      {
-        name: "get_step_details",
-        description: "Retrieve detailed execution information for specific steps (e.g., tool calls, tool results/contents, thinking) in a session.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sessionId: {
-              type: "string",
-              description: "UUID or unique ID of the session",
-            },
-            stepIndex: {
-              type: "number",
-              description: "Index of a single step to retrieve",
-            },
-            startStep: {
-              type: "number",
-              description: "Start step index (inclusive) for range retrieval",
-            },
-            endStep: {
-              type: "number",
-              description: "End step index (inclusive) for range retrieval",
-            },
+          includeToolCalls: {
+            type: "boolean",
+            description: "Whether to include tool calls in the conversational history",
+            default: false,
           },
-          required: ["sessionId"],
-        },
-      },
-      {
-        name: "get_session_artifacts",
-        description: "Retrieve local markdown artifacts (walkthrough.md, implementation_plan.md, task.md) for a completed session.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sessionId: {
-              type: "string",
-              description: "UUID or unique ID of the session",
-            },
+          includeCallResults: {
+            type: "boolean",
+            description: "Whether to include tool calls AND their execution results in the history",
+            default: false,
           },
-          required: ["sessionId"],
-        },
-      },
-      {
-        name: "search_steps",
-        description: "Search for specific terms, tool calls, or errors across all indexed steps.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Text keyword to look for in content, thinking, or tool calls",
-            },
-            sessionId: {
-              type: "string",
-              description: "Restrict search to this specific session ID",
-            },
-            type: {
-              type: "string",
-              description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND)",
-            },
-            status: {
-              type: "string",
-              description: "Filter by step execution status (e.g. DONE, ERROR)",
-            },
-            limit: {
-              type: "number",
-              description: "Max number of steps to return",
-              default: 10,
-            },
+          startStep: {
+            type: "number",
+            description: "Start step index (inclusive) for slicing the history",
+          },
+          endStep: {
+            type: "number",
+            description: "End step index (inclusive) for slicing the history",
           },
         },
+        required: ["sessionId"],
       },
-      {
-        name: "search_history",
-        description: "Perform local semantic vector search across past sessions and individual turns.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Search text or topic (e.g. 'snapping threshold')",
-            },
-            limit: {
-              type: "number",
-              description: "Max number of matching chunks to return",
-              default: 5,
-            },
-            projectPath: {
-              type: "string",
-              description: "Filter matches by project workspace directory path",
-            },
+    },
+    {
+      name: "get_step_details",
+      description: "Retrieve detailed execution information for specific steps (e.g., tool calls, tool results/contents, thinking) in a session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sessionId: {
+            type: "string",
+            description: "UUID or unique ID of the session",
           },
-          required: ["query"],
+          stepIndex: {
+            type: "number",
+            description: "Index of a single step to retrieve",
+          },
+          startStep: {
+            type: "number",
+            description: "Start step index (inclusive) for range retrieval",
+          },
+          endStep: {
+            type: "number",
+            description: "End step index (inclusive) for range retrieval",
+          },
+        },
+        required: ["sessionId"],
+      },
+    },
+    {
+      name: "get_session_artifacts",
+      description: "Retrieve local markdown artifacts (walkthrough.md, implementation_plan.md, task.md) for a completed session.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sessionId: {
+            type: "string",
+            description: "UUID or unique ID of the session",
+          },
+        },
+        required: ["sessionId"],
+      },
+    },
+    {
+      name: "search_steps",
+      description: "Search for specific terms, tool calls, or errors across all indexed steps.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Text keyword to look for in content, thinking, or tool calls",
+          },
+          sessionId: {
+            type: "string",
+            description: "Restrict search to this specific session ID",
+          },
+          type: {
+            type: "string",
+            description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND)",
+          },
+          status: {
+            type: "string",
+            description: "Filter by step execution status (e.g. DONE, ERROR)",
+          },
+          limit: {
+            type: "number",
+            description: "Max number of steps to return",
+            default: 10,
+          },
         },
       },
-      {
-        name: "get_session_benchmarks",
-        description: "Calculate and compare execution metrics (duration, tool calls, and standard token counts) across one or more sessions.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            sessionIds: {
-              type: "array",
-              items: {
-                type: "string",
-              },
-              description: "List of session IDs to benchmark.",
+    },
+    {
+      name: "search_history",
+      description: "Perform local semantic vector search across past sessions and individual turns.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Search text or topic (e.g. 'snapping threshold')",
+          },
+          limit: {
+            type: "number",
+            description: "Max number of matching chunks to return",
+            default: 5,
+          },
+          projectPath: {
+            type: "string",
+            description: "Filter matches by project workspace directory path",
+          },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "get_session_benchmarks",
+      description: "Calculate and compare execution metrics (duration, tool calls, and standard token counts) across one or more sessions.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sessionIds: {
+            type: "array",
+            items: {
+              type: "string",
             },
-            groups: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  name: {
-                    type: "string",
-                    description: "Name of the group (e.g. 'Group A')",
-                  },
-                  sessionIds: {
-                    type: "array",
-                    items: {
-                      type: "string",
-                    },
-                    description: "List of session IDs in this group.",
-                  },
+            description: "List of session IDs to benchmark.",
+          },
+          groups: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                name: {
+                  type: "string",
+                  description: "Name of the group (e.g. 'Group A')",
                 },
-                required: ["name", "sessionIds"],
+                sessionIds: {
+                  type: "array",
+                  items: {
+                    type: "string",
+                  },
+                  description: "List of session IDs in this group.",
+                },
               },
-              description: "Optional grouping of sessions to compare aggregated averages.",
+              required: ["name", "sessionIds"],
             },
+            description: "Optional grouping of sessions to compare aggregated averages.",
           },
-          required: ["sessionIds"],
         },
+        required: ["sessionIds"],
       },
-      {
-        name: "sync_history",
-        description: "Scan local filesystem for new session logs and index them incrementally.",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
+    }
+  ];
+
+  if (!isAutoSyncEnabled()) {
+    tools.push({
+      name: "sync_history",
+      description: "Scan local filesystem for new session logs and index them incrementally.",
+      inputSchema: {
+        type: "object",
+        properties: {},
       },
-    ],
-  };
+    });
+  }
+
+  return { tools };
 });
 
 // Handle Tool Calls
@@ -319,6 +351,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
+    if (isAutoSyncEnabled() && name !== "sync_history") {
+      await syncHistory();
+    }
     if (name === "list_sessions") {
       const adapter = args?.adapter as string | undefined;
       const limit = (args?.limit as number) || 10;
@@ -715,7 +750,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === "sync_history") {
-      await syncHistory();
+      await syncHistory(true);
       return {
         content: [
           {
