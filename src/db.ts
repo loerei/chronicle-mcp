@@ -121,7 +121,7 @@ export function getDb(): DatabaseSync {
 }
 
 export interface SessionEmbeddings {
-  summary: number[];
+  summary?: number[];
   chunks: Map<number, number[]>; // maps stepIndex -> chunkVector
 }
 
@@ -186,6 +186,7 @@ export class InMemoryHistoryStore implements HistoryStore {
       }
     }
     
+    const existingSession = this.sessionsMap.get(sessionId);
     const sessionCopy = {
       id: session.id,
       adapter: session.adapter,
@@ -196,17 +197,25 @@ export class InMemoryHistoryStore implements HistoryStore {
       secondPrompt: session.secondPrompt,
       parentId,
       subagentIds: session.subagentIds || [],
-      summary_vector: embeddings.summary ? [...embeddings.summary] : undefined
+      summary_vector: embeddings.summary
+        ? [...embeddings.summary]
+        : (existingSession ? (existingSession as any).summary_vector : undefined)
     };
 
     const chunksCopy: Array<ChunkData & { chunk_vector: number[] }> = [];
+    const existingChunks = this.chunksMap.get(sessionId) || [];
+    const chunksByStepIndex = new Map(existingChunks.map(c => [c.stepIndex, c]));
+
     const seenChunkIndexes = new Set<number>();
     for (const chunk of session.chunks) {
       if (seenChunkIndexes.has(chunk.stepIndex)) {
         continue;
       }
       seenChunkIndexes.add(chunk.stepIndex);
-      const vec = embeddings.chunks.get(chunk.stepIndex) || [];
+      
+      const existingChunk = chunksByStepIndex.get(chunk.stepIndex);
+      const vec = embeddings.chunks.get(chunk.stepIndex) || (existingChunk ? existingChunk.chunk_vector : []);
+      
       chunksCopy.push({
         stepIndex: chunk.stepIndex,
         text: chunk.text,
@@ -473,12 +482,18 @@ export class SqliteHistoryStore implements HistoryStore {
         }
       }
 
-      db.prepare("DELETE FROM sessions WHERE id = ?").run(session.id);
-
       const summaryStr = embeddings.summary ? JSON.stringify(embeddings.summary) : null;
       db.prepare(`
         INSERT INTO sessions (id, adapter, title, project_path, created_at, first_prompt, second_prompt, summary_vector, parent_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          title = excluded.title,
+          project_path = excluded.project_path,
+          created_at = excluded.created_at,
+          first_prompt = excluded.first_prompt,
+          second_prompt = excluded.second_prompt,
+          summary_vector = COALESCE(excluded.summary_vector, summary_vector),
+          parent_id = COALESCE(excluded.parent_id, parent_id)
       `).run(
         session.id,
         session.adapter,
