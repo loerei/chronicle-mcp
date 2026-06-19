@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert";
 import { 
   InMemoryHistoryStore, 
@@ -7,6 +7,8 @@ import {
   SessionEmbeddings
 } from "../db.js";
 import { SessionData, StepData, ChunkData } from "../adapters/types.js";
+import { syncHistory, isAutoSyncEnabled } from "../index.js";
+import { ADAPTERS } from "../adapters/index.js";
 
 function runTestSuite(name: string, storeFactory: () => HistoryStore) {
   describe(`HistoryStore - ${name}`, () => {
@@ -420,3 +422,58 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
 runTestSuite("InMemoryHistoryStore", () => new InMemoryHistoryStore());
 runTestSuite("SqliteHistoryStore", () => new SqliteHistoryStore(":memory:"));
+
+describe("syncHistory auto-sync and coalescing", () => {
+  let originalDiscover0: any;
+  let originalDiscover1: any;
+
+  before(() => {
+    originalDiscover0 = ADAPTERS[0].discoverSessions;
+    originalDiscover1 = ADAPTERS[1].discoverSessions;
+  });
+
+  after(() => {
+    ADAPTERS[0].discoverSessions = originalDiscover0;
+    ADAPTERS[1].discoverSessions = originalDiscover1;
+  });
+
+  it("should coalesce concurrent syncHistory calls and respect cooldown", async () => {
+    let callCount = 0;
+    ADAPTERS[0].discoverSessions = async () => {
+      callCount++;
+      // Simulate delay
+      await new Promise(resolve => setTimeout(resolve, 50));
+      return [];
+    };
+    ADAPTERS[1].discoverSessions = async () => [];
+
+    // Trigger two concurrent syncs
+    const p1 = syncHistory(true); // Force bypasses cooldown
+    const p2 = syncHistory(true); // Also concurrent, should coalesce
+
+    await Promise.all([p1, p2]);
+
+    // Should only have called discoverSessions once because of coalescing
+    assert.strictEqual(callCount, 1);
+
+    // Now call again WITHOUT force - should be within the 5-second cooldown and not call discoverSessions again
+    await syncHistory();
+    assert.strictEqual(callCount, 1);
+
+    // Call again WITH force - should bypass cooldown and call discoverSessions
+    await syncHistory(true);
+    assert.strictEqual(callCount, 2);
+  });
+
+  it("should return correct status for isAutoSyncEnabled", () => {
+    const originalEnv = process.env.CHRONICLE_AUTO_SYNC;
+    
+    process.env.CHRONICLE_AUTO_SYNC = "true";
+    assert.strictEqual(isAutoSyncEnabled(), true);
+
+    process.env.CHRONICLE_AUTO_SYNC = "false";
+    assert.strictEqual(isAutoSyncEnabled(), false);
+
+    process.env.CHRONICLE_AUTO_SYNC = originalEnv;
+  });
+});
