@@ -147,13 +147,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools: any[] = [
     {
       name: "list_sessions",
-      description: "List all indexed conversations and development sessions across adapters.",
+      description: "List indexed development sessions.",
       inputSchema: {
         type: "object",
         properties: {
           adapter: {
             type: "string",
-            description: "Filter by adapter type: 'antigravity' or 'cursor'",
+            description: "Filter sessions by adapter: 'antigravity' or 'cursor'.",
           },
           limit: {
             type: "number",
@@ -162,12 +162,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           projectPath: {
             type: "string",
-            description: "Filter sessions by project workspace directory path",
+            description: "Filter sessions by absolute workspace path.",
           },
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
             default: "all"
           },
         },
@@ -175,35 +175,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "get_session_details",
-      description: "Retrieve details and conversational history/turns of a specific session.",
+      description: "Retrieve conversational history and steps of a specific session.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: {
             type: "string",
-            description: "UUID or unique ID of the session",
+            description: "Unique session ID.",
           },
           includeToolCalls: {
             type: "boolean",
-            description: "Whether to include tool calls in the conversational history",
+            description: "Include tool calls in the history.",
             default: false,
           },
           includeCallResults: {
             type: "boolean",
-            description: "Whether to include tool calls AND their execution results in the history",
+            description: "Include tool calls and their execution results.",
             default: false,
           },
           startStep: {
             type: "number",
-            description: "Start step index (inclusive) for slicing the history",
+            description: "Start step index (inclusive) for slicing history.",
           },
           endStep: {
             type: "number",
-            description: "End step index (inclusive) for slicing the history",
+            description: "End step index (inclusive) for slicing history.",
           },
           excludeContent: {
             type: "boolean",
-            description: "Whether to exclude large content and thinking fields from retrieved steps to avoid token bloat",
+            description: "Exclude content and thinking fields to prevent token bloat.",
             default: false,
           },
         },
@@ -212,25 +212,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "get_step_details",
-      description: "Retrieve detailed execution information for specific steps (e.g., tool calls, tool results/contents, thinking) in a session.",
+      description: "Retrieve content, thinking, and tool execution details for specific step indexes in a session.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: {
             type: "string",
-            description: "UUID or unique ID of the session",
+            description: "Unique session ID.",
           },
           stepIndex: {
             type: "number",
-            description: "Index of a single step to retrieve",
+            description: "Index of a single step to retrieve.",
           },
           startStep: {
             type: "number",
-            description: "Start step index (inclusive) for range retrieval",
+            description: "Start step index (inclusive) for range retrieval.",
           },
           endStep: {
             type: "number",
-            description: "End step index (inclusive) for range retrieval",
+            description: "End step index (inclusive) for range retrieval.",
           },
         },
         required: ["sessionId"],
@@ -238,13 +238,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "get_session_artifacts",
-      description: "Retrieve local markdown artifacts (walkthrough.md, implementation_plan.md, task.md) for a completed session.",
+      description: "Retrieve markdown artifacts (walkthrough.md, implementation_plan.md, task.md) for a session.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: {
             type: "string",
-            description: "UUID or unique ID of the session",
+            description: "Unique session ID.",
           },
         },
         required: ["sessionId"],
@@ -252,25 +252,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "search_steps",
-      description: "Search for specific terms, tool calls, or errors across all indexed steps.",
+      description: "Search across indexed steps by text query, step type, status, or tool name.",
       inputSchema: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "Text keyword to look for in content, thinking, or tool calls",
+            description: "Text query to find in content, thinking, or tool calls.",
           },
           sessionId: {
             type: "string",
-            description: "Restrict search to this specific session ID",
+            description: "Filter by session ID.",
           },
           type: {
             type: "string",
-            description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND)",
+            description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND).",
           },
           status: {
             type: "string",
-            description: "Filter by step execution status (e.g. DONE, ERROR)",
+            description: "Filter by step status (e.g. DONE, ERROR).",
           },
           limit: {
             type: "number",
@@ -279,25 +279,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           projectPath: {
             type: "string",
-            description: "Filter steps by project workspace directory path",
+            description: "Filter by absolute workspace path.",
           },
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
             default: "all"
           },
           toolName: {
             type: "string",
-            description: "Filter steps by a specific tool execution name",
+            description: "Filter by executed tool name.",
           },
           serverName: {
             type: "string",
-            description: "Filter steps by a specific MCP server name",
+            description: "Filter by MCP server name.",
           },
           excludeContent: {
             type: "boolean",
-            description: "Whether to exclude large content and thinking fields from retrieved steps to avoid token bloat",
+            description: "Exclude content and thinking fields to prevent token bloat.",
             default: false,
           },
         },
@@ -305,13 +305,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "search_history",
-      description: "Perform local semantic vector search across past sessions and individual turns.",
+      description: "Perform semantic search across past sessions and turns.",
       inputSchema: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "Search text or topic (e.g. 'snapping threshold')",
+            description: "Natural language query or topic.",
           },
           limit: {
             type: "number",
@@ -320,12 +320,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           projectPath: {
             type: "string",
-            description: "Filter matches by project workspace directory path",
+            description: "Filter by absolute workspace path.",
           },
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
             default: "all"
           },
         },
@@ -345,12 +345,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           projectPath: {
             type: "string",
-            description: "Filter sessions by project workspace directory path",
+            description: "Filter by absolute workspace path.",
           },
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope. Use 'workspace' to automatically filter results to the current active project workspace. Use 'all' (default) to search globally across all sessions.",
+            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
             default: "all"
           },
         },
@@ -358,7 +358,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "get_session_benchmarks",
-      description: "Calculate and compare execution metrics (duration, tool calls, and standard token counts) across one or more sessions.",
+      description: "Compare duration, tool calls, token usage, and errors across sessions.",
       inputSchema: {
         type: "object",
         properties: {
@@ -367,7 +367,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             items: {
               type: "string",
             },
-            description: "List of session IDs to benchmark.",
+            description: "Session IDs to benchmark.",
           },
           groups: {
             type: "array",
@@ -383,12 +383,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                   items: {
                     type: "string",
                   },
-                  description: "List of session IDs in this group.",
+                  description: "Session IDs to compare.",
                 },
               },
               required: ["name", "sessionIds"],
             },
-            description: "Optional grouping of sessions to compare aggregated averages.",
+            description: "Groups of session IDs to compare aggregated averages.",
           },
         },
         required: ["sessionIds"],
@@ -399,7 +399,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!isAutoSyncEnabled()) {
     tools.push({
       name: "sync_history",
-      description: "Scan local filesystem for new session logs and index them incrementally.",
+      description: "Index new session logs.",
       inputSchema: {
         type: "object",
         properties: {},
