@@ -17,11 +17,79 @@ let activeSync: Promise<void> | null = null;
 let lastSyncTime = 0;
 const SYNC_COOLDOWN_MS = 5000;
 
+type ScopeType = "workspace" | "all";
+
 export function isAutoSyncEnabled(): boolean {
   return (
     process.env.CHRONICLE_AUTO_SYNC === "true" ||
     process.argv.includes("--auto-sync")
   );
+}
+
+async function syncSingleSession(s: any, store: any): Promise<boolean> {
+  // Check if session already indexed
+  const checkResult = store.query({ sessionId: s.id });
+  if (checkResult.sessions.length > 0) {
+    const existingSession = checkResult.sessions[0];
+    const existingChunkIndices = new Set(existingSession.chunks.map((c: any) => c.stepIndex));
+
+    const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
+    const existingStepIndices = new Set(stepsResult.steps.map((step: any) => step.stepIndex));
+
+    const newChunks = s.chunks.filter((c: any) => !existingChunkIndices.has(c.stepIndex));
+    const newSteps = (s.steps || []).filter((step: any) => !existingStepIndices.has(step.stepIndex));
+
+    if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
+      return false;
+    }
+
+    console.error(`[Chronicle MCP] Indexing updates for session: "${s.title}" (${s.id}) - ${newChunks.length} new chunks, ${newSteps.length} new steps`);
+
+    // Recompute summary vector if title or first prompt changed
+    let summaryVector = undefined;
+    if (existingSession.title !== s.title || existingSession.firstPrompt !== s.firstPrompt) {
+      const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
+      [summaryVector] = await getEmbeddingClient().embed([summaryText]);
+    }
+
+    // Compute Level 2 vectors only for the new chunks
+    const chunkVectors = new Map<number, number[]>();
+    if (newChunks.length > 0) {
+      const chunkTexts = newChunks.map((chunk: any) => chunk.text);
+      const vectors = await getEmbeddingClient().embed(chunkTexts);
+      newChunks.forEach((chunk: any, index: number) => {
+        chunkVectors.set(chunk.stepIndex, vectors[index]);
+      });
+    }
+
+    store.save(s, {
+      summary: summaryVector,
+      chunks: chunkVectors
+    });
+    return true;
+  }
+
+  console.error(`[Chronicle MCP] Indexing new session: "${s.title}" (${s.id})`);
+
+  // Compute Level 1 vector (Session identity)
+  const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
+  const [summaryVector] = await getEmbeddingClient().embed([summaryText]);
+
+  // Compute Level 2 vectors (Granular turns)
+  const chunkVectors = new Map<number, number[]>();
+  if (s.chunks.length > 0) {
+    const chunkTexts = s.chunks.map((chunk: any) => chunk.text);
+    const vectors = await getEmbeddingClient().embed(chunkTexts);
+    s.chunks.forEach((chunk: any, index: number) => {
+      chunkVectors.set(chunk.stepIndex, vectors[index]);
+    });
+  }
+
+  store.save(s, {
+    summary: summaryVector,
+    chunks: chunkVectors
+  });
+  return true;
 }
 
 // Incremental Indexing function
@@ -45,70 +113,10 @@ export async function syncHistory(force: boolean = false): Promise<void> {
         let newCount = 0;
 
         for (const s of sessions) {
-          // Check if session already indexed
-          const checkResult = store.query({ sessionId: s.id });
-          if (checkResult.sessions.length > 0) {
-            const existingSession = checkResult.sessions[0];
-            const existingChunkIndices = new Set(existingSession.chunks.map(c => c.stepIndex));
-
-            const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
-            const existingStepIndices = new Set(stepsResult.steps.map(step => step.stepIndex));
-
-            const newChunks = s.chunks.filter(c => !existingChunkIndices.has(c.stepIndex));
-            const newSteps = (s.steps || []).filter(step => !existingStepIndices.has(step.stepIndex));
-
-            if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
-              continue;
-            }
-
+          const didSync = await syncSingleSession(s, store);
+          if (didSync) {
             newCount++;
-            console.error(`[Chronicle MCP] Indexing updates for session: "${s.title}" (${s.id}) - ${newChunks.length} new chunks, ${newSteps.length} new steps`);
-
-            // Recompute summary vector if title or first prompt changed
-            let summaryVector = undefined;
-            if (existingSession.title !== s.title || existingSession.firstPrompt !== s.firstPrompt) {
-              const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
-              [summaryVector] = await getEmbeddingClient().embed([summaryText]);
-            }
-
-            // Compute Level 2 vectors only for the new chunks
-            const chunkVectors = new Map<number, number[]>();
-            if (newChunks.length > 0) {
-              const chunkTexts = newChunks.map(chunk => chunk.text);
-              const vectors = await getEmbeddingClient().embed(chunkTexts);
-              newChunks.forEach((chunk, index) => {
-                chunkVectors.set(chunk.stepIndex, vectors[index]);
-              });
-            }
-
-            store.save(s, {
-              summary: summaryVector,
-              chunks: chunkVectors
-            });
-            continue;
           }
-
-          newCount++;
-          console.error(`[Chronicle MCP] Indexing new session: "${s.title}" (${s.id})`);
-
-          // Compute Level 1 vector (Session identity)
-          const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
-          const [summaryVector] = await getEmbeddingClient().embed([summaryText]);
-
-          // Compute Level 2 vectors (Granular turns)
-          const chunkVectors = new Map<number, number[]>();
-          if (s.chunks.length > 0) {
-            const chunkTexts = s.chunks.map(chunk => chunk.text);
-            const vectors = await getEmbeddingClient().embed(chunkTexts);
-            s.chunks.forEach((chunk, index) => {
-              chunkVectors.set(chunk.stepIndex, vectors[index]);
-            });
-          }
-
-          store.save(s, {
-            summary: summaryVector,
-            chunks: chunkVectors
-          });
         }
 
         if (newCount > 0) {
@@ -422,7 +430,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const adapter = args?.adapter as string | undefined;
       const limit = (args?.limit as number) || 10;
       const projectPath = args?.projectPath as string | undefined;
-      const scope = args?.scope as "workspace" | "all" | undefined;
+      const scope = args?.scope as ScopeType | undefined;
 
       const store = getStore();
       const result = store.query({
@@ -517,13 +525,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 md += `**Tool Calls**: ${step.tool_calls}\n\n`;
               }
             }
-          } else {
-            if (includeCallResults) {
-              md += `### Step ${step.step_index} (${step.type})\n`;
-              md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
-              if (step.content) {
-                md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
-              }
+          } else if (includeCallResults) {
+            md += `### Step ${step.step_index} (${step.type})\n`;
+            md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
+            if (step.content) {
+              md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
             }
           }
         }
@@ -533,7 +539,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const formattedText = chunk.chunk_text
             .replace(/^User:/gm, "**User**:")
             .replace(/^Assistant:/gm, "**Assistant**:")
-            .replace(/\n\*\*Assistant\*\*:/g, "\n\n**Assistant**:");
+            .replaceAll("\n**Assistant**:", "\n\n**Assistant**:");
           md += `### Step ${chunk.step_index}\n${formattedText}\n\n`;
         }
       }
@@ -582,8 +588,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const result = store.query({
         sessionId,
         includeSteps: true,
-        startStep: stepIndex !== undefined ? stepIndex : startStep,
-        endStep: stepIndex !== undefined ? stepIndex : endStep
+        startStep: stepIndex ?? startStep,
+        endStep: stepIndex ?? endStep
       });
 
       const steps = result.steps.map(s => ({
@@ -703,8 +709,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      const sortedSteps = stepsWithSessionId.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
-      const rows = sortedSteps.slice(0, limit);
+      stepsWithSessionId.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
+      const rows = stepsWithSessionId.slice(0, limit);
 
       return {
         content: [
@@ -720,7 +726,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const query = args?.query as string;
       const limit = (args?.limit as number) || 5;
       const projectPath = args?.projectPath as string | undefined;
-      const scope = args?.scope as "workspace" | "all" | undefined;
+      const scope = args?.scope as ScopeType | undefined;
 
       console.error(`[Chronicle MCP] Generating embedding for query: "${query}"`);
       const [queryVector] = await getEmbeddingClient().embed([query]);
@@ -740,7 +746,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "get_tool_usage_stats") {
       const limit = args?.limit as number | undefined;
       const projectPath = args?.projectPath as string | undefined;
-      const scope = args?.scope as "workspace" | "all" | undefined;
+      const scope = args?.scope as ScopeType | undefined;
 
       const stats = await getToolUsageStats({ limit, projectPath, scope });
 
@@ -828,7 +834,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (g) groupName = g.name;
         }
 
-        const durationText = m.durationMs !== null ? `${(m.durationMs / 1000).toFixed(1)}s` : "N/A";
+        const durationText = m.durationMs === null ? "N/A" : `${(m.durationMs / 1000).toFixed(1)}s`;
         const titleText = m.title.length > 40 ? m.title.slice(0, 37) + "..." : m.title;
         const homedir = os.homedir();
         const sessionLink = `[${titleText}](file:///${homedir.replaceAll("\\", "/")}/.gemini/antigravity/brain/${m.sessionId})`;
@@ -873,8 +879,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// Start Stdio Transport
-async function run() {
+const isMain = process.argv[1] && (
+  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]) ||
+  fileURLToPath(import.meta.url).replace(/\.js$/, ".ts") === path.resolve(process.argv[1])
+);
+
+if (isMain) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("[Chronicle MCP] Unified History Server running on stdio transport.");
@@ -883,13 +893,4 @@ async function run() {
   syncHistory().catch((e) => {
     console.error("[Chronicle MCP] Initial sync failed:", e.message);
   });
-}
-
-const isMain = process.argv[1] && (
-  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]) ||
-  fileURLToPath(import.meta.url).replace(/\.js$/, ".ts") === path.resolve(process.argv[1])
-);
-
-if (isMain) {
-  run();
 }

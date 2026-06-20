@@ -1,5 +1,5 @@
 import { getStore, SearchResult as DbSearchResult } from "./db.js";
-import { SessionBenchmarkMetrics } from "./adapters/types.js";
+import { SessionBenchmarkMetrics, StepData } from "./adapters/types.js";
 import { getEncoding } from "js-tiktoken";
 
 const encoder = getEncoding("cl100k_base");
@@ -77,6 +77,96 @@ export async function getSessionDetailsFromDb(
   };
 }
 
+interface StepAnalysis {
+  minCreatedAt: number;
+  maxCreatedAt: number;
+  errorStepsCount: number;
+  toolCallsCount: number;
+  stepTokens: number[];
+}
+
+function analyzeSteps(steps: StepData[]): StepAnalysis {
+  let minCreatedAt = Infinity;
+  let maxCreatedAt = -Infinity;
+  let errorStepsCount = 0;
+  let toolCallsCount = 0;
+  const stepTokens: number[] = [];
+
+  for (const step of steps) {
+    if (step.createdAt !== undefined) {
+      if (step.createdAt < minCreatedAt) minCreatedAt = step.createdAt;
+      if (step.createdAt > maxCreatedAt) maxCreatedAt = step.createdAt;
+    }
+
+    if (step.status === "ERROR") {
+      errorStepsCount++;
+    }
+
+    if (step.type === "PLANNER_RESPONSE" && step.toolCalls) {
+      try {
+        const parsed = JSON.parse(step.toolCalls);
+        if (Array.isArray(parsed)) {
+          toolCallsCount += parsed.length;
+        }
+      } catch {}
+    }
+
+    const contentStr = step.content || "";
+    const thinkingStr = step.thinking || "";
+    const toolCallsStr = step.toolCalls || "";
+    const stepText = contentStr + thinkingStr + toolCallsStr;
+    stepTokens.push(stepText ? encoder.encode(stepText).length : 0);
+  }
+
+  return { minCreatedAt, maxCreatedAt, errorStepsCount, toolCallsCount, stepTokens };
+}
+
+interface CachingMetrics {
+  cumulativeInputTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  estimatedOutputTokens: number;
+  lastModelCallIndex: number;
+}
+
+function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetrics {
+  let cumulativeInputTokens = 0;
+  let cacheHitTokens = 0;
+  let cacheMissTokens = 0;
+  let estimatedOutputTokens = 0;
+  let lastModelCallIndex = -1;
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (step.type === "PLANNER_RESPONSE") {
+      let hit = 0;
+      let miss = 0;
+
+      if (lastModelCallIndex === -1) {
+        for (let j = 0; j < i; j++) {
+          miss += stepTokens[j];
+        }
+      } else {
+        for (let j = 0; j <= lastModelCallIndex; j++) {
+          hit += stepTokens[j];
+        }
+        for (let j = lastModelCallIndex + 1; j < i; j++) {
+          miss += stepTokens[j];
+        }
+      }
+
+      cumulativeInputTokens += (hit + miss);
+      cacheHitTokens += hit;
+      cacheMissTokens += miss;
+      estimatedOutputTokens += stepTokens[i];
+
+      lastModelCallIndex = i;
+    }
+  }
+
+  return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex };
+}
+
 export async function computeSessionBenchmarks(
   sessionIds: string[]
 ): Promise<SessionBenchmarkMetrics[]> {
@@ -110,70 +200,17 @@ export async function computeSessionBenchmarks(
     let errorStepsCount = 0;
 
     if (hasDetailedSteps) {
-      let minCreatedAt = Infinity;
-      let maxCreatedAt = -Infinity;
+      const analysis = analyzeSteps(steps);
+      errorStepsCount = analysis.errorStepsCount;
+      toolCallsCount = analysis.toolCallsCount;
+      const stepTokens = analysis.stepTokens;
 
-      const stepTokens: number[] = [];
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        if (step.createdAt !== undefined) {
-          if (step.createdAt < minCreatedAt) minCreatedAt = step.createdAt;
-          if (step.createdAt > maxCreatedAt) maxCreatedAt = step.createdAt;
-        }
-
-        if (step.status === "ERROR") {
-          errorStepsCount++;
-        }
-
-        // Tool calls count
-        if (step.type === "PLANNER_RESPONSE" && step.toolCalls) {
-          try {
-            const parsed = JSON.parse(step.toolCalls);
-            if (Array.isArray(parsed)) {
-              toolCallsCount += parsed.length;
-            }
-          } catch {}
-        }
-
-        // Token calculations for this step
-        const contentStr = step.content || "";
-        const thinkingStr = step.thinking || "";
-        const toolCallsStr = step.toolCalls || "";
-        const stepText = contentStr + thinkingStr + toolCallsStr;
-        stepTokens.push(stepText ? encoder.encode(stepText).length : 0);
-      }
-
-      // Caching simulation over all model calls (PLANNER_RESPONSE steps)
-      let lastModelCallIndex = -1;
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        const isModelCall = step.type === "PLANNER_RESPONSE";
-
-        if (isModelCall) {
-          let hit = 0;
-          let miss = 0;
-
-          if (lastModelCallIndex !== -1) {
-            for (let j = 0; j <= lastModelCallIndex; j++) {
-              hit += stepTokens[j];
-            }
-            for (let j = lastModelCallIndex + 1; j < i; j++) {
-              miss += stepTokens[j];
-            }
-          } else {
-            for (let j = 0; j < i; j++) {
-              miss += stepTokens[j];
-            }
-          }
-
-          cumulativeInputTokens += (hit + miss);
-          cacheHitTokens += hit;
-          cacheMissTokens += miss;
-          estimatedOutputTokens += stepTokens[i];
-
-          lastModelCallIndex = i;
-        }
-      }
+      const cache = simulateCaching(steps, stepTokens);
+      cumulativeInputTokens = cache.cumulativeInputTokens;
+      cacheHitTokens = cache.cacheHitTokens;
+      cacheMissTokens = cache.cacheMissTokens;
+      estimatedOutputTokens = cache.estimatedOutputTokens;
+      const lastModelCallIndex = cache.lastModelCallIndex;
 
       if (lastModelCallIndex === -1) {
         const total = stepTokens.reduce((a, b) => a + b, 0);
@@ -188,8 +225,8 @@ export async function computeSessionBenchmarks(
         estimatedCostSavings = (1 - (cacheMissTokens + 0.1 * cacheHitTokens) / cumulativeInputTokens) * 100;
       }
 
-      if (minCreatedAt !== Infinity && maxCreatedAt !== -Infinity) {
-        durationMs = maxCreatedAt - minCreatedAt;
+      if (analysis.minCreatedAt !== Infinity && analysis.maxCreatedAt !== -Infinity) {
+        durationMs = analysis.maxCreatedAt - analysis.minCreatedAt;
       }
     } else {
       // Fallback
@@ -229,6 +266,23 @@ export async function computeSessionBenchmarks(
   return metricsList;
 }
 
+function incrementToolStats(toolCallsStr: string, stats: Record<string, number>): void {
+  try {
+    const calls = JSON.parse(toolCallsStr);
+    if (!Array.isArray(calls)) return;
+    for (const call of calls) {
+      let name = call.name || "unknown";
+      if (name === "call_mcp_tool" && call.args) {
+        const server = call.args.ServerName || "unknown";
+        const tool = call.args.ToolName || "unknown";
+        name = `${server}/${tool}`;
+      }
+      name = name.replaceAll("\\", "").replaceAll('"', "").trim();
+      stats[name] = (stats[name] || 0) + 1;
+    }
+  } catch {}
+}
+
 export async function getToolUsageStats(options: { limit?: number; projectPath?: string; scope?: "workspace" | "all" } = {}): Promise<Record<string, number>> {
   const store = getStore();
   const limit = options.limit ?? 30;
@@ -246,21 +300,7 @@ export async function getToolUsageStats(options: { limit?: number; projectPath?:
 
   for (const step of result.steps) {
     if (step.toolCalls) {
-      try {
-        const calls = JSON.parse(step.toolCalls);
-        if (Array.isArray(calls)) {
-          for (const call of calls) {
-            let name = call.name || "unknown";
-            if (name === "call_mcp_tool" && call.args) {
-              const server = call.args.ServerName || "unknown";
-              const tool = call.args.ToolName || "unknown";
-              name = `${server}/${tool}`;
-            }
-            name = name.replace(/\\/g, "").replace(/"/g, "").trim();
-            stats[name] = (stats[name] || 0) + 1;
-          }
-        }
-      } catch {}
+      incrementToolStats(step.toolCalls, stats);
     }
   }
 

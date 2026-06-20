@@ -83,7 +83,7 @@ describe("Chronicle Search Engine Tests", () => {
     store.save(sessionB, {
       summary: [0.1, 0.9],
       chunks: new Map([
-        [0, [0.0, 1.0]]
+        [0, [0, 1]]
       ])
     });
 
@@ -105,8 +105,8 @@ describe("Chronicle Search Engine Tests", () => {
       });
     }
 
-    // Execute search with query vector [1.0, 0.0]
-    const hits = await searchHistory([1.0, 0.0], 3);
+    // Execute search with query vector [1, 0]
+    const hits = await searchHistory([1, 0], 3);
     
     assert.strictEqual(hits.length, 2); // Only chunks of Session A should be returned
     assert.strictEqual(hits[0].chunkText, "Close Match Chunk");
@@ -214,13 +214,13 @@ describe("Chronicle Search Engine Tests", () => {
     });
 
     // Search with projectPath constraint
-    const hitsC = await searchHistory([1.0, 0.0], 3, { projectPath: "d:/projects/c" });
+    const hitsC = await searchHistory([1, 0], 3, { projectPath: "d:/projects/c" });
     assert.strictEqual(hitsC.length, 1);
     assert.strictEqual(hitsC[0].sessionId, "session-c");
     assert.strictEqual(hitsC[0].chunkText, "Close Match Chunk C");
 
     // Search with non-matching projectPath constraint
-    const hitsNone = await searchHistory([1.0, 0.0], 3, { projectPath: "d:/projects/nonexistent" });
+    const hitsNone = await searchHistory([1, 0], 3, { projectPath: "d:/projects/nonexistent" });
     assert.strictEqual(hitsNone.length, 0);
   });
 

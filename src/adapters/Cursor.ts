@@ -1,6 +1,6 @@
-import fs from "fs";
-import path from "path";
-import os from "os";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { SessionData, HistoryAdapter } from "./types.js";
 import { SessionParser } from "./SessionParser.js";
@@ -8,10 +8,8 @@ import { SessionParser } from "./SessionParser.js";
 export class CursorAdapter implements HistoryAdapter {
   name = "cursor";
 
-  async discoverSessions(): Promise<SessionData[]> {
+  private getDbPath(): string {
     const homedir = os.homedir();
-    
-    // Default Cursor global state DB path on Windows
     let dbPath = path.join(
       homedir,
       "AppData",
@@ -22,7 +20,6 @@ export class CursorAdapter implements HistoryAdapter {
       "state.vscdb"
     );
 
-    // Cross-platform fallbacks
     if (!fs.existsSync(dbPath)) {
       if (os.platform() === "darwin") {
         dbPath = path.join(
@@ -45,6 +42,35 @@ export class CursorAdapter implements HistoryAdapter {
         );
       }
     }
+    return dbPath;
+  }
+
+  private parseComposerRow(row: any, sessions: SessionData[]): void {
+    try {
+      const rawVal = row.value;
+      if (!rawVal) return;
+
+      const data = JSON.parse(rawVal);
+      if (row.key.includes("composerStates")) {
+        if (data.composers && typeof data.composers === "object") {
+          for (const compId of Object.keys(data.composers)) {
+            const comp = data.composers[compId];
+            const parsed = SessionParser.parseCursorComposer(compId, comp);
+            if (parsed) sessions.push(parsed);
+          }
+        }
+      } else {
+        const compId = row.key.replace("composer.composerState.", "");
+        const parsed = SessionParser.parseCursorComposer(compId, data);
+        if (parsed) sessions.push(parsed);
+      }
+    } catch (e) {
+      console.warn("CursorAdapter failed to parse composer row:", e);
+    }
+  }
+
+  async discoverSessions(): Promise<SessionData[]> {
+    const dbPath = this.getDbPath();
 
     if (!fs.existsSync(dbPath)) {
       return [];
@@ -53,10 +79,8 @@ export class CursorAdapter implements HistoryAdapter {
     const sessions: SessionData[] = [];
 
     try {
-      // Open Cursor state database in read-only mode if possible, or standard mode
       const db = new DatabaseSync(dbPath);
 
-      // Check if ItemTable exists
       const tableCheck = db
         .prepare(
           "SELECT name FROM sqlite_master WHERE type='table' AND name='ItemTable'"
@@ -68,7 +92,6 @@ export class CursorAdapter implements HistoryAdapter {
         return [];
       }
 
-      // Fetch all composer-related keys
       const rows = db
         .prepare(
           "SELECT key, value FROM ItemTable WHERE key LIKE 'composer.composerState%' OR key LIKE 'composer.composerStates%'"
@@ -76,33 +99,12 @@ export class CursorAdapter implements HistoryAdapter {
         .all() as any[];
 
       for (const row of rows) {
-        try {
-          const rawVal = row.value;
-          if (!rawVal) continue;
-
-          const data = JSON.parse(rawVal);
-          // Cursor composerStates is often stored as a dictionary of composers, or single composer state
-          if (row.key.includes("composerStates")) {
-            // It's a dictionary of multiple composers
-            if (data.composers && typeof data.composers === "object") {
-              for (const compId of Object.keys(data.composers)) {
-                const comp = data.composers[compId];
-                const parsed = SessionParser.parseCursorComposer(compId, comp);
-                if (parsed) sessions.push(parsed);
-              }
-            }
-          } else {
-            // Single composer state
-            const compId = row.key.replace("composer.composerState.", "");
-            const parsed = SessionParser.parseCursorComposer(compId, data);
-            if (parsed) sessions.push(parsed);
-          }
-        } catch {}
+        this.parseComposerRow(row, sessions);
       }
 
       db.close();
     } catch (e) {
-      // Fail silently and return whatever was found (or empty) to avoid blocking MCP execution
+      console.warn("CursorAdapter discoverSessions database error:", e);
     }
 
     return sessions;
