@@ -342,12 +342,16 @@ export class SessionParser {
 
     const title = this.getSessionTitle(sessionId, localTitleMap, state.firstPrompt);
 
+    const stepTimestamps = steps.map(s => s.createdAt).filter((t): t is number => t !== undefined);
+    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : state.createdAt;
+
     return {
       id: sessionId,
       adapter: "antigravity",
       title,
       projectPath: state.projectPath,
       createdAt: state.createdAt,
+      lastActiveAt,
       firstPrompt: state.firstPrompt,
       secondPrompt: state.secondPrompt,
       chunks,
@@ -377,11 +381,113 @@ export class SessionParser {
     const steps: StepData[] = [];
     const promptState = { firstPrompt: "", secondPrompt: "" };
 
-    for (let i = 0; i < conversation.length; i++) {
-      const msg = conversation[i];
-      const sender = msg.type || msg.sender || "";
-      if (sender === "user") {
-        this.parseComposerTurn(msg, i, conversation, composerState, chunks, steps, promptState);
+    // Check if the conversation uses the new bubble-based format
+    const isNewFormat = conversation.some((msg: any) => msg && (msg.type === 1 || msg.type === 2));
+
+    if (isNewFormat) {
+      let stepIndexCounter = 0;
+      let currentUserText = "";
+      let currentAssistantTexts: string[] = [];
+
+      for (const bubble of conversation) {
+        if (!bubble) continue;
+        const bubbleCreatedAt = bubble.createdAt
+          ? (typeof bubble.createdAt === "string" ? new Date(bubble.createdAt).getTime() : bubble.createdAt)
+          : (composerState.createdAt || Date.now());
+
+        if (bubble.type === 1) { // User
+          const userText = bubble.text || "";
+          
+          if (!promptState.firstPrompt) promptState.firstPrompt = userText;
+          else if (!promptState.secondPrompt) promptState.secondPrompt = userText;
+
+          if (currentUserText || currentAssistantTexts.length > 0) {
+            chunks.push({
+              stepIndex: stepIndexCounter,
+              text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
+            });
+            currentAssistantTexts = [];
+          }
+          currentUserText = userText;
+
+          steps.push({
+            stepIndex: stepIndexCounter++,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: userText,
+            createdAt: bubbleCreatedAt,
+          });
+        } else if (bubble.type === 2) { // AI
+          const stepContent = bubble.text || undefined;
+          let stepThinking: string | undefined = undefined;
+          if (bubble.thinking) {
+            stepThinking = typeof bubble.thinking === "string" ? bubble.thinking : (bubble.thinking.text || undefined);
+          }
+
+          let stepToolCalls: string | undefined = undefined;
+          if (bubble.toolFormerData) {
+            const toolName = bubble.toolFormerData.name;
+            let args = {};
+            try {
+              args = bubble.toolFormerData.params ? JSON.parse(bubble.toolFormerData.params) : {};
+            } catch {}
+            stepToolCalls = JSON.stringify([{
+              name: toolName,
+              args: args,
+            }]);
+          }
+
+          if (stepContent) {
+            currentAssistantTexts.push(stepContent);
+          }
+
+          steps.push({
+            stepIndex: stepIndexCounter++,
+            type: "PLANNER_RESPONSE",
+            source: "MODEL",
+            status: "DONE",
+            content: stepContent,
+            thinking: stepThinking,
+            toolCalls: stepToolCalls,
+            createdAt: bubbleCreatedAt,
+          });
+
+          // Separate tool result step
+          if (bubble.toolFormerData) {
+            const toolName = bubble.toolFormerData.name;
+            const isCommand = toolName === "execute_command" || toolName === "run_command";
+            const type = isCommand ? "COMMAND" : "MCP_TOOL";
+            const status = bubble.toolFormerData.status === "completed" ? "DONE" : "ERROR";
+            const content = bubble.toolFormerData.result || bubble.toolFormerData.error || "";
+
+            steps.push({
+              stepIndex: stepIndexCounter++,
+              type,
+              source: "SYSTEM",
+              status,
+              content,
+              createdAt: bubbleCreatedAt,
+            });
+          }
+        }
+      }
+
+      if (currentUserText || currentAssistantTexts.length > 0) {
+        chunks.push({
+          stepIndex: stepIndexCounter,
+          text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
+        });
+      }
+    } else {
+      // Legacy parsing
+      for (let i = 0; i < conversation.length; i++) {
+        const msg = conversation[i];
+        if (!msg) continue;
+        const sender = msg.type || msg.sender || "";
+        if (sender === "user") {
+          this.parseComposerTurn(msg, i, conversation, composerState, chunks, steps, promptState);
+        }
       }
     }
 
@@ -392,12 +498,17 @@ export class SessionParser {
       projectPath = projectPath.replaceAll("\\", "/");
     }
 
+    const createdAt = composerState.createdAt || Date.now();
+    const stepTimestamps = steps.map(s => s.createdAt).filter((t): t is number => t !== undefined);
+    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : createdAt;
+
     return {
       id: composerId,
       adapter: "cursor",
       title,
       projectPath,
-      createdAt: composerState.createdAt || Date.now(),
+      createdAt,
+      lastActiveAt,
       firstPrompt: promptState.firstPrompt,
       secondPrompt: promptState.secondPrompt,
       chunks,

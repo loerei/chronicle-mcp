@@ -72,6 +72,27 @@ export class CursorAdapter implements HistoryAdapter {
     }
   }
 
+  private parseWorkspacePath(workspaceJson: any): string | null {
+    const uriStr = workspaceJson.folder || workspaceJson.workspace || null;
+    if (!uriStr || typeof uriStr !== "string") return null;
+    try {
+      const url = new URL(uriStr);
+      let p = decodeURIComponent(url.pathname);
+      if (os.platform() === "win32" && p.startsWith("/")) {
+        p = p.slice(1);
+      }
+      return p.replaceAll("\\", "/");
+    } catch {
+      let clean = decodeURIComponent(uriStr.replace(/^file:\/\/\/?/, ""));
+      if (os.platform() === "win32" && /^[a-zA-Z]:/.test(clean)) {
+        // already valid windows path
+      } else if (os.platform() === "win32" && clean.startsWith("/")) {
+        clean = clean.slice(1);
+      }
+      return clean.replaceAll("\\", "/");
+    }
+  }
+
   async discoverSessions(): Promise<SessionData[]> {
     const dbPath = this.getDbPath();
 
@@ -84,25 +105,97 @@ export class CursorAdapter implements HistoryAdapter {
     try {
       const db = new DatabaseSync(dbPath);
 
-      const tableCheck = db
+      // 1. Try cursorDiskKV first
+      const diskKVCheck = db
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type='table' AND name='ItemTable'"
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'"
         )
         .get() as any;
 
-      if (!tableCheck) {
-        db.close();
-        return [];
+      if (diskKVCheck) {
+        const rows = db
+          .prepare(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+          )
+          .all() as any[];
+
+        for (const row of rows) {
+          try {
+            const composerId = row.key.replace("composerData:", "");
+            const composerData = JSON.parse(row.value);
+            if (!composerData) continue;
+
+            // Resolve workspace path
+            let resolvedWorkspacePath: string | null = null;
+            if (composerData.workspaceIdentifier?.uri?.fsPath) {
+              resolvedWorkspacePath = composerData.workspaceIdentifier.uri.fsPath;
+            } else if (composerData.workspaceIdentifier?.id) {
+              const wsId = composerData.workspaceIdentifier.id;
+              const workspaceJsonPath = path.join(
+                path.dirname(path.dirname(dbPath)),
+                "workspaceStorage",
+                wsId,
+                "workspace.json"
+              );
+              if (fs.existsSync(workspaceJsonPath)) {
+                try {
+                  const wsJson = JSON.parse(fs.readFileSync(workspaceJsonPath, "utf-8"));
+                  resolvedWorkspacePath = this.parseWorkspacePath(wsJson);
+                } catch {}
+              }
+            }
+
+            // Retrieve conversation bubbles
+            const bubbleHeaders = composerData.fullConversationHeadersOnly || [];
+            const conversationBubbles: any[] = [];
+            for (const header of bubbleHeaders) {
+              const bubbleKey = `bubbleId:${composerId}:${header.bubbleId}`;
+              const bubbleRow = db
+                .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+                .get(bubbleKey) as any;
+              if (bubbleRow && bubbleRow.value) {
+                try {
+                  conversationBubbles.push(JSON.parse(bubbleRow.value));
+                } catch {}
+              }
+            }
+
+            if (conversationBubbles.length > 0) {
+              const state = {
+                createdAt: composerData.createdAt || Date.now(),
+                workspacePath: resolvedWorkspacePath,
+                conversation: conversationBubbles,
+              };
+              const parsed = SessionParser.parseCursorComposer(composerId, state);
+              if (parsed) {
+                sessions.push(parsed);
+              }
+            }
+          } catch (rowErr) {
+            console.warn("CursorAdapter failed to parse cursorDiskKV composer row:", rowErr);
+          }
+        }
       }
 
-      const rows = db
-        .prepare(
-          "SELECT key, value FROM ItemTable WHERE key LIKE 'composer.composerState%' OR key LIKE 'composer.composerStates%'"
-        )
-        .all() as any[];
+      // 2. Fall back to ItemTable if no sessions found
+      if (sessions.length === 0) {
+        const tableCheck = db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ItemTable'"
+          )
+          .get() as any;
 
-      for (const row of rows) {
-        this.parseComposerRow(row, sessions);
+        if (tableCheck) {
+          const rows = db
+            .prepare(
+              "SELECT key, value FROM ItemTable WHERE key LIKE 'composer.composerState%' OR key LIKE 'composer.composerStates%'"
+            )
+            .all() as any[];
+
+          for (const row of rows) {
+            this.parseComposerRow(row, sessions);
+          }
+        }
       }
 
       db.close();

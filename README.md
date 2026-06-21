@@ -21,6 +21,16 @@ This local Model Context Protocol (MCP) server indexes, synchronizes, and expose
 - **Performance Benchmarking & Caching Simulation**: Computes steps, tool calls, duration, errors, and standard BPE token counts (via `js-tiktoken`). Simulates turn-by-turn prefix prompt caching to calculate cumulative input tokens, peak context sizes, cache hit rates, and estimated cost savings. *Note: Caching calculations assume a continuous hot cache, without simulating TTL expiration or provider-specific minimum token limits.*
 - **Zero Native Dependencies**: Built on pure `node:sqlite` using SQLite WAL mode for fast queries without native MSBuild/Python build requirements on Windows.
 
+## Support Matrix
+
+| Feature | Antigravity Adapter | Cursor Adapter |
+| :--- | :--- | :--- |
+| **Log Source** | File-based JSON Lines (`transcript.jsonl`, `transcript_full.jsonl`) | SQLite database (`state.vscdb`) |
+| **Workspace Paths** | Resolved from step-level execution directories | Extracted from `workspacePath` in Composer state |
+| **Granular Steps** | Complete step history (`USER_INPUT`, `PLANNER_RESPONSE`, `MCP_TOOL`, etc.) | Conversation history turns (`user` prompts and `ai`/`assistant` replies) |
+| **Performance Benchmarking** | Detailed step-level duration, error tracking, and caching simulation | Limited (estimates derived from plain text/tokens and session creation time) |
+| **Subagent Linking** | Bidirectional traversal of parent/child relationships | Not supported (no subagent hierarchy concept in Cursor Composer) |
+
 ## Tech Stack
 
 - **Core**: Node.js & TypeScript
