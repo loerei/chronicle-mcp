@@ -464,7 +464,7 @@ export class InMemoryHistoryStore implements HistoryStore {
         parentId: s.parentId || null,
         subagentIds: s.subagentIds || [],
         chunks: sessionChunks,
-        ...(sessionSteps !== undefined ? { steps: sessionSteps } : {})
+        ...(sessionSteps === undefined ? {} : { steps: sessionSteps })
       };
     });
 
@@ -710,20 +710,17 @@ export class SqliteHistoryStore implements HistoryStore {
     }
   }
 
-  query(options: QueryOptions): QueryResult {
-    const db = this.db;
-    
-    let sessionSql = `SELECT id, adapter, title, project_path, created_at, first_prompt, second_prompt, parent_id FROM sessions`;
-    const sessionWhere: string[] = [];
-    const sessionParams: any[] = [];
+  private buildSessionQuery(options: QueryOptions, params: any[]): string {
+    let sql = `SELECT id, adapter, title, project_path, created_at, first_prompt, second_prompt, parent_id FROM sessions`;
+    const where: string[] = [];
 
     if (options.sessionId !== undefined) {
-      sessionWhere.push("id = ?");
-      sessionParams.push(options.sessionId);
+      where.push("id = ?");
+      params.push(options.sessionId);
     }
     if (options.adapter !== undefined) {
-      sessionWhere.push("adapter = ?");
-      sessionParams.push(options.adapter);
+      where.push("adapter = ?");
+      params.push(options.adapter);
     }
     let resolvedProjectPath = options.projectPath;
     if (resolvedProjectPath === undefined && options.scope === "workspace") {
@@ -731,19 +728,69 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     if (resolvedProjectPath !== undefined) {
-      sessionWhere.push("project_path LIKE ?");
-      sessionParams.push(`%${resolvedProjectPath}%`);
+      where.push("project_path LIKE ?");
+      params.push(`%${resolvedProjectPath}%`);
     }
 
-    if (sessionWhere.length > 0) {
-      sessionSql += " WHERE " + sessionWhere.join(" AND ");
+    if (where.length > 0) {
+      sql += " WHERE " + where.join(" AND ");
     }
 
     if (options.limit !== undefined) {
-      sessionSql += " LIMIT ?";
-      sessionParams.push(options.limit);
+      sql += " LIMIT ?";
+      params.push(options.limit);
     }
+    return sql;
+  }
 
+  private buildChunkQuery(placeholders: string, options: QueryOptions, params: any[]): string {
+    let sql = `SELECT session_id, step_index, chunk_text FROM session_chunks WHERE session_id IN (${placeholders})`;
+    if (options.startStep !== undefined) {
+      sql += " AND step_index >= ?";
+      params.push(options.startStep);
+    }
+    if (options.endStep !== undefined) {
+      sql += " AND step_index <= ?";
+      params.push(options.endStep);
+    }
+    sql += " ORDER BY step_index ASC";
+    return sql;
+  }
+
+  private buildStepQuery(placeholders: string, options: QueryOptions, params: any[]): string {
+    const contentCol = options.excludeContent ? "NULL as content" : "content";
+    const thinkingCol = options.excludeContent ? "NULL as thinking" : "thinking";
+    let sql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at FROM session_steps WHERE session_id IN (${placeholders})`;
+
+    if (options.startStep !== undefined) {
+      sql += " AND step_index >= ?";
+      params.push(options.startStep);
+    }
+    if (options.endStep !== undefined) {
+      sql += " AND step_index <= ?";
+      params.push(options.endStep);
+    }
+    if (options.stepType !== undefined) {
+      sql += " AND type = ?";
+      params.push(options.stepType);
+    }
+    if (options.stepStatus !== undefined) {
+      sql += " AND status = ?";
+      params.push(options.stepStatus);
+    }
+    if (options.stepQuery !== undefined) {
+      sql += " AND (content LIKE ? OR thinking LIKE ? OR tool_calls LIKE ?)";
+      params.push(`%${options.stepQuery}%`, `%${options.stepQuery}%`, `%${options.stepQuery}%`);
+    }
+    sql += " ORDER BY step_index ASC";
+    return sql;
+  }
+
+  query(options: QueryOptions): QueryResult {
+    const db = this.db;
+    
+    const sessionParams: any[] = [];
+    const sessionSql = this.buildSessionQuery(options, sessionParams);
     const sessionsRows = db.prepare(sessionSql).all(...sessionParams) as any[];
 
     const sessionsResult: SessionData[] = [];
@@ -757,50 +804,14 @@ export class SqliteHistoryStore implements HistoryStore {
     const sessionIds = sessionsRows.map(s => s.id);
     const placeholders = sessionIds.map(() => "?").join(",");
 
-    let chunkSql = `SELECT session_id, step_index, chunk_text FROM session_chunks WHERE session_id IN (${placeholders})`;
     const chunkParams: any[] = [...sessionIds];
-
-    if (options.startStep !== undefined) {
-      chunkSql += " AND step_index >= ?";
-      chunkParams.push(options.startStep);
-    }
-    if (options.endStep !== undefined) {
-      chunkSql += " AND step_index <= ?";
-      chunkParams.push(options.endStep);
-    }
-    chunkSql += " ORDER BY step_index ASC";
-
+    const chunkSql = this.buildChunkQuery(placeholders, options, chunkParams);
     const chunksRows = db.prepare(chunkSql).all(...chunkParams) as any[];
 
     let stepsRows: any[] = [];
     if (options.includeSteps) {
-      const contentCol = options.excludeContent ? "NULL as content" : "content";
-      const thinkingCol = options.excludeContent ? "NULL as thinking" : "thinking";
-      let stepSql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at FROM session_steps WHERE session_id IN (${placeholders})`;
       const stepParams: any[] = [...sessionIds];
-
-      if (options.startStep !== undefined) {
-        stepSql += " AND step_index >= ?";
-        stepParams.push(options.startStep);
-      }
-      if (options.endStep !== undefined) {
-        stepSql += " AND step_index <= ?";
-        stepParams.push(options.endStep);
-      }
-      if (options.stepType !== undefined) {
-        stepSql += " AND type = ?";
-        stepParams.push(options.stepType);
-      }
-      if (options.stepStatus !== undefined) {
-        stepSql += " AND status = ?";
-        stepParams.push(options.stepStatus);
-      }
-      if (options.stepQuery !== undefined) {
-        stepSql += " AND (content LIKE ? OR thinking LIKE ? OR tool_calls LIKE ?)";
-        stepParams.push(`%${options.stepQuery}%`, `%${options.stepQuery}%`, `%${options.stepQuery}%`);
-      }
-      stepSql += " ORDER BY step_index ASC";
-
+      const stepSql = this.buildStepQuery(placeholders, options, stepParams);
       stepsRows = db.prepare(stepSql).all(...stepParams) as any[];
     }
 

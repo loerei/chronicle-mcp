@@ -172,6 +172,85 @@ function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetric
   return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex };
 }
 
+function computeSingleSessionMetrics(sessionId: string, session: any, steps: StepData[]): SessionBenchmarkMetrics {
+  const hasDetailedSteps = steps.length > 0;
+
+  let totalSteps = steps.length;
+  let toolCallsCount = 0;
+  let durationMs: number | null = null;
+  let cumulativeInputTokens = 0;
+  let cacheHitTokens = 0;
+  let cacheMissTokens = 0;
+  let cacheHitRate = 0;
+  let estimatedCostSavings = 0;
+  let peakContextSize = 0;
+  let estimatedOutputTokens = 0;
+  let errorStepsCount = 0;
+
+  if (hasDetailedSteps) {
+    const analysis = analyzeSteps(steps);
+    errorStepsCount = analysis.errorStepsCount;
+    toolCallsCount = analysis.toolCallsCount;
+    const stepTokens = analysis.stepTokens;
+
+    const cache = simulateCaching(steps, stepTokens);
+    cumulativeInputTokens = cache.cumulativeInputTokens;
+    cacheHitTokens = cache.cacheHitTokens;
+    cacheMissTokens = cache.cacheMissTokens;
+    estimatedOutputTokens = cache.estimatedOutputTokens;
+    const lastModelCallIndex = cache.lastModelCallIndex;
+
+    if (lastModelCallIndex === -1) {
+      const total = stepTokens.reduce((a, b) => a + b, 0);
+      cacheMissTokens = total;
+      cumulativeInputTokens = total;
+    }
+
+    peakContextSize = stepTokens.reduce((a, b) => a + b, 0);
+
+    if (cumulativeInputTokens > 0) {
+      cacheHitRate = (cacheHitTokens / cumulativeInputTokens) * 100;
+      estimatedCostSavings = (1 - (cacheMissTokens + 0.1 * cacheHitTokens) / cumulativeInputTokens) * 100;
+    }
+
+    if (analysis.minCreatedAt !== Infinity && analysis.maxCreatedAt !== -Infinity) {
+      durationMs = analysis.maxCreatedAt - analysis.minCreatedAt;
+    }
+  } else {
+    // Fallback
+    totalSteps = session.chunks.length;
+    let fullChunksText = "";
+    for (const chunk of session.chunks) {
+      fullChunksText += chunk.text + "\n";
+    }
+
+    if (fullChunksText) {
+      const total = encoder.encode(fullChunksText).length;
+      cacheMissTokens = Math.ceil(total * 0.6);
+      estimatedOutputTokens = Math.ceil(total * 0.4);
+      cumulativeInputTokens = cacheMissTokens;
+      peakContextSize = total;
+    }
+  }
+
+  return {
+    sessionId,
+    title: session.title,
+    totalSteps,
+    toolCallsCount,
+    durationMs,
+    cumulativeInputTokens,
+    cacheHitTokens,
+    cacheMissTokens,
+    cacheHitRate,
+    estimatedCostSavings,
+    peakContextSize,
+    estimatedOutputTokens,
+    errorStepsCount,
+    hasDetailedSteps
+  };
+}
+
 export async function computeSessionBenchmarks(
   sessionIds: string[]
 ): Promise<SessionBenchmarkMetrics[]> {
@@ -189,83 +268,7 @@ export async function computeSessionBenchmarks(
       continue;
     }
 
-    const steps = result.steps;
-    const hasDetailedSteps = steps.length > 0;
-
-    let totalSteps = steps.length;
-    let toolCallsCount = 0;
-    let durationMs: number | null = null;
-    let cumulativeInputTokens = 0;
-    let cacheHitTokens = 0;
-    let cacheMissTokens = 0;
-    let cacheHitRate = 0;
-    let estimatedCostSavings = 0;
-    let peakContextSize = 0;
-    let estimatedOutputTokens = 0;
-    let errorStepsCount = 0;
-
-    if (hasDetailedSteps) {
-      const analysis = analyzeSteps(steps);
-      errorStepsCount = analysis.errorStepsCount;
-      toolCallsCount = analysis.toolCallsCount;
-      const stepTokens = analysis.stepTokens;
-
-      const cache = simulateCaching(steps, stepTokens);
-      cumulativeInputTokens = cache.cumulativeInputTokens;
-      cacheHitTokens = cache.cacheHitTokens;
-      cacheMissTokens = cache.cacheMissTokens;
-      estimatedOutputTokens = cache.estimatedOutputTokens;
-      const lastModelCallIndex = cache.lastModelCallIndex;
-
-      if (lastModelCallIndex === -1) {
-        const total = stepTokens.reduce((a, b) => a + b, 0);
-        cacheMissTokens = total;
-        cumulativeInputTokens = total;
-      }
-
-      peakContextSize = stepTokens.reduce((a, b) => a + b, 0);
-
-      if (cumulativeInputTokens > 0) {
-        cacheHitRate = (cacheHitTokens / cumulativeInputTokens) * 100;
-        estimatedCostSavings = (1 - (cacheMissTokens + 0.1 * cacheHitTokens) / cumulativeInputTokens) * 100;
-      }
-
-      if (analysis.minCreatedAt !== Infinity && analysis.maxCreatedAt !== -Infinity) {
-        durationMs = analysis.maxCreatedAt - analysis.minCreatedAt;
-      }
-    } else {
-      // Fallback
-      totalSteps = session.chunks.length;
-      let fullChunksText = "";
-      for (const chunk of session.chunks) {
-        fullChunksText += chunk.text + "\n";
-      }
-
-      if (fullChunksText) {
-        const total = encoder.encode(fullChunksText).length;
-        cacheMissTokens = Math.ceil(total * 0.6);
-        estimatedOutputTokens = Math.ceil(total * 0.4);
-        cumulativeInputTokens = cacheMissTokens;
-        peakContextSize = total;
-      }
-    }
-
-    metricsList.push({
-      sessionId,
-      title: session.title,
-      totalSteps,
-      toolCallsCount,
-      durationMs,
-      cumulativeInputTokens,
-      cacheHitTokens,
-      cacheMissTokens,
-      cacheHitRate,
-      estimatedCostSavings,
-      peakContextSize,
-      estimatedOutputTokens,
-      errorStepsCount,
-      hasDetailedSteps
-    });
+    metricsList.push(computeSingleSessionMetrics(sessionId, session, result.steps));
   }
 
   return metricsList;

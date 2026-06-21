@@ -231,6 +231,74 @@ export class SessionParser {
     }
   }
 
+  private static getSessionTitle(sessionId: string, localTitleMap: Map<string, string>, firstPrompt: string): string {
+    const existingTitle = localTitleMap.get(sessionId);
+    if (existingTitle) return existingTitle;
+
+    const cleanPrompt = firstPrompt.trim();
+    if (cleanPrompt) {
+      return cleanPrompt.length > 50 ? cleanPrompt.slice(0, 47) + "..." : cleanPrompt;
+    }
+    return `Session ${sessionId.slice(0, 8)}`;
+  }
+
+  private static getComposerTitle(composerId: string, composerState: any, firstPrompt: string): string {
+    const existingTitle = composerState.name || composerState.title;
+    if (existingTitle) return existingTitle;
+
+    if (firstPrompt) {
+      return firstPrompt.length > 50 ? firstPrompt.slice(0, 50) + "..." : firstPrompt;
+    }
+    return `Composer ${composerId.slice(0, 8)}`;
+  }
+
+  private static parseComposerTurn(
+    msg: any,
+    i: number,
+    conversation: any[],
+    composerState: any,
+    chunks: ChunkData[],
+    steps: StepData[],
+    state: { firstPrompt: string; secondPrompt: string }
+  ): void {
+    const userText = msg.text || "";
+    
+    if (!state.firstPrompt) {
+      state.firstPrompt = userText;
+    } else if (!state.secondPrompt) {
+      state.secondPrompt = userText;
+    }
+
+    const reply = this.findAssistantReply(conversation, i + 1);
+    const assistantText = reply ? reply.text : "";
+    const assistantStepIndex = reply ? reply.index : i + 1;
+
+    chunks.push({
+      stepIndex: i,
+      text: `User: ${userText}\nAssistant: ${assistantText}`,
+    });
+
+    steps.push({
+      stepIndex: i,
+      type: "USER_INPUT",
+      source: "USER_EXPLICIT",
+      status: "DONE",
+      content: userText,
+      createdAt: composerState.createdAt || Date.now(),
+    });
+
+    if (assistantText) {
+      steps.push({
+        stepIndex: assistantStepIndex,
+        type: "PLANNER_RESPONSE",
+        source: "MODEL",
+        status: "DONE",
+        content: assistantText,
+        createdAt: composerState.createdAt || Date.now(),
+      });
+    }
+  }
+
   static parseAntigravity(sessionId: string, jsonlContent: string): SessionData | null {
     if (!jsonlContent) return null;
 
@@ -261,7 +329,6 @@ export class SessionParser {
       } catch {}
     }
 
-    // Push the final turn if exists
     if (state.currentTurnUserText) {
       chunks.push({
         stepIndex: state.currentStepIndex,
@@ -269,20 +336,11 @@ export class SessionParser {
       });
     }
 
-    // If no USER_INPUT was encountered or steps is empty, return null
     if (steps.length === 0) {
       return null;
     }
 
-    let title = localTitleMap.get(sessionId);
-    if (!title) {
-      const cleanPrompt = state.firstPrompt.trim();
-      if (cleanPrompt) {
-        title = cleanPrompt.length > 50 ? cleanPrompt.slice(0, 47) + "..." : cleanPrompt;
-      } else {
-        title = `Session ${sessionId.slice(0, 8)}`;
-      }
-    }
+    const title = this.getSessionTitle(sessionId, localTitleMap, state.firstPrompt);
 
     return {
       id: sessionId,
@@ -317,69 +375,18 @@ export class SessionParser {
     const conversation = composerState.conversation;
     const chunks: ChunkData[] = [];
     const steps: StepData[] = [];
-    let firstPrompt = "";
-    let secondPrompt = "";
+    const promptState = { firstPrompt: "", secondPrompt: "" };
 
-    // Parse turns: User message followed by Assistant reply
     for (let i = 0; i < conversation.length; i++) {
       const msg = conversation[i];
       const sender = msg.type || msg.sender || "";
       if (sender === "user") {
-        const userText = msg.text || "";
-        
-        if (!firstPrompt) {
-          firstPrompt = userText;
-        } else if (!secondPrompt) {
-          secondPrompt = userText;
-        }
-
-        // Find subsequent assistant reply
-        const reply = this.findAssistantReply(conversation, i + 1);
-        const assistantText = reply ? reply.text : "";
-        const assistantStepIndex = reply ? reply.index : i + 1;
-
-        chunks.push({
-          stepIndex: i,
-          text: `User: ${userText}\nAssistant: ${assistantText}`,
-        });
-
-        // Add dummy steps
-        steps.push({
-          stepIndex: i,
-          type: "USER_INPUT",
-          source: "USER_EXPLICIT",
-          status: "DONE",
-          content: userText,
-          createdAt: composerState.createdAt || Date.now(),
-        });
-
-        if (assistantText) {
-          steps.push({
-            stepIndex: assistantStepIndex,
-            type: "PLANNER_RESPONSE",
-            source: "MODEL",
-            status: "DONE",
-            content: assistantText,
-            createdAt: composerState.createdAt || Date.now(),
-          });
-        }
+        this.parseComposerTurn(msg, i, conversation, composerState, chunks, steps, promptState);
       }
     }
 
-    // Try to get title
-    let title = composerState.name || composerState.title;
-    if (!title) {
-      if (firstPrompt) {
-        title = firstPrompt.slice(0, 50);
-        if (firstPrompt.length > 50) {
-          title += "...";
-        }
-      } else {
-        title = `Composer ${composerId.slice(0, 8)}`;
-      }
-    }
+    const title = this.getComposerTitle(composerId, composerState, promptState.firstPrompt);
 
-    // Workspace folder/project path
     let projectPath = composerState.workspacePath || null;
     if (projectPath && typeof projectPath === "string") {
       projectPath = projectPath.replaceAll("\\", "/");
@@ -391,8 +398,8 @@ export class SessionParser {
       title,
       projectPath,
       createdAt: composerState.createdAt || Date.now(),
-      firstPrompt,
-      secondPrompt,
+      firstPrompt: promptState.firstPrompt,
+      secondPrompt: promptState.secondPrompt,
       chunks,
       steps,
     };
