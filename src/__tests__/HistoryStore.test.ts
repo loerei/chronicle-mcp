@@ -6,7 +6,7 @@ import {
   HistoryStore,
   SessionEmbeddings
 } from "../db.js";
-import { SessionData, StepData, ChunkData } from "../adapters/types.js";
+import { SessionData } from "../adapters/types.js";
 import { syncHistory, isAutoSyncEnabled } from "../index.js";
 import { ADAPTERS } from "../adapters/index.js";
 
@@ -248,7 +248,7 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       const embeddingsB: SessionEmbeddings = {
         summary: [0.1, 0.9],
         chunks: new Map([
-          [0, [1.0, 0.0]] // Excellent chunk similarity, but session level 1 excludes it
+          [0, [1, 0]] // Excellent chunk similarity, but session level 1 excludes it
         ])
       };
 
@@ -274,8 +274,8 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         store.save(dummy, dummyEmbed);
       }
 
-      // Execute search with query vector [1.0, 0.0]
-      const hits = store.search([1.0, 0.0], 3);
+      // Execute search with query vector [1, 0]
+      const hits = store.search([1, 0], 3);
 
       assert.strictEqual(hits.length, 2); // Only chunks of Session A should be returned
       assert.strictEqual(hits[0].chunkText, "Close Match Chunk");
@@ -284,10 +284,10 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.ok(Math.abs(hits[1].similarity - 0.7) < 0.01);
 
       // Search with projectPath constraint
-      const hitsC = store.search([1.0, 0.0], 3, { projectPath: "projects/a" });
+      const hitsC = store.search([1, 0], 3, { projectPath: "projects/a" });
       assert.strictEqual(hitsC.length, 2);
 
-      const hitsNone = store.search([1.0, 0.0], 3, { projectPath: "projects/nonexistent" });
+      const hitsNone = store.search([1, 0], 3, { projectPath: "projects/nonexistent" });
       assert.strictEqual(hitsNone.length, 0);
 
       store.close();
@@ -309,7 +309,7 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         ]
       };
 
-      store.save(session, { summary: [1.0, 0.0], chunks: new Map([[1, [1, 0]]]) });
+      store.save(session, { summary: [1, 0], chunks: new Map([[1, [1, 0]]]) });
 
       // Save again with same session id, same chunk index but different text
       const session2: SessionData = {
@@ -319,7 +319,7 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         ]
       };
       
-      store.save(session2, { summary: [1.0, 0.0], chunks: new Map([[1, [1, 0]]]) });
+      store.save(session2, { summary: [1, 0], chunks: new Map([[1, [1, 0]]]) });
 
       // Verify that after save, only one chunk with stepIndex 1 exists (the latest one or ignored first)
       const res = store.query({ sessionId: "session-dup" });
@@ -401,7 +401,7 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
       store.save(session, {
         summary: [0.5, 0.5],
-        chunks: new Map([[0, [1.0, 0.0]]])
+        chunks: new Map([[0, [1, 0]]])
       });
 
       // Save again with additional chunk and step
@@ -419,7 +419,7 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
       // In incremental save, we only pass vectors for NEW chunks
       store.save(sessionUpdated, {
-        chunks: new Map([[1, [0.0, 1.0]]])
+        chunks: new Map([[1, [0, 1]]])
       });
 
       const res = store.query({ sessionId: "session-inc", includeSteps: true });
@@ -427,18 +427,18 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(res.steps.length, 2);
       
       // Verify first chunk vector is preserved (i.e. not empty)
-      const searchRes = store.search([1.0, 0.0], 5);
+      const searchRes = store.search([1, 0], 5);
       assert.strictEqual(searchRes.length, 2);
-      // The first chunk should match query [1.0, 0.0] with 1.0 similarity
+      // The first chunk should match query [1, 0] with 1 similarity
       const hit0 = searchRes.find(h => h.stepIndex === 0);
       assert.ok(hit0);
-      assert.ok(Math.abs(hit0.similarity - 1.0) < 0.01);
+      assert.ok(Math.abs(hit0.similarity - 1) < 0.01);
 
-      // The second chunk should match query [0.0, 1.0] with 1.0 similarity
-      const searchRes2 = store.search([0.0, 1.0], 5);
+      // The second chunk should match query [0, 1] with 1 similarity
+      const searchRes2 = store.search([0, 1], 5);
       const hit1 = searchRes2.find(h => h.stepIndex === 1);
       assert.ok(hit1);
-      assert.ok(Math.abs(hit1.similarity - 1.0) < 0.01);
+      assert.ok(Math.abs(hit1.similarity - 1) < 0.01);
 
       store.close();
     });

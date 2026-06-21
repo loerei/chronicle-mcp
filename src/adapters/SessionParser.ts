@@ -19,55 +19,77 @@ function cleanUserRequest(text: string): string {
   return cleaned.trim();
 }
 
+function getPathStringsFromCall(call: any): string[] {
+  if (!call) return [];
+  const args = call.args || call.arguments || {};
+  const paths: string[] = [];
+
+  const addPath = (val: any) => {
+    if (typeof val === "string") paths.push(val);
+  };
+
+  addPath(args.Cwd);
+  addPath(args.cwd);
+  addPath(args.DirectoryPath);
+  addPath(args.directoryPath);
+
+  if (args.Arguments && typeof args.Arguments === "object") {
+    const nested = args.Arguments;
+    addPath(nested.Cwd);
+    addPath(nested.cwd);
+    addPath(nested.DirectoryPath);
+    addPath(nested.directoryPath);
+    addPath(nested.target_file);
+    addPath(nested.TargetFile);
+    addPath(nested.AbsolutePath);
+    addPath(nested.SearchPath);
+  }
+
+  addPath(args.target_file);
+  addPath(args.TargetFile);
+  addPath(args.AbsolutePath);
+  addPath(args.SearchPath);
+
+  return paths;
+}
+
+function parseUsersPath(parts: string[]): string | null {
+  if (parts.length >= 5 && parts[1].toLowerCase() === "users" && parts[2]) {
+    const isGemini = parts[3] === ".gemini";
+    const isProjects = parts[3].toLowerCase() === "projects";
+    if ((isGemini || isProjects) && parts[4]) {
+      return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
+    }
+  }
+  return null;
+}
+
+function parseProjectFromPath(normalized: string): string | null {
+  const projMatch = /^([a-zA-Z]:\/[Pp]rojects\/[a-zA-Z0-9_-]+)/.exec(normalized);
+  if (projMatch) {
+    return projMatch[1];
+  }
+
+  const parts = normalized.split("/");
+  if (parts.length >= 3 && /^[a-zA-Z]:$/.exec(parts[0])) {
+    if (parts[1].toLowerCase() === "projects" && parts[2]) {
+      return `${parts[0]}/${parts[1]}/${parts[2]}`;
+    }
+    const usersProj = parseUsersPath(parts);
+    if (usersProj) return usersProj;
+  }
+  return null;
+}
+
 function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
   for (const call of toolCalls) {
-    if (!call) continue;
-    const args = call.args || call.arguments || {};
-    const pathsToCheck: string[] = [];
-
-    if (args.Cwd && typeof args.Cwd === "string") pathsToCheck.push(args.Cwd);
-    if (args.cwd && typeof args.cwd === "string") pathsToCheck.push(args.cwd);
-    if (args.DirectoryPath && typeof args.DirectoryPath === "string") pathsToCheck.push(args.DirectoryPath);
-    if (args.directoryPath && typeof args.directoryPath === "string") pathsToCheck.push(args.directoryPath);
-
-    if (args.Arguments && typeof args.Arguments === "object") {
-      const nested = args.Arguments;
-      if (nested.Cwd && typeof nested.Cwd === "string") pathsToCheck.push(nested.Cwd);
-      if (nested.cwd && typeof nested.cwd === "string") pathsToCheck.push(nested.cwd);
-      if (nested.DirectoryPath && typeof nested.DirectoryPath === "string") pathsToCheck.push(nested.DirectoryPath);
-      if (nested.directoryPath && typeof nested.directoryPath === "string") pathsToCheck.push(nested.directoryPath);
-      if (nested.target_file && typeof nested.target_file === "string") pathsToCheck.push(nested.target_file);
-      if (nested.TargetFile && typeof nested.TargetFile === "string") pathsToCheck.push(nested.TargetFile);
-      if (nested.AbsolutePath && typeof nested.AbsolutePath === "string") pathsToCheck.push(nested.AbsolutePath);
-      if (nested.SearchPath && typeof nested.SearchPath === "string") pathsToCheck.push(nested.SearchPath);
-    }
-
-    if (args.target_file && typeof args.target_file === "string") pathsToCheck.push(args.target_file);
-    if (args.TargetFile && typeof args.TargetFile === "string") pathsToCheck.push(args.TargetFile);
-    if (args.AbsolutePath && typeof args.AbsolutePath === "string") pathsToCheck.push(args.AbsolutePath);
-    if (args.SearchPath && typeof args.SearchPath === "string") pathsToCheck.push(args.SearchPath);
-
+    const pathsToCheck = getPathStringsFromCall(call);
     for (const p of pathsToCheck) {
       if (!p) continue;
       const normalized = p.replaceAll("\\", "/");
-      const projMatch = normalized.match(/^([a-zA-Z]:\/[Pp]rojects\/[a-zA-Z0-9_-]+)/);
-      if (projMatch) {
-        return projMatch[1];
-      }
-
-      const parts = normalized.split("/");
-      if (parts.length >= 3 && parts[0].match(/^[a-zA-Z]:$/)) {
-        if (parts[1].toLowerCase() === "projects" && parts[2]) {
-          return `${parts[0]}/${parts[1]}/${parts[2]}`;
-        }
-        if (parts[1].toLowerCase() === "users" && parts[2] && parts[3]) {
-          if (parts[3] === ".gemini" && parts[4]) {
-            return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
-          }
-          if (parts[3].toLowerCase() === "projects" && parts[4]) {
-            return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
-          }
-        }
+      const proj = parseProjectFromPath(normalized);
+      if (proj) {
+        return proj;
       }
     }
   }
@@ -75,20 +97,156 @@ function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
 }
 
 export class SessionParser {
+  private static parseStepData(data: any, steps: StepData[], state: { projectPath: string | null; createdAt: number }): void {
+    const stepType = data.type;
+    const stepIndex = data.step_index ?? 0;
+    const stepSource = data.source || "";
+    const stepStatus = data.status || "";
+    const stepCreatedAt = data.created_at ? new Date(data.created_at).getTime() : undefined;
+
+    let stepContent = data.content || undefined;
+    let stepThinking = data.thinking || undefined;
+    let stepToolCalls: string | undefined = undefined;
+
+    if (data.tool_calls) {
+      stepToolCalls = JSON.stringify(data.tool_calls);
+      if (!state.projectPath && Array.isArray(data.tool_calls)) {
+        const extracted = extractProjectPathFromToolCalls(data.tool_calls);
+        if (extracted) {
+          state.projectPath = extracted;
+        }
+      }
+    }
+
+    steps.push({
+      stepIndex,
+      type: stepType,
+      source: stepSource,
+      status: stepStatus,
+      content: stepContent,
+      thinking: stepThinking,
+      toolCalls: stepToolCalls,
+      createdAt: stepCreatedAt,
+    });
+
+    if (state.createdAt === 0 && data.created_at) {
+      state.createdAt = new Date(data.created_at).getTime();
+    }
+  }
+
+  private static handleUserInput(
+    data: any,
+    state: {
+      firstPrompt: string;
+      secondPrompt: string;
+      projectPath: string | null;
+      currentTurnUserText: string;
+      currentTurnAssistantText: string;
+      currentStepIndex: number;
+    },
+    chunks: ChunkData[]
+  ): void {
+    const text = data.content || "";
+    const stepIndex = data.step_index ?? 0;
+
+    // Push previous turn if exists
+    if (state.currentTurnUserText) {
+      chunks.push({
+        stepIndex: state.currentStepIndex,
+        text: `User: ${state.currentTurnUserText}\nAssistant: ${state.currentTurnAssistantText}`,
+      });
+    }
+
+    // Extract projectPath from ADDITIONAL_METADATA if present in user input
+    if (text.includes("Workspace mapping") || text.includes("active workspaces")) {
+      const match = text.match(/d:\\Projects\\[a-z0-9_-]+/i) || text.match(/[a-zA-Z]:\\[^\s]+/);
+      if (match) {
+        state.projectPath = match[0].replaceAll("\\", "/");
+      }
+    }
+
+    const cleanedPrompt = cleanUserRequest(text);
+    if (!state.firstPrompt) {
+      state.firstPrompt = cleanedPrompt;
+    } else if (!state.secondPrompt) {
+      state.secondPrompt = cleanedPrompt;
+    }
+
+    state.currentTurnUserText = cleanedPrompt;
+    state.currentTurnAssistantText = "";
+    state.currentStepIndex = stepIndex;
+  }
+
+  private static handlePlannerResponse(assistantText: string, state: { currentTurnAssistantText: string }): void {
+    if (!assistantText) return;
+    if (state.currentTurnAssistantText) {
+      state.currentTurnAssistantText += "\n" + assistantText;
+    } else {
+      state.currentTurnAssistantText = assistantText;
+    }
+  }
+
+  private static handleConversationHistory(historyText: string, localTitleMap: Map<string, string>): void {
+    const linesInHistory = historyText.split("\n");
+    for (const hLine of linesInHistory) {
+      const match = /## Conversation\s+([a-fA-F0-9-]+):\s*(.*)/.exec(hLine);
+      if (match) {
+        localTitleMap.set(match[1].trim(), match[2].trim());
+      }
+    }
+  }
+
+  private static handleInvokeSubagent(content: string, subagentIds: string[]): void {
+    const regex = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/g;
+    let match;
+    while ((match = regex.exec(content)) !== null) {
+      subagentIds.push(match[1]);
+    }
+  }
+
+  private static processStepType(
+    data: any,
+    state: {
+      firstPrompt: string;
+      secondPrompt: string;
+      projectPath: string | null;
+      currentTurnUserText: string;
+      currentTurnAssistantText: string;
+      currentStepIndex: number;
+    },
+    chunks: ChunkData[],
+    localTitleMap: Map<string, string>,
+    subagentIds: string[]
+  ): void {
+    const stepType = data.type;
+
+    if (stepType === "USER_INPUT") {
+      this.handleUserInput(data, state, chunks);
+    } else if (stepType === "PLANNER_RESPONSE") {
+      this.handlePlannerResponse(data.content || "", state);
+    } else if (stepType === "CONVERSATION_HISTORY") {
+      this.handleConversationHistory(data.content || "", localTitleMap);
+    } else if (stepType === "INVOKE_SUBAGENT") {
+      this.handleInvokeSubagent(data.content || "", subagentIds);
+    }
+  }
+
   static parseAntigravity(sessionId: string, jsonlContent: string): SessionData | null {
     if (!jsonlContent) return null;
 
     const lines = jsonlContent.split("\n");
-    let firstPrompt = "";
-    let secondPrompt = "";
-    let projectPath: string | null = null;
-    let createdAt = 0;
+    const state = {
+      firstPrompt: "",
+      secondPrompt: "",
+      projectPath: null as string | null,
+      createdAt: 0,
+      currentTurnUserText: "",
+      currentTurnAssistantText: "",
+      currentStepIndex: 0,
+    };
 
     const chunks: ChunkData[] = [];
     const steps: StepData[] = [];
-    let currentTurnUserText = "";
-    let currentTurnAssistantText = "";
-    let currentStepIndex = 0;
     const localTitleMap = new Map<string, string>();
     const subagentIds: string[] = [];
 
@@ -98,105 +256,16 @@ export class SessionParser {
         const data = jsonParse(line);
         if (!data) continue;
 
-        const stepType = data.type;
-        const stepIndex = data.step_index ?? 0;
-        const stepSource = data.source || "";
-        const stepStatus = data.status || "";
-        const stepCreatedAt = data.created_at ? new Date(data.created_at).getTime() : undefined;
-
-        let stepContent = data.content || undefined;
-        let stepThinking = data.thinking || undefined;
-        let stepToolCalls: string | undefined = undefined;
-
-        if (data.tool_calls) {
-          stepToolCalls = JSON.stringify(data.tool_calls);
-          if (!projectPath && Array.isArray(data.tool_calls)) {
-            const extracted = extractProjectPathFromToolCalls(data.tool_calls);
-            if (extracted) {
-              projectPath = extracted;
-            }
-          }
-        }
-
-        steps.push({
-          stepIndex,
-          type: stepType,
-          source: stepSource,
-          status: stepStatus,
-          content: stepContent,
-          thinking: stepThinking,
-          toolCalls: stepToolCalls,
-          createdAt: stepCreatedAt,
-        });
-
-        if (createdAt === 0 && data.created_at) {
-          createdAt = new Date(data.created_at).getTime();
-        }
-
-        if (stepType === "USER_INPUT") {
-          const text = data.content || "";
-          
-          // Push previous turn if exists
-          if (currentTurnUserText) {
-            chunks.push({
-              stepIndex: currentStepIndex,
-              text: `User: ${currentTurnUserText}\nAssistant: ${currentTurnAssistantText}`,
-            });
-          }
-
-          // Extract projectPath from ADDITIONAL_METADATA if present in user input
-          if (text.includes("Workspace mapping") || text.includes("active workspaces")) {
-            const match = text.match(/d:\\Projects\\[a-zA-Z0-9_-]+/i) || text.match(/[a-zA-Z]:\\[^\s]+/);
-            if (match) {
-              projectPath = match[0].replaceAll("\\", "/");
-            }
-          }
-
-          if (!firstPrompt) {
-            firstPrompt = cleanUserRequest(text);
-          } else if (!secondPrompt) {
-            secondPrompt = cleanUserRequest(text);
-          }
-
-          currentTurnUserText = cleanUserRequest(text);
-          currentTurnAssistantText = "";
-          currentStepIndex = stepIndex;
-        } else if (stepType === "PLANNER_RESPONSE") {
-          const assistantText = data.content || "";
-          if (assistantText) {
-            if (currentTurnAssistantText) {
-              currentTurnAssistantText += "\n" + assistantText;
-            } else {
-              currentTurnAssistantText = assistantText;
-            }
-          }
-        } else if (stepType === "CONVERSATION_HISTORY") {
-          const historyText = data.content || "";
-          const linesInHistory = historyText.split("\n");
-          for (const hLine of linesInHistory) {
-            const match = hLine.match(/## Conversation\s+([a-fA-F0-9-]+):\s*(.*)/);
-            if (match) {
-              const id = match[1].trim();
-              const title = match[2].trim();
-              localTitleMap.set(id, title);
-            }
-          }
-        } else if (stepType === "INVOKE_SUBAGENT") {
-          const content = data.content || "";
-          const regex = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/g;
-          let match;
-          while ((match = regex.exec(content)) !== null) {
-            subagentIds.push(match[1]);
-          }
-        }
+        this.parseStepData(data, steps, state);
+        this.processStepType(data, state, chunks, localTitleMap, subagentIds);
       } catch {}
     }
 
     // Push the final turn if exists
-    if (currentTurnUserText) {
+    if (state.currentTurnUserText) {
       chunks.push({
-        stepIndex: currentStepIndex,
-        text: `User: ${currentTurnUserText}\nAssistant: ${currentTurnAssistantText}`,
+        stepIndex: state.currentStepIndex,
+        text: `User: ${state.currentTurnUserText}\nAssistant: ${state.currentTurnAssistantText}`,
       });
     }
 
@@ -207,7 +276,7 @@ export class SessionParser {
 
     let title = localTitleMap.get(sessionId);
     if (!title) {
-      const cleanPrompt = firstPrompt.trim();
+      const cleanPrompt = state.firstPrompt.trim();
       if (cleanPrompt) {
         title = cleanPrompt.length > 50 ? cleanPrompt.slice(0, 47) + "..." : cleanPrompt;
       } else {
@@ -219,18 +288,29 @@ export class SessionParser {
       id: sessionId,
       adapter: "antigravity",
       title,
-      projectPath,
-      createdAt,
-      firstPrompt,
-      secondPrompt,
+      projectPath: state.projectPath,
+      createdAt: state.createdAt,
+      firstPrompt: state.firstPrompt,
+      secondPrompt: state.secondPrompt,
       chunks,
       steps,
       subagentIds,
     };
   }
 
+  private static findAssistantReply(conversation: any[], startIndex: number): { text: string, index: number } | null {
+    for (let j = startIndex; j < conversation.length; j++) {
+      const nextMsg = conversation[j];
+      const sender = nextMsg.type || nextMsg.sender || "";
+      if (sender === "ai" || sender === "assistant") {
+        return { text: nextMsg.text || "", index: j };
+      }
+    }
+    return null;
+  }
+
   static parseCursorComposer(composerId: string, composerState: any): SessionData | null {
-    if (!composerState || !composerState.conversation || !Array.isArray(composerState.conversation)) {
+    if (!Array.isArray(composerState?.conversation)) {
       return null;
     }
 
@@ -243,7 +323,8 @@ export class SessionParser {
     // Parse turns: User message followed by Assistant reply
     for (let i = 0; i < conversation.length; i++) {
       const msg = conversation[i];
-      if (msg.type === "user" || msg.sender === "user") {
+      const sender = msg.type || msg.sender || "";
+      if (sender === "user") {
         const userText = msg.text || "";
         
         if (!firstPrompt) {
@@ -253,16 +334,9 @@ export class SessionParser {
         }
 
         // Find subsequent assistant reply
-        let assistantText = "";
-        let assistantStepIndex = i + 1;
-        for (let j = i + 1; j < conversation.length; j++) {
-          const nextMsg = conversation[j];
-          if (nextMsg.type === "ai" || nextMsg.sender === "ai" || nextMsg.sender === "assistant") {
-            assistantText = nextMsg.text || "";
-            assistantStepIndex = j;
-            break;
-          }
-        }
+        const reply = this.findAssistantReply(conversation, i + 1);
+        const assistantText = reply ? reply.text : "";
+        const assistantStepIndex = reply ? reply.index : i + 1;
 
         chunks.push({
           stepIndex: i,
@@ -295,9 +369,14 @@ export class SessionParser {
     // Try to get title
     let title = composerState.name || composerState.title;
     if (!title) {
-      title = firstPrompt
-        ? firstPrompt.slice(0, 50) + (firstPrompt.length > 50 ? "..." : "")
-        : `Composer ${composerId.slice(0, 8)}`;
+      if (firstPrompt) {
+        title = firstPrompt.slice(0, 50);
+        if (firstPrompt.length > 50) {
+          title += "...";
+        }
+      } else {
+        title = `Composer ${composerId.slice(0, 8)}`;
+      }
     }
 
     // Workspace folder/project path

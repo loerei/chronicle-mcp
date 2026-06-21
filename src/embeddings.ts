@@ -40,7 +40,7 @@ export class TransformersEmbeddingClient implements EmbeddingClient {
 
 export class MockEmbeddingClient implements EmbeddingClient {
   async embed(texts: string[]): Promise<number[][]> {
-    return texts.map(() => [1.0, 0.0]);
+    return texts.map(() => [1, 0]);
   }
 }
 

@@ -7,8 +7,8 @@ describe("EmbeddingClient Tests", () => {
     const client = new MockEmbeddingClient();
     const result = await client.embed(["hello", "world"]);
     assert.strictEqual(result.length, 2);
-    assert.deepStrictEqual(result[0], [1.0, 0.0]);
-    assert.deepStrictEqual(result[1], [1.0, 0.0]);
+    assert.deepStrictEqual(result[0], [1, 0]);
+    assert.deepStrictEqual(result[1], [1, 0]);
   });
 
   it("TransformersEmbeddingClient returns correct vectors when running", async () => {

@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
-import os from "os";
-import fs from "fs";
+import os from "node:os";
+import fs from "node:fs";
 import { SessionData, StepData, ChunkData } from "./adapters/types.js";
 
 function matchToolCall(call: any, targetServer?: string, targetTool?: string): boolean {
@@ -64,11 +64,12 @@ export function getDb(): DatabaseSync {
       SELECT sql FROM sqlite_master WHERE type='table' AND name='session_chunks'
     `).get() as { sql: string } | undefined;
 
-    if (tableSqlRow && tableSqlRow.sql && !tableSqlRow.sql.includes("UNIQUE")) {
+    if (tableSqlRow?.sql && !tableSqlRow.sql.includes("UNIQUE")) {
       needsMigration = true;
     }
   } catch (e) {
     // Table might not exist yet, which is fine
+    console.debug?.("[Chronicle MCP] Table check for migration failed:", e);
   }
 
   if (needsMigration) {
@@ -144,8 +145,10 @@ export function getDb(): DatabaseSync {
 
   try {
     db.exec("ALTER TABLE sessions ADD COLUMN parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL;");
-  } catch (e) {
-    // Ignore error if column already exists
+  } catch (e: any) {
+    if (!e?.message?.includes("duplicate column name")) {
+      console.debug?.("[Chronicle MCP] Alter table parent_id failed:", e);
+    }
   }
 
   return db;
@@ -207,41 +210,12 @@ function dotProduct(a: number[], b: number[]): number {
 }
 
 export class InMemoryHistoryStore implements HistoryStore {
-  private sessionsMap = new Map<string, Omit<SessionData, "chunks"> & { summary_vector?: number[] }>();
-  private stepsMap = new Map<string, StepData[]>();
-  private chunksMap = new Map<string, Array<ChunkData & { chunk_vector: number[] }>>();
+  private readonly sessionsMap = new Map<string, Omit<SessionData, "chunks"> & { summary_vector?: number[] }>();
+  private readonly stepsMap = new Map<string, StepData[]>();
+  private readonly chunksMap = new Map<string, Array<ChunkData & { chunk_vector: number[] }>>();
 
-  save(session: SessionData, embeddings: SessionEmbeddings): void {
-    const sessionId = session.id;
-
-    let parentId = session.parentId || null;
-    if (!parentId) {
-      const existing = this.sessionsMap.get(sessionId);
-      if (existing && (existing as any).parentId) {
-        parentId = (existing as any).parentId;
-      }
-    }
-    
-    const existingSession = this.sessionsMap.get(sessionId);
-    const sessionCopy = {
-      id: session.id,
-      adapter: session.adapter,
-      title: session.title,
-      projectPath: session.projectPath,
-      createdAt: session.createdAt,
-      firstPrompt: session.firstPrompt,
-      secondPrompt: session.secondPrompt,
-      parentId,
-      subagentIds: session.subagentIds || [],
-      summary_vector: embeddings.summary
-        ? [...embeddings.summary]
-        : (existingSession ? (existingSession as any).summary_vector : undefined)
-    };
-
+  private copyChunks(session: SessionData, embeddings: SessionEmbeddings, chunksByStepIndex: Map<number, ChunkData & { chunk_vector: number[] }>): Array<ChunkData & { chunk_vector: number[] }> {
     const chunksCopy: Array<ChunkData & { chunk_vector: number[] }> = [];
-    const existingChunks = this.chunksMap.get(sessionId) || [];
-    const chunksByStepIndex = new Map(existingChunks.map(c => [c.stepIndex, c]));
-
     const seenChunkIndexes = new Set<number>();
     for (const chunk of session.chunks) {
       if (seenChunkIndexes.has(chunk.stepIndex)) {
@@ -258,7 +232,10 @@ export class InMemoryHistoryStore implements HistoryStore {
         chunk_vector: [...vec]
       });
     }
+    return chunksCopy;
+  }
 
+  private copySteps(session: SessionData): StepData[] {
     const stepsCopy: StepData[] = [];
     const seenStepIndexes = new Set<number>();
     if (session.steps) {
@@ -279,22 +256,19 @@ export class InMemoryHistoryStore implements HistoryStore {
         });
       }
     }
+    return stepsCopy;
+  }
 
-    this.sessionsMap.set(sessionId, sessionCopy);
-    this.chunksMap.set(sessionId, chunksCopy);
-    this.stepsMap.set(sessionId, stepsCopy);
-
-    if (session.subagentIds && session.subagentIds.length > 0) {
-      for (const childId of session.subagentIds) {
-        const childSession = this.sessionsMap.get(childId);
-        if (childSession) {
-          (childSession as any).parentId = session.id;
-        }
+  private updateSubagents(subagentIds: string[], parentId: string): void {
+    for (const childId of subagentIds) {
+      const childSession = this.sessionsMap.get(childId);
+      if (childSession) {
+        (childSession as any).parentId = parentId;
       }
     }
   }
 
-  query(options: QueryOptions): QueryResult {
+  private filterSessions(options: QueryOptions): any[] {
     let matchedSessions = Array.from(this.sessionsMap.values());
 
     if (options.sessionId !== undefined) {
@@ -312,17 +286,18 @@ export class InMemoryHistoryStore implements HistoryStore {
     if (resolvedProjectPath !== undefined) {
       const pathFilter = resolvedProjectPath.toLowerCase();
       matchedSessions = matchedSessions.filter(s => 
-        s.projectPath && s.projectPath.toLowerCase().includes(pathFilter)
+        s.projectPath?.toLowerCase().includes(pathFilter)
       );
     }
 
     if (options.limit !== undefined) {
       matchedSessions = matchedSessions.slice(0, options.limit);
     }
+    return matchedSessions;
+  }
 
-    const sessionIds = new Set(matchedSessions.map(s => s.id));
-
-    let matchedChunks: ChunkData[] = [];
+  private filterChunks(sessionIds: Set<string>, options: QueryOptions): ChunkData[] {
+    const matchedChunks: ChunkData[] = [];
     for (const [sid, chunks] of this.chunksMap.entries()) {
       if (!sessionIds.has(sid)) continue;
       for (const chunk of chunks) {
@@ -334,43 +309,116 @@ export class InMemoryHistoryStore implements HistoryStore {
         });
       }
     }
+    return matchedChunks;
+  }
 
-    let matchedSteps: StepData[] = [];
-    if (options.includeSteps) {
-      for (const [sid, steps] of this.stepsMap.entries()) {
-        if (!sessionIds.has(sid)) continue;
-        for (const step of steps) {
-          if (options.startStep !== undefined && step.stepIndex < options.startStep) continue;
-          if (options.endStep !== undefined && step.stepIndex > options.endStep) continue;
-          if (options.stepType !== undefined && step.type !== options.stepType) continue;
-          if (options.stepStatus !== undefined && step.status !== options.stepStatus) continue;
-          if (options.stepQuery !== undefined) {
-            const query = options.stepQuery.toLowerCase();
-            const contentMatch = step.content && step.content.toLowerCase().includes(query);
-            const thinkingMatch = step.thinking && step.thinking.toLowerCase().includes(query);
-            const toolCallsMatch = step.toolCalls && step.toolCalls.toLowerCase().includes(query);
-            if (!contentMatch && !thinkingMatch && !toolCallsMatch) continue;
-          }
-          if (options.toolName !== undefined || options.serverName !== undefined) {
-            if (!step.toolCalls) continue;
-            try {
-              const calls = JSON.parse(step.toolCalls);
-              if (!Array.isArray(calls)) continue;
-              const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
-              if (!isMatch) continue;
-            } catch {
-              continue;
-            }
-          }
-          const stepCopy = { ...step };
-          if (options.excludeContent) {
-            delete stepCopy.content;
-            delete stepCopy.thinking;
-          }
-          matchedSteps.push(stepCopy);
+  private matchStepQuery(step: StepData, query: string): boolean {
+    const contentMatch = step.content?.toLowerCase().includes(query);
+    const thinkingMatch = step.thinking?.toLowerCase().includes(query);
+    const toolCallsMatch = step.toolCalls?.toLowerCase().includes(query);
+    return !!(contentMatch || thinkingMatch || toolCallsMatch);
+  }
+
+  private matchStepTool(step: StepData, serverName?: string, toolName?: string): boolean {
+    if (!step.toolCalls) return false;
+    try {
+      const calls = JSON.parse(step.toolCalls);
+      if (!Array.isArray(calls)) return false;
+      return calls.some(call => matchToolCall(call, serverName, toolName));
+    } catch {
+      return false;
+    }
+  }
+
+  private matchStep(step: StepData, options: QueryOptions): boolean {
+    if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
+    if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
+    if (options.stepType !== undefined && step.type !== options.stepType) return false;
+    if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
+    
+    if (options.stepQuery !== undefined) {
+      if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
+    }
+    
+    if (options.toolName !== undefined || options.serverName !== undefined) {
+      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
+    }
+
+    return true;
+  }
+
+  private filterSteps(sessionIds: Set<string>, options: QueryOptions): StepData[] {
+    const matchedSteps: StepData[] = [];
+    if (!options.includeSteps) return matchedSteps;
+
+    for (const [sid, steps] of this.stepsMap.entries()) {
+      if (!sessionIds.has(sid)) continue;
+      for (const step of steps) {
+        if (!this.matchStep(step, options)) continue;
+
+        const stepCopy = { ...step };
+        if (options.excludeContent) {
+          delete stepCopy.content;
+          delete stepCopy.thinking;
         }
+        matchedSteps.push(stepCopy);
       }
     }
+    return matchedSteps;
+  }
+
+  save(session: SessionData, embeddings: SessionEmbeddings): void {
+    const sessionId = session.id;
+
+    let parentId = session.parentId || null;
+    if (!parentId) {
+      const existing = this.sessionsMap.get(sessionId);
+      if (existing && (existing as any).parentId) {
+        parentId = (existing as any).parentId;
+      }
+    }
+    
+    const existingSession = this.sessionsMap.get(sessionId);
+    let summaryVector = undefined;
+    if (embeddings.summary) {
+      summaryVector = [...embeddings.summary];
+    } else if (existingSession) {
+      summaryVector = (existingSession as any).summary_vector;
+    }
+
+    const sessionCopy = {
+      id: session.id,
+      adapter: session.adapter,
+      title: session.title,
+      projectPath: session.projectPath,
+      createdAt: session.createdAt,
+      firstPrompt: session.firstPrompt,
+      secondPrompt: session.secondPrompt,
+      parentId,
+      subagentIds: session.subagentIds || [],
+      summary_vector: summaryVector
+    };
+
+    const existingChunks = this.chunksMap.get(sessionId) || [];
+    const chunksByStepIndex = new Map(existingChunks.map(c => [c.stepIndex, c]));
+    const chunksCopy = this.copyChunks(session, embeddings, chunksByStepIndex);
+    const stepsCopy = this.copySteps(session);
+
+    this.sessionsMap.set(sessionId, sessionCopy);
+    this.chunksMap.set(sessionId, chunksCopy);
+    this.stepsMap.set(sessionId, stepsCopy);
+
+    if (session.subagentIds && session.subagentIds.length > 0) {
+      this.updateSubagents(session.subagentIds, session.id);
+    }
+  }
+
+  query(options: QueryOptions): QueryResult {
+    const matchedSessions = this.filterSessions(options);
+    const sessionIds = new Set(matchedSessions.map(s => s.id));
+
+    const matchedChunks = this.filterChunks(sessionIds, options);
+    const matchedSteps = this.filterSteps(sessionIds, options);
 
     const sessionsResult = matchedSessions.map(s => {
       const sessionChunks = (this.chunksMap.get(s.id) || [])
@@ -387,23 +435,12 @@ export class InMemoryHistoryStore implements HistoryStore {
           if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
           if (options.stepType !== undefined && step.type !== options.stepType) return false;
           if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
+          
           if (options.stepQuery !== undefined) {
-            const query = options.stepQuery.toLowerCase();
-            const contentMatch = step.content && step.content.toLowerCase().includes(query);
-            const thinkingMatch = step.thinking && step.thinking.toLowerCase().includes(query);
-            const toolCallsMatch = step.toolCalls && step.toolCalls.toLowerCase().includes(query);
-            if (!contentMatch && !thinkingMatch && !toolCallsMatch) return false;
+            if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
           }
           if (options.toolName !== undefined || options.serverName !== undefined) {
-            if (!step.toolCalls) return false;
-            try {
-              const calls = JSON.parse(step.toolCalls);
-              if (!Array.isArray(calls)) return false;
-              const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
-              if (!isMatch) return false;
-            } catch {
-              return false;
-            }
+            if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
           }
           return true;
         })
@@ -424,8 +461,8 @@ export class InMemoryHistoryStore implements HistoryStore {
         createdAt: s.createdAt,
         firstPrompt: s.firstPrompt,
         secondPrompt: s.secondPrompt,
-        parentId: (s as any).parentId || null,
-        subagentIds: (s as any).subagentIds || [],
+        parentId: s.parentId || null,
+        subagentIds: s.subagentIds || [],
         chunks: sessionChunks,
         ...(sessionSteps !== undefined ? { steps: sessionSteps } : {})
       };
@@ -449,7 +486,7 @@ export class InMemoryHistoryStore implements HistoryStore {
     if (resolvedProjectPath) {
       const pathFilter = resolvedProjectPath.toLowerCase();
       candidateSessions = candidateSessions.filter(s => 
-        s.projectPath && s.projectPath.toLowerCase().includes(pathFilter)
+        s.projectPath?.toLowerCase().includes(pathFilter)
       );
     }
 
@@ -495,11 +532,13 @@ export class InMemoryHistoryStore implements HistoryStore {
     return sessions[0]?.projectPath || undefined;
   }
 
-  close(): void {}
+  close(): void {
+    // No-op for in-memory store
+  }
 }
 
 export class SqliteHistoryStore implements HistoryStore {
-  private db: DatabaseSync;
+  private readonly db: DatabaseSync;
   constructor(dbPath: string) {
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`
@@ -547,15 +586,48 @@ export class SqliteHistoryStore implements HistoryStore {
 
     try {
       this.db.exec("ALTER TABLE sessions ADD COLUMN parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL;");
-    } catch (e) {
-      // Ignore error if column already exists
+    } catch (e: any) {
+      if (!e?.message?.includes("duplicate column name")) {
+        console.debug?.("[Chronicle MCP] parent_id alter table failed:", e);
+      }
     }
 
     try {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);");
     } catch (e) {
       // Ignore error if column/index already exists
+      console.debug?.("[Chronicle MCP] idx_sessions_parent create index failed:", e);
     }
+  }
+
+  private filterAndPushStep(row: any, options: QueryOptions, stepsBySession: Map<string, StepData[]>, stepsResult: StepData[]): void {
+    const step: StepData = {
+      stepIndex: row.step_index,
+      type: row.type,
+      source: row.source,
+      status: row.status,
+      content: row.content ?? undefined,
+      thinking: row.thinking ?? undefined,
+      toolCalls: row.tool_calls ?? undefined,
+      createdAt: row.created_at ?? undefined
+    };
+
+    if (options.toolName !== undefined || options.serverName !== undefined) {
+      if (!step.toolCalls) return;
+      try {
+        const calls = JSON.parse(step.toolCalls);
+        if (!Array.isArray(calls)) return;
+        const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
+        if (!isMatch) return;
+      } catch {
+        return;
+      }
+    }
+
+    const sList = stepsBySession.get(row.session_id) || [];
+    sList.push(step);
+    stepsBySession.set(row.session_id, sList);
+    stepsResult.push(step);
   }
 
   save(session: SessionData, embeddings: SessionEmbeddings): void {
@@ -743,33 +815,7 @@ export class SqliteHistoryStore implements HistoryStore {
 
     const stepsBySession = new Map<string, StepData[]>();
     for (const row of stepsRows) {
-      const step: StepData = {
-        stepIndex: row.step_index,
-        type: row.type,
-        source: row.source,
-        status: row.status,
-        content: row.content ?? undefined,
-        thinking: row.thinking ?? undefined,
-        toolCalls: row.tool_calls ?? undefined,
-        createdAt: row.created_at ?? undefined
-      };
-
-      if (options.toolName !== undefined || options.serverName !== undefined) {
-        if (!step.toolCalls) continue;
-        try {
-          const calls = JSON.parse(step.toolCalls);
-          if (!Array.isArray(calls)) continue;
-          const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
-          if (!isMatch) continue;
-        } catch {
-          continue;
-        }
-      }
-
-      const sList = stepsBySession.get(row.session_id) || [];
-      sList.push(step);
-      stepsBySession.set(row.session_id, sList);
-      stepsResult.push(step);
+      this.filterAndPushStep(row, options, stepsBySession, stepsResult);
     }
 
     for (const s of sessionsRows) {
@@ -822,7 +868,9 @@ export class SqliteHistoryStore implements HistoryStore {
         const vec = JSON.parse(s.summary_vector) as number[];
         const sim = dotProduct(queryVector, vec);
         matchedSessions.push({ id: s.id, similarity: sim });
-      } catch {}
+      } catch (e) {
+        console.debug?.("[Chronicle MCP] Failed to parse summary vector:", e);
+      }
     }
 
     matchedSessions.sort((a, b) => b.similarity - a.similarity);
@@ -856,7 +904,9 @@ export class SqliteHistoryStore implements HistoryStore {
           chunkText: c.chunk_text,
           similarity: sim,
         });
-      } catch {}
+      } catch (e) {
+        console.debug?.("[Chronicle MCP] Failed to parse chunk vector:", e);
+      }
     }
 
     results.sort((a, b) => b.similarity - a.similarity);
@@ -872,6 +922,7 @@ export class SqliteHistoryStore implements HistoryStore {
       `).get() as { project_path: string } | undefined;
       return row?.project_path || undefined;
     } catch (e) {
+      console.debug?.("[Chronicle MCP] getActiveProjectPath failed:", e);
       return undefined;
     }
   }
@@ -879,7 +930,9 @@ export class SqliteHistoryStore implements HistoryStore {
   close(): void {
     try {
       this.db.close();
-    } catch {}
+    } catch (e) {
+      console.warn("[Chronicle MCP] Failed to close database:", e);
+    }
   }
 }
 
@@ -890,8 +943,6 @@ export function setStore(store: HistoryStore): void {
 }
 
 export function getStore(): HistoryStore {
-  if (!storeInstance) {
-    storeInstance = new SqliteHistoryStore(DB_PATH);
-  }
+  storeInstance ??= new SqliteHistoryStore(DB_PATH);
   return storeInstance;
 }

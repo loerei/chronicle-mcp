@@ -12,7 +12,7 @@ describe("SessionParser Tests", () => {
           step_index: 0,
           source: "USER_EXPLICIT",
           status: "DONE",
-          content: "<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\\Projects\\my-project</ADDITIONAL_METADATA>",
+          content: String.raw`<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\Projects\my-project</ADDITIONAL_METADATA>`,
           created_at: "2026-06-14T12:00:00.000Z"
         }),
         JSON.stringify({
@@ -39,7 +39,7 @@ describe("SessionParser Tests", () => {
       );
       assert.ok(session.steps);
       assert.strictEqual(session.steps.length, 2);
-      assert.strictEqual(session.steps[0].content, "<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\\Projects\\my-project</ADDITIONAL_METADATA>");
+      assert.strictEqual(session.steps[0].content, String.raw`<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\Projects\my-project</ADDITIONAL_METADATA>`);
     });
 
     it("should extract projectPath from tool calls if not present in user input", () => {
@@ -59,7 +59,7 @@ describe("SessionParser Tests", () => {
             name: "run_command",
             arguments: {
               CommandLine: "npm run build",
-              Cwd: "d:\\Projects\\my-cool-project"
+              Cwd: String.raw`d:\Projects\my-cool-project`
             }
           }]
         })
@@ -162,7 +162,7 @@ describe("SessionParser Tests", () => {
       const state = {
         createdAt: 1700000000000,
         name: "My Composer Title",
-        workspacePath: "d:\\Projects\\another-project",
+        workspacePath: String.raw`d:\Projects\another-project`,
         conversation: [
           {
             type: "user",
