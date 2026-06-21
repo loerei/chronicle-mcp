@@ -53,6 +53,17 @@ function getPathStringsFromCall(call: any): string[] {
   return paths;
 }
 
+function parseUsersPath(parts: string[]): string | null {
+  if (parts.length >= 5 && parts[1].toLowerCase() === "users" && parts[2]) {
+    const isGemini = parts[3] === ".gemini";
+    const isProjects = parts[3].toLowerCase() === "projects";
+    if ((isGemini || isProjects) && parts[4]) {
+      return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
+    }
+  }
+  return null;
+}
+
 function parseProjectFromPath(normalized: string): string | null {
   const projMatch = /^([a-zA-Z]:\/[Pp]rojects\/[a-zA-Z0-9_-]+)/.exec(normalized);
   if (projMatch) {
@@ -64,14 +75,8 @@ function parseProjectFromPath(normalized: string): string | null {
     if (parts[1].toLowerCase() === "projects" && parts[2]) {
       return `${parts[0]}/${parts[1]}/${parts[2]}`;
     }
-    if (parts[1].toLowerCase() === "users" && parts[2] && parts[3]) {
-      if (parts[3] === ".gemini" && parts[4]) {
-        return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
-      }
-      if (parts[3].toLowerCase() === "projects" && parts[4]) {
-        return `${parts[0]}/${parts[1]}/${parts[2]}/${parts[3]}/${parts[4]}`;
-      }
-    }
+    const usersProj = parseUsersPath(parts);
+    if (usersProj) return usersProj;
   }
   return null;
 }
@@ -129,6 +134,49 @@ export class SessionParser {
     }
   }
 
+  private static handleUserInput(
+    data: any,
+    state: {
+      firstPrompt: string;
+      secondPrompt: string;
+      projectPath: string | null;
+      currentTurnUserText: string;
+      currentTurnAssistantText: string;
+      currentStepIndex: number;
+    },
+    chunks: ChunkData[]
+  ): void {
+    const text = data.content || "";
+    const stepIndex = data.step_index ?? 0;
+
+    // Push previous turn if exists
+    if (state.currentTurnUserText) {
+      chunks.push({
+        stepIndex: state.currentStepIndex,
+        text: `User: ${state.currentTurnUserText}\nAssistant: ${state.currentTurnAssistantText}`,
+      });
+    }
+
+    // Extract projectPath from ADDITIONAL_METADATA if present in user input
+    if (text.includes("Workspace mapping") || text.includes("active workspaces")) {
+      const match = text.match(/d:\\Projects\\[a-z0-9_-]+/i) || text.match(/[a-zA-Z]:\\[^\s]+/);
+      if (match) {
+        state.projectPath = match[0].replaceAll("\\", "/");
+      }
+    }
+
+    const cleanedPrompt = cleanUserRequest(text);
+    if (!state.firstPrompt) {
+      state.firstPrompt = cleanedPrompt;
+    } else if (!state.secondPrompt) {
+      state.secondPrompt = cleanedPrompt;
+    }
+
+    state.currentTurnUserText = cleanedPrompt;
+    state.currentTurnAssistantText = "";
+    state.currentStepIndex = stepIndex;
+  }
+
   private static processStepType(
     data: any,
     state: {
@@ -144,37 +192,9 @@ export class SessionParser {
     subagentIds: string[]
   ): void {
     const stepType = data.type;
-    const stepIndex = data.step_index ?? 0;
 
     if (stepType === "USER_INPUT") {
-      const text = data.content || "";
-      
-      // Push previous turn if exists
-      if (state.currentTurnUserText) {
-        chunks.push({
-          stepIndex: state.currentStepIndex,
-          text: `User: ${state.currentTurnUserText}\nAssistant: ${state.currentTurnAssistantText}`,
-        });
-      }
-
-      // Extract projectPath from ADDITIONAL_METADATA if present in user input
-      if (text.includes("Workspace mapping") || text.includes("active workspaces")) {
-        const match = text.match(/d:\\Projects\\[a-z0-9_-]+/i) || text.match(/[a-zA-Z]:\\[^\s]+/);
-        if (match) {
-          state.projectPath = match[0].replaceAll("\\", "/");
-        }
-      }
-
-      const cleanedPrompt = cleanUserRequest(text);
-      if (!state.firstPrompt) {
-        state.firstPrompt = cleanedPrompt;
-      } else if (!state.secondPrompt) {
-        state.secondPrompt = cleanedPrompt;
-      }
-
-      state.currentTurnUserText = cleanedPrompt;
-      state.currentTurnAssistantText = "";
-      state.currentStepIndex = stepIndex;
+      this.handleUserInput(data, state, chunks);
     } else if (stepType === "PLANNER_RESPONSE") {
       const assistantText = data.content || "";
       if (assistantText) {

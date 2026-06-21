@@ -45,6 +45,15 @@ export class CursorAdapter implements HistoryAdapter {
     return dbPath;
   }
 
+  private parseComposers(data: any, sessions: SessionData[]): void {
+    if (!data.composers || typeof data.composers !== "object") return;
+    for (const compId of Object.keys(data.composers)) {
+      const comp = data.composers[compId];
+      const parsed = SessionParser.parseCursorComposer(compId, comp);
+      if (parsed) sessions.push(parsed);
+    }
+  }
+
   private parseComposerRow(row: any, sessions: SessionData[]): void {
     try {
       const rawVal = row.value;
@@ -52,13 +61,7 @@ export class CursorAdapter implements HistoryAdapter {
 
       const data = JSON.parse(rawVal);
       if (row.key.includes("composerStates")) {
-        if (data.composers && typeof data.composers === "object") {
-          for (const compId of Object.keys(data.composers)) {
-            const comp = data.composers[compId];
-            const parsed = SessionParser.parseCursorComposer(compId, comp);
-            if (parsed) sessions.push(parsed);
-          }
-        }
+        this.parseComposers(data, sessions);
       } else {
         const compId = row.key.replace("composer.composerState.", "");
         const parsed = SessionParser.parseCursorComposer(compId, data);

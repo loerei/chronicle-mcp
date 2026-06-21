@@ -85,6 +85,16 @@ interface StepAnalysis {
   stepTokens: number[];
 }
 
+function countToolCalls(toolCalls: string | undefined): number {
+  if (!toolCalls) return 0;
+  try {
+    const parsed = JSON.parse(toolCalls);
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function analyzeSteps(steps: StepData[]): StepAnalysis {
   let minCreatedAt = Infinity;
   let maxCreatedAt = -Infinity;
@@ -94,22 +104,15 @@ function analyzeSteps(steps: StepData[]): StepAnalysis {
 
   for (const step of steps) {
     if (step.createdAt !== undefined) {
-      if (step.createdAt < minCreatedAt) minCreatedAt = step.createdAt;
-      if (step.createdAt > maxCreatedAt) maxCreatedAt = step.createdAt;
+      minCreatedAt = Math.min(minCreatedAt, step.createdAt);
+      maxCreatedAt = Math.max(maxCreatedAt, step.createdAt);
     }
 
     if (step.status === "ERROR") {
       errorStepsCount++;
     }
 
-    if (step.type === "PLANNER_RESPONSE" && step.toolCalls) {
-      try {
-        const parsed = JSON.parse(step.toolCalls);
-        if (Array.isArray(parsed)) {
-          toolCallsCount += parsed.length;
-        }
-      } catch {}
-    }
+    toolCallsCount += countToolCalls(step.type === "PLANNER_RESPONSE" ? step.toolCalls : undefined);
 
     const contentStr = step.content || "";
     const thinkingStr = step.thinking || "";
@@ -129,6 +132,14 @@ interface CachingMetrics {
   lastModelCallIndex: number;
 }
 
+function sumTokens(tokens: number[], start: number, end: number): number {
+  let sum = 0;
+  for (let i = start; i < end; i++) {
+    sum += tokens[i];
+  }
+  return sum;
+}
+
 function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetrics {
   let cumulativeInputTokens = 0;
   let cacheHitTokens = 0;
@@ -138,30 +149,24 @@ function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetric
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    if (step.type === "PLANNER_RESPONSE") {
-      let hit = 0;
-      let miss = 0;
+    if (step.type !== "PLANNER_RESPONSE") continue;
 
-      if (lastModelCallIndex === -1) {
-        for (let j = 0; j < i; j++) {
-          miss += stepTokens[j];
-        }
-      } else {
-        for (let j = 0; j <= lastModelCallIndex; j++) {
-          hit += stepTokens[j];
-        }
-        for (let j = lastModelCallIndex + 1; j < i; j++) {
-          miss += stepTokens[j];
-        }
-      }
+    let hit = 0;
+    let miss = 0;
 
-      cumulativeInputTokens += (hit + miss);
-      cacheHitTokens += hit;
-      cacheMissTokens += miss;
-      estimatedOutputTokens += stepTokens[i];
-
-      lastModelCallIndex = i;
+    if (lastModelCallIndex === -1) {
+      miss = sumTokens(stepTokens, 0, i);
+    } else {
+      hit = sumTokens(stepTokens, 0, lastModelCallIndex + 1);
+      miss = sumTokens(stepTokens, lastModelCallIndex + 1, i);
     }
+
+    cumulativeInputTokens += (hit + miss);
+    cacheHitTokens += hit;
+    cacheMissTokens += miss;
+    estimatedOutputTokens += stepTokens[i];
+
+    lastModelCallIndex = i;
   }
 
   return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex };

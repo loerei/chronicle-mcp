@@ -330,6 +330,23 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
   }
 
+  private matchStep(step: StepData, options: QueryOptions): boolean {
+    if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
+    if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
+    if (options.stepType !== undefined && step.type !== options.stepType) return false;
+    if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
+    
+    if (options.stepQuery !== undefined) {
+      if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
+    }
+    
+    if (options.toolName !== undefined || options.serverName !== undefined) {
+      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
+    }
+
+    return true;
+  }
+
   private filterSteps(sessionIds: Set<string>, options: QueryOptions): StepData[] {
     const matchedSteps: StepData[] = [];
     if (!options.includeSteps) return matchedSteps;
@@ -337,18 +354,7 @@ export class InMemoryHistoryStore implements HistoryStore {
     for (const [sid, steps] of this.stepsMap.entries()) {
       if (!sessionIds.has(sid)) continue;
       for (const step of steps) {
-        if (options.startStep !== undefined && step.stepIndex < options.startStep) continue;
-        if (options.endStep !== undefined && step.stepIndex > options.endStep) continue;
-        if (options.stepType !== undefined && step.type !== options.stepType) continue;
-        if (options.stepStatus !== undefined && step.status !== options.stepStatus) continue;
-        
-        if (options.stepQuery !== undefined) {
-          if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) continue;
-        }
-        
-        if (options.toolName !== undefined || options.serverName !== undefined) {
-          if (!this.matchStepTool(step, options.serverName, options.toolName)) continue;
-        }
+        if (!this.matchStep(step, options)) continue;
 
         const stepCopy = { ...step };
         if (options.excludeContent) {
@@ -455,8 +461,8 @@ export class InMemoryHistoryStore implements HistoryStore {
         createdAt: s.createdAt,
         firstPrompt: s.firstPrompt,
         secondPrompt: s.secondPrompt,
-        parentId: (s as any).parentId || null,
-        subagentIds: (s as any).subagentIds || [],
+        parentId: s.parentId || null,
+        subagentIds: s.subagentIds || [],
         chunks: sessionChunks,
         ...(sessionSteps !== undefined ? { steps: sessionSteps } : {})
       };

@@ -890,7 +890,11 @@ if (isMain) {
   console.error("[Chronicle MCP] Unified History Server running on stdio transport.");
 
   // Run initial sync on startup asynchronously to not block connection
-  syncHistory().catch((e) => {
-    console.error("[Chronicle MCP] Initial sync failed:", e.message);
-  });
+  (async () => {
+    try {
+      await syncHistory();
+    } catch (e: any) {
+      console.error("[Chronicle MCP] Initial sync failed:", e.message || String(e));
+    }
+  })();
 }
