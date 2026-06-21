@@ -177,6 +177,33 @@ export class SessionParser {
     state.currentStepIndex = stepIndex;
   }
 
+  private static handlePlannerResponse(assistantText: string, state: { currentTurnAssistantText: string }): void {
+    if (!assistantText) return;
+    if (state.currentTurnAssistantText) {
+      state.currentTurnAssistantText += "\n" + assistantText;
+    } else {
+      state.currentTurnAssistantText = assistantText;
+    }
+  }
+
+  private static handleConversationHistory(historyText: string, localTitleMap: Map<string, string>): void {
+    const linesInHistory = historyText.split("\n");
+    for (const hLine of linesInHistory) {
+      const match = /## Conversation\s+([a-fA-F0-9-]+):\s*(.*)/.exec(hLine);
+      if (match) {
+        localTitleMap.set(match[1].trim(), match[2].trim());
+      }
+    }
+  }
+
+  private static handleInvokeSubagent(content: string, subagentIds: string[]): void {
+    const regex = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/g;
+    let match;
+    while ((match = regex.exec(content)) !== null) {
+      subagentIds.push(match[1]);
+    }
+  }
+
   private static processStepType(
     data: any,
     state: {
@@ -196,30 +223,11 @@ export class SessionParser {
     if (stepType === "USER_INPUT") {
       this.handleUserInput(data, state, chunks);
     } else if (stepType === "PLANNER_RESPONSE") {
-      const assistantText = data.content || "";
-      if (assistantText) {
-        if (state.currentTurnAssistantText) {
-          state.currentTurnAssistantText += "\n" + assistantText;
-        } else {
-          state.currentTurnAssistantText = assistantText;
-        }
-      }
+      this.handlePlannerResponse(data.content || "", state);
     } else if (stepType === "CONVERSATION_HISTORY") {
-      const historyText = data.content || "";
-      const linesInHistory = historyText.split("\n");
-      for (const hLine of linesInHistory) {
-        const match = /## Conversation\s+([a-fA-F0-9-]+):\s*(.*)/.exec(hLine);
-        if (match) {
-          localTitleMap.set(match[1].trim(), match[2].trim());
-        }
-      }
+      this.handleConversationHistory(data.content || "", localTitleMap);
     } else if (stepType === "INVOKE_SUBAGENT") {
-      const content = data.content || "";
-      const regex = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/g;
-      let match;
-      while ((match = regex.exec(content)) !== null) {
-        subagentIds.push(match[1]);
-      }
+      this.handleInvokeSubagent(data.content || "", subagentIds);
     }
   }
 
