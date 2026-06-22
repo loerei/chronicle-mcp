@@ -150,6 +150,28 @@ const server = new Server(
   }
 );
 
+// Shared schema definition for conversation step slicing and sorting to avoid SonarCloud duplication
+const conversationStepParams = {
+  conversationStepsOnly: {
+    type: "boolean",
+    description: "Include only conversation steps.",
+    default: false,
+  },
+  reverseSteps: {
+    type: "boolean",
+    description: "Retrieve history in reverse order.",
+    default: false,
+  },
+  startConversationStep: {
+    type: "number",
+    description: "Start 1-based conversation step index (inclusive).",
+  },
+  endConversationStep: {
+    type: "number",
+    description: "End 1-based conversation step index (inclusive).",
+  },
+};
+
 // Register Tool Definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools: any[] = [
@@ -229,24 +251,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: "Include step creation timestamps in the output.",
             default: false,
           },
-          conversationStepsOnly: {
-            type: "boolean",
-            description: "Include only conversation steps (USER_INPUT and PLANNER_RESPONSE) in history.",
-            default: false,
-          },
-          reverseSteps: {
-            type: "boolean",
-            description: "Retrieve history in reverse chronological order (newest first).",
-            default: false,
-          },
-          startConversationStep: {
-            type: "number",
-            description: "Start 1-based conversation step index (inclusive) for slicing history.",
-          },
-          endConversationStep: {
-            type: "number",
-            description: "End 1-based conversation step index (inclusive) for slicing history.",
-          },
+          ...conversationStepParams,
         },
         required: ["sessionId"],
       },
@@ -273,24 +278,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "number",
             description: "End step index (inclusive) for range retrieval.",
           },
-          conversationStepsOnly: {
-            type: "boolean",
-            description: "Include only conversation steps.",
-            default: false,
-          },
-          reverseSteps: {
-            type: "boolean",
-            description: "Retrieve history in reverse order.",
-            default: false,
-          },
-          startConversationStep: {
-            type: "number",
-            description: "Start 1-based conversation step index (inclusive).",
-          },
-          endConversationStep: {
-            type: "number",
-            description: "End 1-based conversation step index (inclusive).",
-          },
+          ...conversationStepParams,
         },
         required: ["sessionId"],
       },
