@@ -22,7 +22,14 @@ function cleanUserRequest(text: string): string {
     }
     cleaned = cleaned.substring(0, startIdx) + cleaned.substring(endIdx + "</ADDITIONAL_METADATA>".length);
   }
-  cleaned = cleaned.replace(/<[^>]*>/g, ""); // Strip any leftover HTML/XML tags
+  let tagStart;
+  while ((tagStart = cleaned.indexOf("<")) !== -1) {
+    const tagEnd = cleaned.indexOf(">", tagStart);
+    if (tagEnd === -1) {
+      break;
+    }
+    cleaned = cleaned.substring(0, tagStart) + cleaned.substring(tagEnd + 1);
+  }
   return cleaned.trim();
 }
 
