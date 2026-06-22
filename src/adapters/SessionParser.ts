@@ -14,7 +14,14 @@ function cleanUserRequest(text: string): string {
   cleaned = cleaned.replace(/<USER_REQUEST>[\s\S]*?<\/USER_REQUEST>/g, (match) => {
     return match.replace(/<\/?USER_REQUEST>/g, "");
   });
-  cleaned = cleaned.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, "");
+  let startIdx;
+  while ((startIdx = cleaned.indexOf("<ADDITIONAL_METADATA>")) !== -1) {
+    const endIdx = cleaned.indexOf("</ADDITIONAL_METADATA>", startIdx);
+    if (endIdx === -1) {
+      break;
+    }
+    cleaned = cleaned.substring(0, startIdx) + cleaned.substring(endIdx + "</ADDITIONAL_METADATA>".length);
+  }
   cleaned = cleaned.replace(/<[^>]*>/g, ""); // Strip any leftover HTML/XML tags
   return cleaned.trim();
 }
@@ -371,6 +378,48 @@ export class SessionParser {
     return null;
   }
 
+  private static parseBubbleCreatedAt(bubble: any, defaultCreatedAt: number): number {
+    if (!bubble.createdAt) {
+      return defaultCreatedAt;
+    }
+    if (typeof bubble.createdAt === "string") {
+      return new Date(bubble.createdAt).getTime();
+    }
+    return bubble.createdAt;
+  }
+
+  private static parseUserBubble(
+    bubble: any,
+    bubbleCreatedAt: number,
+    promptState: { firstPrompt: string; secondPrompt: string },
+    chunks: ChunkData[],
+    steps: StepData[],
+    state: { stepIndexCounter: number; currentUserText: string; currentAssistantTexts: string[] }
+  ): void {
+    const userText = bubble.text || "";
+
+    if (!promptState.firstPrompt) promptState.firstPrompt = userText;
+    else if (!promptState.secondPrompt) promptState.secondPrompt = userText;
+
+    if (state.currentUserText || state.currentAssistantTexts.length > 0) {
+      chunks.push({
+        stepIndex: state.stepIndexCounter,
+        text: `User: ${state.currentUserText}\nAssistant: ${state.currentAssistantTexts.join("\n")}`,
+      });
+      state.currentAssistantTexts = [];
+    }
+    state.currentUserText = userText;
+
+    steps.push({
+      stepIndex: state.stepIndexCounter++,
+      type: "USER_INPUT",
+      source: "USER_EXPLICIT",
+      status: "DONE",
+      content: userText,
+      createdAt: bubbleCreatedAt,
+    });
+  }
+
   private static parseCursorNewFormat(
     conversation: any[],
     composerState: any,
@@ -378,52 +427,32 @@ export class SessionParser {
     chunks: ChunkData[],
     steps: StepData[]
   ): void {
-    let stepIndexCounter = 0;
-    let currentUserText = "";
-    let currentAssistantTexts: string[] = [];
+    const state = {
+      stepIndexCounter: 0,
+      currentUserText: "",
+      currentAssistantTexts: [] as string[],
+    };
+    const defaultCreatedAt = composerState.createdAt || Date.now();
 
     for (const bubble of conversation) {
       if (!bubble) continue;
-      const bubbleCreatedAt = bubble.createdAt
-        ? (typeof bubble.createdAt === "string" ? new Date(bubble.createdAt).getTime() : bubble.createdAt)
-        : (composerState.createdAt || Date.now());
+      const bubbleCreatedAt = this.parseBubbleCreatedAt(bubble, defaultCreatedAt);
 
       if (bubble.type === 1) { // User
-        const userText = bubble.text || "";
-        
-        if (!promptState.firstPrompt) promptState.firstPrompt = userText;
-        else if (!promptState.secondPrompt) promptState.secondPrompt = userText;
-
-        if (currentUserText || currentAssistantTexts.length > 0) {
-          chunks.push({
-            stepIndex: stepIndexCounter,
-            text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
-          });
-          currentAssistantTexts = [];
-        }
-        currentUserText = userText;
-
-        steps.push({
-          stepIndex: stepIndexCounter++,
-          type: "USER_INPUT",
-          source: "USER_EXPLICIT",
-          status: "DONE",
-          content: userText,
-          createdAt: bubbleCreatedAt,
-        });
+        this.parseUserBubble(bubble, bubbleCreatedAt, promptState, chunks, steps, state);
       } else if (bubble.type === 2) { // AI
-        this.parseCursorAIBubble(bubble, bubbleCreatedAt, stepIndexCounter, currentAssistantTexts, steps);
-        stepIndexCounter += 1;
+        this.parseCursorAIBubble(bubble, bubbleCreatedAt, state.stepIndexCounter, state.currentAssistantTexts, steps);
+        state.stepIndexCounter += 1;
         if (bubble.toolFormerData) {
-          stepIndexCounter += 1;
+          state.stepIndexCounter += 1;
         }
       }
     }
 
-    if (currentUserText || currentAssistantTexts.length > 0) {
+    if (state.currentUserText || state.currentAssistantTexts.length > 0) {
       chunks.push({
-        stepIndex: stepIndexCounter,
-        text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
+        stepIndex: state.stepIndexCounter,
+        text: `User: ${state.currentUserText}\nAssistant: ${state.currentAssistantTexts.join("\n")}`,
       });
     }
   }

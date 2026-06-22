@@ -392,22 +392,26 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
   }
 
+  private isConversationStep(step: StepData): boolean {
+    if (step.type === "USER_INPUT") return true;
+    return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+  }
+
+  private matchStepQueryAndTool(step: StepData, options: QueryOptions): boolean {
+    if (options.stepQuery !== undefined && !this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
+    if (options.toolName !== undefined || options.serverName !== undefined) {
+      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
+    }
+    return true;
+  }
+
   private matchStep(step: StepData, options: QueryOptions): boolean {
     if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
     if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
     if (options.stepType !== undefined && step.type !== options.stepType) return false;
     if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
-    if (options.conversationStepsOnly && step.type !== "USER_INPUT" && !(step.type === "PLANNER_RESPONSE" && step.content && step.content.trim() !== "")) return false;
-    
-    if (options.stepQuery !== undefined) {
-      if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
-    }
-    
-    if (options.toolName !== undefined || options.serverName !== undefined) {
-      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
-    }
-
-    return true;
+    if (options.conversationStepsOnly && !this.isConversationStep(step)) return false;
+    return this.matchStepQueryAndTool(step, options);
   }
 
   private filterSteps(sessionIds: Set<string>, options: QueryOptions): StepData[] {
@@ -480,33 +484,32 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
   }
 
-  query(options: QueryOptions): QueryResult {
-    const queryOpts = { ...options };
+  private resolveConversationSteps(queryOpts: QueryOptions): void {
+    if (!queryOpts.sessionId) return;
+    if (queryOpts.startConversationStep === undefined && queryOpts.endConversationStep === undefined) return;
 
-    if (queryOpts.sessionId && (queryOpts.startConversationStep !== undefined || queryOpts.endConversationStep !== undefined)) {
-      const steps = this.stepsMap.get(queryOpts.sessionId) || [];
-      const convSteps = steps
-        .filter(s => s.type === "USER_INPUT" || (s.type === "PLANNER_RESPONSE" && s.content && s.content.trim() !== ""))
-        .sort((a, b) => a.stepIndex - b.stepIndex);
+    const steps = this.stepsMap.get(queryOpts.sessionId) || [];
+    const convSteps = steps
+      .filter(s => s.type === "USER_INPUT" || (s.type === "PLANNER_RESPONSE" && s.content && s.content.trim() !== ""))
+      .sort((a, b) => a.stepIndex - b.stepIndex);
 
-      if (queryOpts.startConversationStep !== undefined) {
-        const idx = queryOpts.startConversationStep - 1;
-        if (idx >= 0 && idx < convSteps.length) {
-          queryOpts.startStep = convSteps[idx].stepIndex;
-        } else {
-          queryOpts.startStep = Infinity;
-        }
-      }
-      if (queryOpts.endConversationStep !== undefined) {
-        const idx = queryOpts.endConversationStep - 1;
-        if (idx >= 0 && idx < convSteps.length) {
-          queryOpts.endStep = convSteps[idx].stepIndex;
-        } else if (idx < 0) {
-          queryOpts.endStep = -1;
-        }
+    if (queryOpts.startConversationStep !== undefined) {
+      const idx = queryOpts.startConversationStep - 1;
+      queryOpts.startStep = (idx >= 0 && idx < convSteps.length) ? convSteps[idx].stepIndex : Infinity;
+    }
+    if (queryOpts.endConversationStep !== undefined) {
+      const idx = queryOpts.endConversationStep - 1;
+      if (idx >= 0 && idx < convSteps.length) {
+        queryOpts.endStep = convSteps[idx].stepIndex;
+      } else if (idx < 0) {
+        queryOpts.endStep = -1;
       }
     }
+  }
 
+  query(options: QueryOptions): QueryResult {
+    const queryOpts = { ...options };
+    this.resolveConversationSteps(queryOpts);
     const matchedSessions = this.filterSessions(queryOpts);
     const sessionIds = new Set(matchedSessions.map(s => s.id));
 
