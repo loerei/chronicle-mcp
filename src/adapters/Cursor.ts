@@ -93,6 +93,70 @@ export class CursorAdapter implements HistoryAdapter {
     }
   }
 
+  private resolveDiskKVWorkspacePath(composerData: any, dbPath: string): string | null {
+    if (composerData.workspaceIdentifier?.uri?.fsPath) {
+      return composerData.workspaceIdentifier.uri.fsPath;
+    }
+    if (composerData.workspaceIdentifier?.id) {
+      const wsId = composerData.workspaceIdentifier.id;
+      const workspaceJsonPath = path.join(
+        path.dirname(path.dirname(dbPath)),
+        "workspaceStorage",
+        wsId,
+        "workspace.json"
+      );
+      if (fs.existsSync(workspaceJsonPath)) {
+        try {
+          const wsJson = JSON.parse(fs.readFileSync(workspaceJsonPath, "utf-8"));
+          return this.parseWorkspacePath(wsJson);
+        } catch {}
+      }
+    }
+    return null;
+  }
+
+  private retrieveConversationBubbles(db: any, composerId: string, composerData: any): any[] {
+    const bubbleHeaders = composerData.fullConversationHeadersOnly || [];
+    const conversationBubbles: any[] = [];
+    for (const header of bubbleHeaders) {
+      const bubbleKey = `bubbleId:${composerId}:${header.bubbleId}`;
+      const bubbleRow = db
+        .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+        .get(bubbleKey) as any;
+      if (bubbleRow?.value) {
+        try {
+          conversationBubbles.push(JSON.parse(bubbleRow.value));
+        } catch {}
+      }
+    }
+    return conversationBubbles;
+  }
+
+  private parseDiskKVRow(row: any, db: any, dbPath: string, sessions: SessionData[]): void {
+    try {
+      const composerId = row.key.replace("composerData:", "");
+      const composerData = JSON.parse(row.value);
+      if (!composerData) return;
+
+      const resolvedWorkspacePath = this.resolveDiskKVWorkspacePath(composerData, dbPath);
+      const conversationBubbles = this.retrieveConversationBubbles(db, composerId, composerData);
+
+      if (conversationBubbles.length > 0) {
+        const state = {
+          createdAt: composerData.createdAt || Date.now(),
+          workspacePath: resolvedWorkspacePath,
+          conversation: conversationBubbles,
+        };
+        const parsed = SessionParser.parseCursorComposer(composerId, state);
+        if (parsed) {
+          sessions.push(parsed);
+        }
+      }
+    } catch (rowErr) {
+      console.warn("CursorAdapter failed to parse cursorDiskKV composer row:", rowErr);
+    }
+  }
+
   async discoverSessions(): Promise<SessionData[]> {
     const dbPath = this.getDbPath();
 
@@ -120,60 +184,7 @@ export class CursorAdapter implements HistoryAdapter {
           .all() as any[];
 
         for (const row of rows) {
-          try {
-            const composerId = row.key.replace("composerData:", "");
-            const composerData = JSON.parse(row.value);
-            if (!composerData) continue;
-
-            // Resolve workspace path
-            let resolvedWorkspacePath: string | null = null;
-            if (composerData.workspaceIdentifier?.uri?.fsPath) {
-              resolvedWorkspacePath = composerData.workspaceIdentifier.uri.fsPath;
-            } else if (composerData.workspaceIdentifier?.id) {
-              const wsId = composerData.workspaceIdentifier.id;
-              const workspaceJsonPath = path.join(
-                path.dirname(path.dirname(dbPath)),
-                "workspaceStorage",
-                wsId,
-                "workspace.json"
-              );
-              if (fs.existsSync(workspaceJsonPath)) {
-                try {
-                  const wsJson = JSON.parse(fs.readFileSync(workspaceJsonPath, "utf-8"));
-                  resolvedWorkspacePath = this.parseWorkspacePath(wsJson);
-                } catch {}
-              }
-            }
-
-            // Retrieve conversation bubbles
-            const bubbleHeaders = composerData.fullConversationHeadersOnly || [];
-            const conversationBubbles: any[] = [];
-            for (const header of bubbleHeaders) {
-              const bubbleKey = `bubbleId:${composerId}:${header.bubbleId}`;
-              const bubbleRow = db
-                .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
-                .get(bubbleKey) as any;
-              if (bubbleRow && bubbleRow.value) {
-                try {
-                  conversationBubbles.push(JSON.parse(bubbleRow.value));
-                } catch {}
-              }
-            }
-
-            if (conversationBubbles.length > 0) {
-              const state = {
-                createdAt: composerData.createdAt || Date.now(),
-                workspacePath: resolvedWorkspacePath,
-                conversation: conversationBubbles,
-              };
-              const parsed = SessionParser.parseCursorComposer(composerId, state);
-              if (parsed) {
-                sessions.push(parsed);
-              }
-            }
-          } catch (rowErr) {
-            console.warn("CursorAdapter failed to parse cursorDiskKV composer row:", rowErr);
-          }
+          this.parseDiskKVRow(row, db, dbPath, sessions);
         }
       }
 

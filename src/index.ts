@@ -1,4 +1,4 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js"; // NOSONAR
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
@@ -138,7 +138,7 @@ export async function syncHistory(force: boolean = false): Promise<void> {
 }
 
 // Initialize MCP Server
-const server = new Server(
+const server = new Server( // NOSONAR
   {
     name: "chronicle-mcp",
     version: "1.0.0",

@@ -15,7 +15,7 @@ function cleanUserRequest(text: string): string {
     return match.replace(/<\/?USER_REQUEST>/g, "");
   });
   cleaned = cleaned.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/g, "");
-  cleaned = cleaned.replace(/<[^>]+>/g, ""); // Strip any leftover HTML/XML tags
+  cleaned = cleaned.replace(/<[^>]*>/g, ""); // Strip any leftover HTML/XML tags
   return cleaned.trim();
 }
 
@@ -371,6 +371,127 @@ export class SessionParser {
     return null;
   }
 
+  private static parseCursorNewFormat(
+    conversation: any[],
+    composerState: any,
+    promptState: { firstPrompt: string; secondPrompt: string },
+    chunks: ChunkData[],
+    steps: StepData[]
+  ): void {
+    let stepIndexCounter = 0;
+    let currentUserText = "";
+    let currentAssistantTexts: string[] = [];
+
+    for (const bubble of conversation) {
+      if (!bubble) continue;
+      const bubbleCreatedAt = bubble.createdAt
+        ? (typeof bubble.createdAt === "string" ? new Date(bubble.createdAt).getTime() : bubble.createdAt)
+        : (composerState.createdAt || Date.now());
+
+      if (bubble.type === 1) { // User
+        const userText = bubble.text || "";
+        
+        if (!promptState.firstPrompt) promptState.firstPrompt = userText;
+        else if (!promptState.secondPrompt) promptState.secondPrompt = userText;
+
+        if (currentUserText || currentAssistantTexts.length > 0) {
+          chunks.push({
+            stepIndex: stepIndexCounter,
+            text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
+          });
+          currentAssistantTexts = [];
+        }
+        currentUserText = userText;
+
+        steps.push({
+          stepIndex: stepIndexCounter++,
+          type: "USER_INPUT",
+          source: "USER_EXPLICIT",
+          status: "DONE",
+          content: userText,
+          createdAt: bubbleCreatedAt,
+        });
+      } else if (bubble.type === 2) { // AI
+        this.parseCursorAIBubble(bubble, bubbleCreatedAt, stepIndexCounter, currentAssistantTexts, steps);
+        stepIndexCounter += 1;
+        if (bubble.toolFormerData) {
+          stepIndexCounter += 1;
+        }
+      }
+    }
+
+    if (currentUserText || currentAssistantTexts.length > 0) {
+      chunks.push({
+        stepIndex: stepIndexCounter,
+        text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
+      });
+    }
+  }
+
+  private static parseCursorAIBubble(
+    bubble: any,
+    bubbleCreatedAt: number,
+    stepIndex: number,
+    currentAssistantTexts: string[],
+    steps: StepData[]
+  ): void {
+    const stepContent = bubble.text || undefined;
+    let stepThinking: string | undefined = undefined;
+    if (bubble.thinking) {
+      if (typeof bubble.thinking === "string") {
+        stepThinking = bubble.thinking;
+      } else {
+        stepThinking = bubble.thinking.text || undefined;
+      }
+    }
+
+    let stepToolCalls: string | undefined = undefined;
+    if (bubble.toolFormerData) {
+      const toolName = bubble.toolFormerData.name;
+      let args = {};
+      try {
+        args = bubble.toolFormerData.params ? JSON.parse(bubble.toolFormerData.params) : {};
+      } catch {}
+      stepToolCalls = JSON.stringify([{
+        name: toolName,
+        args: args,
+      }]);
+    }
+
+    if (stepContent) {
+      currentAssistantTexts.push(stepContent);
+    }
+
+    steps.push({
+      stepIndex,
+      type: "PLANNER_RESPONSE",
+      source: "MODEL",
+      status: "DONE",
+      content: stepContent,
+      thinking: stepThinking,
+      toolCalls: stepToolCalls,
+      createdAt: bubbleCreatedAt,
+    });
+
+    // Separate tool result step
+    if (bubble.toolFormerData) {
+      const toolName = bubble.toolFormerData.name;
+      const isCommand = toolName === "execute_command" || toolName === "run_command";
+      const type = isCommand ? "COMMAND" : "MCP_TOOL";
+      const status = bubble.toolFormerData.status === "completed" ? "DONE" : "ERROR";
+      const content = bubble.toolFormerData.result || bubble.toolFormerData.error || "";
+
+      steps.push({
+        stepIndex: stepIndex + 1,
+        type,
+        source: "SYSTEM",
+        status,
+        content,
+        createdAt: bubbleCreatedAt,
+      });
+    }
+  }
+
   static parseCursorComposer(composerId: string, composerState: any): SessionData | null {
     if (!Array.isArray(composerState?.conversation)) {
       return null;
@@ -385,100 +506,7 @@ export class SessionParser {
     const isNewFormat = conversation.some((msg: any) => msg && (msg.type === 1 || msg.type === 2));
 
     if (isNewFormat) {
-      let stepIndexCounter = 0;
-      let currentUserText = "";
-      let currentAssistantTexts: string[] = [];
-
-      for (const bubble of conversation) {
-        if (!bubble) continue;
-        const bubbleCreatedAt = bubble.createdAt
-          ? (typeof bubble.createdAt === "string" ? new Date(bubble.createdAt).getTime() : bubble.createdAt)
-          : (composerState.createdAt || Date.now());
-
-        if (bubble.type === 1) { // User
-          const userText = bubble.text || "";
-          
-          if (!promptState.firstPrompt) promptState.firstPrompt = userText;
-          else if (!promptState.secondPrompt) promptState.secondPrompt = userText;
-
-          if (currentUserText || currentAssistantTexts.length > 0) {
-            chunks.push({
-              stepIndex: stepIndexCounter,
-              text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
-            });
-            currentAssistantTexts = [];
-          }
-          currentUserText = userText;
-
-          steps.push({
-            stepIndex: stepIndexCounter++,
-            type: "USER_INPUT",
-            source: "USER_EXPLICIT",
-            status: "DONE",
-            content: userText,
-            createdAt: bubbleCreatedAt,
-          });
-        } else if (bubble.type === 2) { // AI
-          const stepContent = bubble.text || undefined;
-          let stepThinking: string | undefined = undefined;
-          if (bubble.thinking) {
-            stepThinking = typeof bubble.thinking === "string" ? bubble.thinking : (bubble.thinking.text || undefined);
-          }
-
-          let stepToolCalls: string | undefined = undefined;
-          if (bubble.toolFormerData) {
-            const toolName = bubble.toolFormerData.name;
-            let args = {};
-            try {
-              args = bubble.toolFormerData.params ? JSON.parse(bubble.toolFormerData.params) : {};
-            } catch {}
-            stepToolCalls = JSON.stringify([{
-              name: toolName,
-              args: args,
-            }]);
-          }
-
-          if (stepContent) {
-            currentAssistantTexts.push(stepContent);
-          }
-
-          steps.push({
-            stepIndex: stepIndexCounter++,
-            type: "PLANNER_RESPONSE",
-            source: "MODEL",
-            status: "DONE",
-            content: stepContent,
-            thinking: stepThinking,
-            toolCalls: stepToolCalls,
-            createdAt: bubbleCreatedAt,
-          });
-
-          // Separate tool result step
-          if (bubble.toolFormerData) {
-            const toolName = bubble.toolFormerData.name;
-            const isCommand = toolName === "execute_command" || toolName === "run_command";
-            const type = isCommand ? "COMMAND" : "MCP_TOOL";
-            const status = bubble.toolFormerData.status === "completed" ? "DONE" : "ERROR";
-            const content = bubble.toolFormerData.result || bubble.toolFormerData.error || "";
-
-            steps.push({
-              stepIndex: stepIndexCounter++,
-              type,
-              source: "SYSTEM",
-              status,
-              content,
-              createdAt: bubbleCreatedAt,
-            });
-          }
-        }
-      }
-
-      if (currentUserText || currentAssistantTexts.length > 0) {
-        chunks.push({
-          stepIndex: stepIndexCounter,
-          text: `User: ${currentUserText}\nAssistant: ${currentAssistantTexts.join("\n")}`,
-        });
-      }
+      this.parseCursorNewFormat(conversation, composerState, promptState, chunks, steps);
     } else {
       // Legacy parsing
       for (let i = 0; i < conversation.length; i++) {
