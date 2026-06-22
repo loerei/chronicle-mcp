@@ -105,6 +105,7 @@ export function getDb(): DatabaseSync {
       title TEXT NOT NULL,
       project_path TEXT,
       created_at INTEGER,
+      last_active_at INTEGER,
       first_prompt TEXT,
       second_prompt TEXT,
       summary_vector TEXT,
@@ -151,6 +152,14 @@ export function getDb(): DatabaseSync {
     }
   }
 
+  try {
+    db.exec("ALTER TABLE sessions ADD COLUMN last_active_at INTEGER;");
+  } catch (e: any) {
+    if (!e?.message?.includes("duplicate column name")) {
+      console.debug?.("[Chronicle MCP] Alter table last_active_at failed:", e);
+    }
+  }
+
   return db;
 }
 
@@ -174,6 +183,12 @@ export interface QueryOptions {
   toolName?: string;
   serverName?: string;
   excludeContent?: boolean;
+  timeRange?: string; // Format: "start:end"
+  sortBy?: "created" | "active";
+  conversationStepsOnly?: boolean;
+  reverseSteps?: boolean;
+  startConversationStep?: number;
+  endConversationStep?: number;
 }
 
 export interface QueryResult {
@@ -207,6 +222,31 @@ function dotProduct(a: number[], b: number[]): number {
     val += a[i] * b[i];
   }
   return val;
+}
+
+function parseTimeRange(timeRange: string): { start: number | null; end: number | null } | null {
+  const parts = timeRange.split(":");
+  if (parts.length !== 2) return null;
+  const parseVal = (val: string): number | null => {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      const num = Number.parseInt(trimmed, 10);
+      if (num >= 1000000000 && num <= 9999999999) {
+        return num * 1000;
+      }
+      return num;
+    }
+    const date = new Date(trimmed);
+    if (!Number.isNaN(date.getTime())) {
+      return date.getTime();
+    }
+    return null;
+  };
+  return {
+    start: parseVal(parts[0]),
+    end: parseVal(parts[1])
+  };
 }
 
 export class InMemoryHistoryStore implements HistoryStore {
@@ -268,6 +308,17 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
   }
 
+  private filterSessionsByTimeRange(sessions: any[], timeRange: string): any[] {
+    const range = parseTimeRange(timeRange);
+    if (!range) return sessions;
+    return sessions.filter(s => {
+      const activeTime = (s as any).lastActiveAt ?? s.createdAt;
+      if (range.start !== null && activeTime < range.start) return false;
+      if (range.end !== null && activeTime > range.end) return false;
+      return true;
+    });
+  }
+
   private filterSessions(options: QueryOptions): any[] {
     let matchedSessions = Array.from(this.sessionsMap.values());
 
@@ -289,6 +340,17 @@ export class InMemoryHistoryStore implements HistoryStore {
         s.projectPath?.toLowerCase().includes(pathFilter)
       );
     }
+
+    if (options.timeRange !== undefined) {
+      matchedSessions = this.filterSessionsByTimeRange(matchedSessions, options.timeRange);
+    }
+
+    const sortBy = options.sortBy || "active";
+    matchedSessions.sort((a, b) => {
+      const timeA = sortBy === "created" ? a.createdAt : ((a as any).lastActiveAt ?? a.createdAt);
+      const timeB = sortBy === "created" ? b.createdAt : ((b as any).lastActiveAt ?? b.createdAt);
+      return timeB - timeA;
+    });
 
     if (options.limit !== undefined) {
       matchedSessions = matchedSessions.slice(0, options.limit);
@@ -330,21 +392,26 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
   }
 
+  private isConversationStep(step: StepData): boolean {
+    if (step.type === "USER_INPUT") return true;
+    return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+  }
+
+  private matchStepQueryAndTool(step: StepData, options: QueryOptions): boolean {
+    if (options.stepQuery !== undefined && !this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
+    if (options.toolName !== undefined || options.serverName !== undefined) {
+      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
+    }
+    return true;
+  }
+
   private matchStep(step: StepData, options: QueryOptions): boolean {
     if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
     if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
     if (options.stepType !== undefined && step.type !== options.stepType) return false;
     if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
-    
-    if (options.stepQuery !== undefined) {
-      if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
-    }
-    
-    if (options.toolName !== undefined || options.serverName !== undefined) {
-      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
-    }
-
-    return true;
+    if (options.conversationStepsOnly && !this.isConversationStep(step)) return false;
+    return this.matchStepQueryAndTool(step, options);
   }
 
   private filterSteps(sessionIds: Set<string>, options: QueryOptions): StepData[] {
@@ -386,12 +453,16 @@ export class InMemoryHistoryStore implements HistoryStore {
       summaryVector = (existingSession as any).summary_vector;
     }
 
+    const stepTimestamps = (session.steps || []).map(s => s.createdAt).filter((t): t is number => t !== undefined);
+    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : (session.lastActiveAt ?? session.createdAt);
+
     const sessionCopy = {
       id: session.id,
       adapter: session.adapter,
       title: session.title,
       projectPath: session.projectPath,
       createdAt: session.createdAt,
+      lastActiveAt,
       firstPrompt: session.firstPrompt,
       secondPrompt: session.secondPrompt,
       parentId,
@@ -413,45 +484,70 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
   }
 
+  private resolveConversationSteps(queryOpts: QueryOptions): void {
+    if (!queryOpts.sessionId) return;
+    if (queryOpts.startConversationStep === undefined && queryOpts.endConversationStep === undefined) return;
+
+    const steps = this.stepsMap.get(queryOpts.sessionId) || [];
+    const convSteps = steps
+      .filter(s => s.type === "USER_INPUT" || (s.type === "PLANNER_RESPONSE" && s.content && s.content.trim() !== ""))
+      .sort((a, b) => a.stepIndex - b.stepIndex);
+
+    if (queryOpts.startConversationStep !== undefined) {
+      const idx = queryOpts.startConversationStep - 1;
+      queryOpts.startStep = (idx >= 0 && idx < convSteps.length) ? convSteps[idx].stepIndex : Infinity;
+    }
+    if (queryOpts.endConversationStep !== undefined) {
+      const idx = queryOpts.endConversationStep - 1;
+      if (idx >= 0 && idx < convSteps.length) {
+        queryOpts.endStep = convSteps[idx].stepIndex;
+      } else if (idx < 0) {
+        queryOpts.endStep = -1;
+      }
+    }
+  }
+
   query(options: QueryOptions): QueryResult {
-    const matchedSessions = this.filterSessions(options);
+    const queryOpts = { ...options };
+    this.resolveConversationSteps(queryOpts);
+    const matchedSessions = this.filterSessions(queryOpts);
     const sessionIds = new Set(matchedSessions.map(s => s.id));
 
-    const matchedChunks = this.filterChunks(sessionIds, options);
-    const matchedSteps = this.filterSteps(sessionIds, options);
+    const matchedChunks = this.filterChunks(sessionIds, queryOpts);
+    const matchedSteps = this.filterSteps(sessionIds, queryOpts);
+
+    if (queryOpts.reverseSteps) {
+      matchedSteps.reverse();
+      matchedChunks.reverse();
+    }
 
     const sessionsResult = matchedSessions.map(s => {
       const sessionChunks = (this.chunksMap.get(s.id) || [])
         .filter(c => {
-          if (options.startStep !== undefined && c.stepIndex < options.startStep) return false;
-          if (options.endStep !== undefined && c.stepIndex > options.endStep) return false;
+          if (queryOpts.startStep !== undefined && c.stepIndex < queryOpts.startStep) return false;
+          if (queryOpts.endStep !== undefined && c.stepIndex > queryOpts.endStep) return false;
           return true;
         })
         .map(c => ({ stepIndex: c.stepIndex, text: c.text }));
 
-      const sessionSteps = options.includeSteps ? (this.stepsMap.get(s.id) || [])
-        .filter(step => {
-          if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
-          if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
-          if (options.stepType !== undefined && step.type !== options.stepType) return false;
-          if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
-          
-          if (options.stepQuery !== undefined) {
-            if (!this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
-          }
-          if (options.toolName !== undefined || options.serverName !== undefined) {
-            if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
-          }
-          return true;
-        })
+      if (queryOpts.reverseSteps) {
+        sessionChunks.reverse();
+      }
+
+      const sessionSteps = queryOpts.includeSteps ? (this.stepsMap.get(s.id) || [])
+        .filter(step => this.matchStep(step, queryOpts))
         .map(step => {
           const stepCopy = { ...step };
-          if (options.excludeContent) {
+          if (queryOpts.excludeContent) {
             delete stepCopy.content;
             delete stepCopy.thinking;
           }
           return stepCopy;
         }) : undefined;
+
+      if (sessionSteps && queryOpts.reverseSteps) {
+        sessionSteps.reverse();
+      }
 
       return {
         id: s.id,
@@ -459,6 +555,7 @@ export class InMemoryHistoryStore implements HistoryStore {
         title: s.title,
         projectPath: s.projectPath,
         createdAt: s.createdAt,
+        lastActiveAt: (s as any).lastActiveAt ?? s.createdAt,
         firstPrompt: s.firstPrompt,
         secondPrompt: s.secondPrompt,
         parentId: s.parentId || null,
@@ -548,6 +645,7 @@ export class SqliteHistoryStore implements HistoryStore {
         title TEXT NOT NULL,
         project_path TEXT,
         created_at INTEGER,
+        last_active_at INTEGER,
         first_prompt TEXT,
         second_prompt TEXT,
         summary_vector TEXT,
@@ -593,6 +691,14 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN last_active_at INTEGER;");
+    } catch (e: any) {
+      if (!e?.message?.includes("duplicate column name")) {
+        console.debug?.("[Chronicle MCP] last_active_at alter table failed:", e);
+      }
+    }
+
+    try {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);");
     } catch (e) {
       // Ignore error if column/index already exists
@@ -601,6 +707,10 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   private filterAndPushStep(row: any, options: QueryOptions, stepsBySession: Map<string, StepData[]>, stepsResult: StepData[]): void {
+    if (options.conversationStepsOnly && row.type !== "USER_INPUT" && !(row.type === "PLANNER_RESPONSE" && row.content && row.content.trim() !== "")) {
+      return;
+    }
+
     const step: StepData = {
       stepIndex: row.step_index,
       type: row.type,
@@ -642,14 +752,18 @@ export class SqliteHistoryStore implements HistoryStore {
         }
       }
 
+      const stepTimestamps = (session.steps || []).map(s => s.createdAt).filter((t): t is number => t !== undefined);
+      const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : (session.lastActiveAt ?? session.createdAt);
+
       const summaryStr = embeddings.summary ? JSON.stringify(embeddings.summary) : null;
       db.prepare(`
-        INSERT INTO sessions (id, adapter, title, project_path, created_at, first_prompt, second_prompt, summary_vector, parent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (id, adapter, title, project_path, created_at, last_active_at, first_prompt, second_prompt, summary_vector, parent_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           project_path = excluded.project_path,
           created_at = excluded.created_at,
+          last_active_at = excluded.last_active_at,
           first_prompt = excluded.first_prompt,
           second_prompt = excluded.second_prompt,
           summary_vector = COALESCE(excluded.summary_vector, summary_vector),
@@ -660,6 +774,7 @@ export class SqliteHistoryStore implements HistoryStore {
         session.title,
         session.projectPath,
         session.createdAt,
+        lastActiveAt,
         session.firstPrompt,
         session.secondPrompt,
         summaryStr,
@@ -710,8 +825,21 @@ export class SqliteHistoryStore implements HistoryStore {
     }
   }
 
+  private buildSessionQueryTimeRange(where: string[], params: any[], timeRange: string): void {
+    const range = parseTimeRange(timeRange);
+    if (!range) return;
+    if (range.start !== null) {
+      where.push("COALESCE(last_active_at, created_at) >= ?");
+      params.push(range.start);
+    }
+    if (range.end !== null) {
+      where.push("COALESCE(last_active_at, created_at) <= ?");
+      params.push(range.end);
+    }
+  }
+
   private buildSessionQuery(options: QueryOptions, params: any[]): string {
-    let sql = `SELECT id, adapter, title, project_path, created_at, first_prompt, second_prompt, parent_id FROM sessions`;
+    let sql = `SELECT id, adapter, title, project_path, created_at, last_active_at, first_prompt, second_prompt, parent_id FROM sessions`;
     const where: string[] = [];
 
     if (options.sessionId !== undefined) {
@@ -732,9 +860,17 @@ export class SqliteHistoryStore implements HistoryStore {
       params.push(`%${resolvedProjectPath}%`);
     }
 
+    if (options.timeRange !== undefined) {
+      this.buildSessionQueryTimeRange(where, params, options.timeRange);
+    }
+
     if (where.length > 0) {
       sql += " WHERE " + where.join(" AND ");
     }
+
+    const sortBy = options.sortBy || "active";
+    const orderCol = sortBy === "created" ? "created_at" : "COALESCE(last_active_at, created_at)";
+    sql += ` ORDER BY ${orderCol} DESC`;
 
     if (options.limit !== undefined) {
       sql += " LIMIT ?";
@@ -753,7 +889,8 @@ export class SqliteHistoryStore implements HistoryStore {
       sql += " AND step_index <= ?";
       params.push(options.endStep);
     }
-    sql += " ORDER BY step_index ASC";
+    const sortDir = options.reverseSteps ? "DESC" : "ASC";
+    sql += ` ORDER BY step_index ${sortDir}`;
     return sql;
   }
 
@@ -782,15 +919,50 @@ export class SqliteHistoryStore implements HistoryStore {
       sql += " AND (content LIKE ? OR thinking LIKE ? OR tool_calls LIKE ?)";
       params.push(`%${options.stepQuery}%`, `%${options.stepQuery}%`, `%${options.stepQuery}%`);
     }
-    sql += " ORDER BY step_index ASC";
+    const sortDir = options.reverseSteps ? "DESC" : "ASC";
+    sql += ` ORDER BY step_index ${sortDir}`;
     return sql;
+  }
+
+  private resolveConversationSteps(db: any, queryOpts: QueryOptions): void {
+    if (queryOpts.startConversationStep !== undefined) {
+      const row = db.prepare(`
+        SELECT step_index FROM session_steps
+        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))
+        ORDER BY step_index ASC
+        LIMIT 1 OFFSET ?
+      `).get(queryOpts.sessionId, queryOpts.startConversationStep - 1) as { step_index: number } | undefined;
+      if (row) {
+        queryOpts.startStep = row.step_index;
+      } else {
+        queryOpts.startStep = Infinity;
+      }
+    }
+    if (queryOpts.endConversationStep !== undefined) {
+      const row = db.prepare(`
+        SELECT step_index FROM session_steps
+        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))
+        ORDER BY step_index ASC
+        LIMIT 1 OFFSET ?
+      `).get(queryOpts.sessionId, queryOpts.endConversationStep - 1) as { step_index: number } | undefined;
+      if (row) {
+        queryOpts.endStep = row.step_index;
+      } else {
+        queryOpts.endStep = -1;
+      }
+    }
   }
 
   query(options: QueryOptions): QueryResult {
     const db = this.db;
-    
+    const queryOpts = { ...options };
+
+    if (queryOpts.sessionId && (queryOpts.startConversationStep !== undefined || queryOpts.endConversationStep !== undefined)) {
+      this.resolveConversationSteps(db, queryOpts);
+    }
+
     const sessionParams: any[] = [];
-    const sessionSql = this.buildSessionQuery(options, sessionParams);
+    const sessionSql = this.buildSessionQuery(queryOpts, sessionParams);
     const sessionsRows = db.prepare(sessionSql).all(...sessionParams) as any[];
 
     const sessionsResult: SessionData[] = [];
@@ -805,13 +977,13 @@ export class SqliteHistoryStore implements HistoryStore {
     const placeholders = sessionIds.map(() => "?").join(",");
 
     const chunkParams: any[] = [...sessionIds];
-    const chunkSql = this.buildChunkQuery(placeholders, options, chunkParams);
+    const chunkSql = this.buildChunkQuery(placeholders, queryOpts, chunkParams);
     const chunksRows = db.prepare(chunkSql).all(...chunkParams) as any[];
 
     let stepsRows: any[] = [];
-    if (options.includeSteps) {
+    if (queryOpts.includeSteps) {
       const stepParams: any[] = [...sessionIds];
-      const stepSql = this.buildStepQuery(placeholders, options, stepParams);
+      const stepSql = this.buildStepQuery(placeholders, queryOpts, stepParams);
       stepsRows = db.prepare(stepSql).all(...stepParams) as any[];
     }
 
@@ -826,7 +998,7 @@ export class SqliteHistoryStore implements HistoryStore {
 
     const stepsBySession = new Map<string, StepData[]>();
     for (const row of stepsRows) {
-      this.filterAndPushStep(row, options, stepsBySession, stepsResult);
+      this.filterAndPushStep(row, queryOpts, stepsBySession, stepsResult);
     }
 
     for (const s of sessionsRows) {
@@ -836,11 +1008,12 @@ export class SqliteHistoryStore implements HistoryStore {
         title: s.title,
         projectPath: s.project_path,
         createdAt: s.created_at,
+        lastActiveAt: s.last_active_at ?? s.created_at,
         firstPrompt: s.first_prompt,
         secondPrompt: s.second_prompt,
         parentId: s.parent_id || null,
         chunks: chunksBySession.get(s.id) || [],
-        steps: options.includeSteps ? (stepsBySession.get(s.id) || []) : undefined
+        steps: queryOpts.includeSteps ? (stepsBySession.get(s.id) || []) : undefined
       });
     }
 

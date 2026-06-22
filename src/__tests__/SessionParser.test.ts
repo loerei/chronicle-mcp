@@ -204,5 +204,59 @@ describe("SessionParser Tests", () => {
       assert.ok(session);
       assert.strictEqual(session.title, "A very long prompt that goes on and on to test the...");
     });
+
+    it("should parse new bubble-based Cursor composer format with thinking and tool executions", () => {
+      const composerId = "composer-new";
+      const state = {
+        createdAt: 1700000000000,
+        workspacePath: "d:/Projects/another-project",
+        conversation: [
+          {
+            type: 1, // User
+            text: "What tools do you have?",
+            createdAt: 1700000001000
+          },
+          {
+            type: 2, // AI
+            text: "Here is what I found:",
+            thinking: { text: "Thinking about tools...", signature: "" },
+            createdAt: 1700000002000,
+            toolFormerData: {
+              name: "list_dir",
+              params: '{"DirectoryPath":"d:/Projects/another-project"}',
+              status: "completed",
+              result: '{"files":[]}'
+            }
+          }
+        ]
+      };
+
+      const session = SessionParser.parseCursorComposer(composerId, state);
+      assert.ok(session);
+      assert.strictEqual(session.id, composerId);
+      assert.strictEqual(session.firstPrompt, "What tools do you have?");
+      assert.strictEqual(session.steps?.length, 3); // USER_INPUT, PLANNER_RESPONSE, MCP_TOOL
+
+      // USER_INPUT
+      assert.strictEqual(session.steps[0].type, "USER_INPUT");
+      assert.strictEqual(session.steps[0].content, "What tools do you have?");
+      assert.strictEqual(session.steps[0].createdAt, 1700000001000);
+
+      // PLANNER_RESPONSE
+      assert.strictEqual(session.steps[1].type, "PLANNER_RESPONSE");
+      assert.strictEqual(session.steps[1].content, "Here is what I found:");
+      assert.strictEqual(session.steps[1].thinking, "Thinking about tools...");
+      assert.strictEqual(session.steps[1].createdAt, 1700000002000);
+      assert.ok(session.steps[1].toolCalls);
+      const call = JSON.parse(session.steps[1].toolCalls);
+      assert.strictEqual(call[0].name, "list_dir");
+      assert.strictEqual(call[0].args.DirectoryPath, "d:/Projects/another-project");
+
+      // MCP_TOOL (separate result step)
+      assert.strictEqual(session.steps[2].type, "MCP_TOOL");
+      assert.strictEqual(session.steps[2].status, "DONE");
+      assert.strictEqual(session.steps[2].content, '{"files":[]}');
+      assert.strictEqual(session.steps[2].createdAt, 1700000002000);
+    });
   });
 });

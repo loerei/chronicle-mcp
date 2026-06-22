@@ -1,4 +1,4 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js"; // NOSONAR
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
@@ -138,7 +138,7 @@ export async function syncHistory(force: boolean = false): Promise<void> {
 }
 
 // Initialize MCP Server
-const server = new Server(
+const server = new Server( // NOSONAR
   {
     name: "chronicle-mcp",
     version: "1.0.0",
@@ -149,6 +149,28 @@ const server = new Server(
     },
   }
 );
+
+// Shared schema definition for conversation step slicing and sorting to avoid SonarCloud duplication
+const conversationStepParams = {
+  conversationStepsOnly: {
+    type: "boolean",
+    description: "Include only conversation steps.",
+    default: false,
+  },
+  reverseSteps: {
+    type: "boolean",
+    description: "Retrieve history in reverse order.",
+    default: false,
+  },
+  startConversationStep: {
+    type: "number",
+    description: "Start 1-based conversation step index (inclusive).",
+  },
+  endConversationStep: {
+    type: "number",
+    description: "End 1-based conversation step index (inclusive).",
+  },
+};
 
 // Register Tool Definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -177,6 +199,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             enum: ["workspace", "all"],
             description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
             default: "all"
+          },
+          timeRange: {
+            type: "string",
+            description: "Search sessions within a time range, formatted as 'start:end' (e.g. '2026-06-20:2026-06-22' or '1781298371:1781308371'). Leave one side blank for open-ended range."
+          },
+          sortBy: {
+            type: "string",
+            enum: ["created", "active"],
+            description: "Sort sessions by: 'created' for creation time; 'active' for latest activity time.",
+            default: "active"
           },
         },
       },
@@ -214,6 +246,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: "Exclude content and thinking fields to prevent token bloat.",
             default: false,
           },
+          includeTimestamps: {
+            type: "boolean",
+            description: "Include step creation timestamps in the output.",
+            default: false,
+          },
+          ...conversationStepParams,
         },
         required: ["sessionId"],
       },
@@ -240,6 +278,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "number",
             description: "End step index (inclusive) for range retrieval.",
           },
+          ...conversationStepParams,
         },
         required: ["sessionId"],
       },
@@ -306,6 +345,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           excludeContent: {
             type: "boolean",
             description: "Exclude content and thinking fields to prevent token bloat.",
+            default: false,
+          },
+          conversationStepsOnly: {
+            type: "boolean",
+            description: "Filter search results to conversation steps only.",
             default: false,
           },
         },
@@ -423,22 +467,26 @@ async function handleListSessions(args: any): Promise<any> {
   const limit = (args?.limit as number) || 10;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as ScopeType | undefined;
+  const timeRange = args?.timeRange as string | undefined;
+  const sortBy = args?.sortBy as "created" | "active" | undefined;
 
   const store = getStore();
   const result = store.query({
     adapter,
     projectPath,
     scope,
-    limit
+    limit,
+    timeRange,
+    sortBy
   });
 
-  const sortedSessions = [...result.sessions].sort((a, b) => b.createdAt - a.createdAt);
-  const rows = sortedSessions.map(s => ({
+  const rows = result.sessions.map(s => ({
     id: s.id,
     adapter: s.adapter,
     title: s.title,
     project_path: s.projectPath,
     created_at: s.createdAt,
+    last_active_at: s.lastActiveAt,
     first_prompt: s.firstPrompt
   }));
 
@@ -459,6 +507,11 @@ async function handleGetSessionDetails(args: any): Promise<any> {
   const startStep = args?.startStep as number | undefined;
   const endStep = args?.endStep as number | undefined;
   const excludeContent = args?.excludeContent as boolean | undefined;
+  const includeTimestamps = args?.includeTimestamps as boolean | undefined;
+  const conversationStepsOnly = args?.conversationStepsOnly as boolean | undefined;
+  const reverseSteps = args?.reverseSteps as boolean | undefined;
+  const startConversationStep = args?.startConversationStep as number | undefined;
+  const endConversationStep = args?.endConversationStep as number | undefined;
 
   const details = await getSessionDetailsFromDb(sessionId, {
     includeToolCalls,
@@ -466,6 +519,10 @@ async function handleGetSessionDetails(args: any): Promise<any> {
     startStep,
     endStep,
     excludeContent,
+    conversationStepsOnly,
+    reverseSteps,
+    startConversationStep,
+    endConversationStep,
   });
 
   if (!details) {
@@ -496,14 +553,16 @@ async function handleGetSessionDetails(args: any): Promise<any> {
   }
   md += `\n--- \n\n`;
 
-  const needSteps = includeToolCalls || includeCallResults;
+  const needSteps = includeToolCalls || includeCallResults || conversationStepsOnly;
 
   if (needSteps) {
     for (const step of details.steps) {
+      const timeStr = (includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
+      const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
       if (step.type === "USER_INPUT") {
-        md += `### Step ${step.step_index}\n**User**: ${step.content || ""}\n\n`;
+        md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
       } else if (step.type === "PLANNER_RESPONSE") {
-        md += `### Step ${step.step_index}\n`;
+        md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
         if (step.thinking) {
           md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
         }
@@ -518,7 +577,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
           }
         }
       } else if (includeCallResults) {
-        md += `### Step ${step.step_index} (${step.type})\n`;
+        md += `### Step ${step.step_index} (${step.type})${convStepIdx}${timeStr}\n`;
         md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
         if (step.content) {
           md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
@@ -531,7 +590,8 @@ async function handleGetSessionDetails(args: any): Promise<any> {
         .replace(/^User:/gm, "**User**:")
         .replace(/^Assistant:/gm, "**Assistant**:")
         .replaceAll("\n**Assistant**:", "\n\n**Assistant**:");
-      md += `### Step ${chunk.step_index}\n${formattedText}\n\n`;
+      const convStepIdx = chunk.conversation_step_index ? ` (Conversation Step ${chunk.conversation_step_index})` : "";
+      md += `### Step ${chunk.step_index}${convStepIdx}\n${formattedText}\n\n`;
     }
   }
 
@@ -561,6 +621,10 @@ async function handleGetStepDetails(args: any): Promise<any> {
   const stepIndex = args?.stepIndex as number | undefined;
   const startStep = args?.startStep as number | undefined;
   const endStep = args?.endStep as number | undefined;
+  const conversationStepsOnly = args?.conversationStepsOnly as boolean | undefined;
+  const reverseSteps = args?.reverseSteps as boolean | undefined;
+  const startConversationStep = args?.startConversationStep as number | undefined;
+  const endConversationStep = args?.endConversationStep as number | undefined;
 
   const store = getStore();
   const sessionResult = store.query({ sessionId });
@@ -580,7 +644,22 @@ async function handleGetStepDetails(args: any): Promise<any> {
     sessionId,
     includeSteps: true,
     startStep: stepIndex ?? startStep,
-    endStep: stepIndex ?? endStep
+    endStep: stepIndex ?? endStep,
+    conversationStepsOnly,
+    reverseSteps,
+    startConversationStep,
+    endConversationStep,
+  });
+
+  const allConvResult = store.query({
+    sessionId,
+    includeSteps: true,
+    conversationStepsOnly: true
+  });
+  const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
+  const convStepIndexMap = new Map<number, number>();
+  sortedConvSteps.forEach((step, idx) => {
+    convStepIndexMap.set(step.stepIndex, idx + 1);
   });
 
   const steps = result.steps.map(s => ({
@@ -591,7 +670,8 @@ async function handleGetStepDetails(args: any): Promise<any> {
     content: s.content ?? null,
     thinking: s.thinking ?? null,
     tool_calls: s.toolCalls ?? null,
-    created_at: s.createdAt ?? null
+    created_at: s.createdAt ?? null,
+    conversation_step_index: convStepIndexMap.get(s.stepIndex) ?? null
   }));
 
   return {
@@ -664,6 +744,7 @@ async function handleSearchSteps(args: any): Promise<any> {
   const toolName = args?.toolName as string | undefined;
   const serverName = args?.serverName as string | undefined;
   const excludeContent = args?.excludeContent as boolean | undefined;
+  const conversationStepsOnly = args?.conversationStepsOnly as boolean | undefined;
 
   const store = getStore();
   const result = store.query({
@@ -676,12 +757,30 @@ async function handleSearchSteps(args: any): Promise<any> {
     scope,
     toolName,
     serverName,
-    excludeContent
+    excludeContent,
+    conversationStepsOnly,
   });
 
   const stepsWithSessionId: any[] = [];
+  const convStepIndexMaps = new Map<string, Map<number, number>>();
+
   for (const s of result.sessions) {
     if (s.steps) {
+      let convMap = convStepIndexMaps.get(s.id);
+      if (!convMap) {
+        const allConvResult = store.query({
+          sessionId: s.id,
+          includeSteps: true,
+          conversationStepsOnly: true
+        });
+        const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
+        convMap = new Map<number, number>();
+        sortedConvSteps.forEach((step, idx) => {
+          convMap!.set(step.stepIndex, idx + 1);
+        });
+        convStepIndexMaps.set(s.id, convMap);
+      }
+
       for (const step of s.steps) {
         stepsWithSessionId.push({
           session_id: s.id,
@@ -694,7 +793,8 @@ async function handleSearchSteps(args: any): Promise<any> {
             thinking: step.thinking ?? null,
           }),
           tool_calls: step.toolCalls ?? null,
-          created_at: step.createdAt ?? null
+          created_at: step.createdAt ?? null,
+          conversation_step_index: convMap.get(step.stepIndex) ?? null
         });
       }
     }

@@ -32,16 +32,24 @@ export async function getSessionDetailsFromDb(
     startStep?: number;
     endStep?: number;
     excludeContent?: boolean;
+    conversationStepsOnly?: boolean;
+    reverseSteps?: boolean;
+    startConversationStep?: number;
+    endConversationStep?: number;
   } = {}
 ): Promise<any> {
   const store = getStore();
-  const includeSteps = !!(options.includeToolCalls || options.includeCallResults);
+  const includeSteps = !!(options.includeToolCalls || options.includeCallResults || options.conversationStepsOnly);
   const result = store.query({
     sessionId,
     includeSteps,
     startStep: options.startStep,
     endStep: options.endStep,
-    excludeContent: options.excludeContent
+    excludeContent: options.excludeContent,
+    conversationStepsOnly: options.conversationStepsOnly,
+    reverseSteps: options.reverseSteps,
+    startConversationStep: options.startConversationStep,
+    endConversationStep: options.endConversationStep
   });
 
   const session = result.sessions[0];
@@ -52,6 +60,18 @@ export async function getSessionDetailsFromDb(
     chunk_text: c.text
   }));
 
+  // Query all conversation steps for this session to build the absolute conversation_step_index mapping
+  const allConvResult = store.query({
+    sessionId,
+    includeSteps: true,
+    conversationStepsOnly: true
+  });
+  const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
+  const convStepIndexMap = new Map<number, number>();
+  sortedConvSteps.forEach((step, idx) => {
+    convStepIndexMap.set(step.stepIndex, idx + 1);
+  });
+
   const dbSteps = result.steps.map(s => ({
     step_index: s.stepIndex,
     type: s.type,
@@ -60,7 +80,8 @@ export async function getSessionDetailsFromDb(
     content: s.content,
     thinking: s.thinking,
     tool_calls: s.toolCalls,
-    created_at: s.createdAt
+    created_at: s.createdAt,
+    conversation_step_index: convStepIndexMap.get(s.stepIndex) ?? null
   }));
 
   return {

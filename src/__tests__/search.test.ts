@@ -258,4 +258,38 @@ describe("Chronicle Search Engine Tests", () => {
     assert.strictEqual(res.steps[0].stepIndex, 5);
     assert.strictEqual(res.steps[0].status, "ERROR");
   });
+
+  it("should populate conversation_step_index correctly in getSessionDetailsFromDb", async () => {
+    const store = getStore();
+    const session: SessionData = {
+      id: "session-conv-idx-test",
+      adapter: "antigravity",
+      title: "Steps Test Title",
+      projectPath: "d:/projects/test",
+      createdAt: 1700000000000,
+      firstPrompt: "hello",
+      secondPrompt: "world",
+      chunks: [],
+      steps: [
+        { stepIndex: 1, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Prompt 1", createdAt: 1700000000000 },
+        { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "DONE", content: "Command", createdAt: 1700000001000 },
+        { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "", thinking: "Thinking only", createdAt: 1700000002000 },
+        { stepIndex: 4, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Prompt 2", createdAt: 1700000003000 },
+        { stepIndex: 5, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response 2", createdAt: 1700000004000 }
+      ]
+    };
+    store.save(session, {
+      summary: [1, 0],
+      chunks: new Map()
+    });
+
+    const details = await getSessionDetailsFromDb("session-conv-idx-test", { includeToolCalls: true });
+    assert.ok(details);
+    assert.strictEqual(details.steps.length, 5);
+    assert.strictEqual(details.steps[0].conversation_step_index, 1); // USER_INPUT
+    assert.strictEqual(details.steps[1].conversation_step_index, null); // COMMAND (not a conv step)
+    assert.strictEqual(details.steps[2].conversation_step_index, null); // PLANNER_RESPONSE (thinking only)
+    assert.strictEqual(details.steps[3].conversation_step_index, 2); // USER_INPUT
+    assert.strictEqual(details.steps[4].conversation_step_index, 3); // PLANNER_RESPONSE
+  });
 });
