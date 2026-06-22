@@ -507,6 +507,123 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
       store.close();
     });
+
+    it("should track session lastActiveAt and support sorting and time range query", () => {
+      const store = storeFactory();
+
+      const session1: SessionData = {
+        id: "session-t1",
+        adapter: "antigravity",
+        title: "Test Session 1",
+        projectPath: "d:/projects/test",
+        createdAt: 1000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "hello", createdAt: 1000 },
+          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "world", createdAt: 5000 }
+        ]
+      };
+
+      const session2: SessionData = {
+        id: "session-t2",
+        adapter: "antigravity",
+        title: "Test Session 2",
+        projectPath: "d:/projects/test",
+        createdAt: 2000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "hello", createdAt: 2000 },
+          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "world", createdAt: 3000 }
+        ]
+      };
+
+      const embeddings: SessionEmbeddings = {
+        summary: [0.5, 0.5],
+        chunks: new Map()
+      };
+
+      store.save(session1, embeddings);
+      store.save(session2, embeddings);
+
+      // session1 has: createdAt=1000, lastActiveAt=5000
+      // session2 has: createdAt=2000, lastActiveAt=3000
+
+      // Sort by active DESC (default): should be session-t1 (5000) then session-t2 (3000)
+      const resActive = store.query({ sortBy: "active" });
+      assert.strictEqual(resActive.sessions.length, 2);
+      assert.strictEqual(resActive.sessions[0].id, "session-t1");
+      assert.strictEqual(resActive.sessions[1].id, "session-t2");
+      assert.strictEqual(resActive.sessions[0].lastActiveAt, 5000);
+      assert.strictEqual(resActive.sessions[1].lastActiveAt, 3000);
+
+      // Sort by created DESC: should be session-t2 (2000) then session-t1 (1000)
+      const resCreated = store.query({ sortBy: "created" });
+      assert.strictEqual(resCreated.sessions.length, 2);
+      assert.strictEqual(resCreated.sessions[0].id, "session-t2");
+      assert.strictEqual(resCreated.sessions[1].id, "session-t1");
+
+      // Filter timeRange "1500:4000" (matches session-t2 lastActiveAt=3000, but session-t1 lastActiveAt=5000 is out of range)
+      const resRange = store.query({ timeRange: "1500:4000" });
+      assert.strictEqual(resRange.sessions.length, 1);
+      assert.strictEqual(resRange.sessions[0].id, "session-t2");
+
+      store.close();
+    });
+
+    it("should filter conversation steps, sort in reverse, and slice by conversation step range", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "session-conv-steps",
+        adapter: "antigravity",
+        title: "Conv Steps Test",
+        projectPath: "",
+        createdAt: 1700000000000,
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          { stepIndex: 1, type: "USER_INPUT", source: "USER", status: "DONE", content: "first prompt" },
+          { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "DONE", content: "some command" },
+          { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "", thinking: "response 1 thinking" },
+          { stepIndex: 4, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "tool result" },
+          { stepIndex: 5, type: "USER_INPUT", source: "USER", status: "DONE", content: "second prompt" },
+          { stepIndex: 6, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "response 2" }
+        ]
+      };
+
+      store.save(session, { summary: [0.5, 0.5], chunks: new Map() });
+
+      // 1. Test conversationStepsOnly: true (only stepIndex 1, 5, 6 because stepIndex 3 has no content)
+      const resConvOnly = store.query({ includeSteps: true, sessionId: "session-conv-steps", conversationStepsOnly: true });
+      assert.strictEqual(resConvOnly.steps.length, 3);
+      assert.strictEqual(resConvOnly.steps[0].stepIndex, 1);
+      assert.strictEqual(resConvOnly.steps[1].stepIndex, 5);
+      assert.strictEqual(resConvOnly.steps[2].stepIndex, 6);
+
+      // 2. Test reverseSteps: true
+      const resReverse = store.query({ includeSteps: true, sessionId: "session-conv-steps", reverseSteps: true });
+      assert.strictEqual(resReverse.steps.length, 6);
+      assert.strictEqual(resReverse.steps[0].stepIndex, 6);
+      assert.strictEqual(resReverse.steps[5].stepIndex, 1);
+
+      // 3. Test startConversationStep and endConversationStep (1-based index of conversation steps)
+      // Conversation steps:
+      // Index 1 (1-based) -> stepIndex 1 (USER_INPUT)
+      // Index 2 (1-based) -> stepIndex 5 (USER_INPUT)
+      // Index 3 (1-based) -> stepIndex 6 (PLANNER_RESPONSE)
+      // Slice from conversation step 2 to 3 -> stepIndex 5 to 6
+      const resConvRange = store.query({ includeSteps: true, sessionId: "session-conv-steps", startConversationStep: 2, endConversationStep: 3 });
+      assert.strictEqual(resConvRange.steps.length, 2);
+      assert.strictEqual(resConvRange.steps[0].stepIndex, 5);
+      assert.strictEqual(resConvRange.steps[1].stepIndex, 6);
+
+      store.close();
+    });
   });
 }
 

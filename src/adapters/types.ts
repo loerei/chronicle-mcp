@@ -4,6 +4,7 @@ export interface SessionData {
   title: string;
   projectPath: string | null;
   createdAt: number;
+  lastActiveAt?: number;
   firstPrompt: string;
   secondPrompt: string;
   chunks: ChunkData[];
