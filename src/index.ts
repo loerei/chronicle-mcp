@@ -251,6 +251,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             description: "Include step creation timestamps in the output.",
             default: false,
           },
+          output: {
+            type: "string",
+            description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
+          },
           ...conversationStepParams,
         },
         required: ["sessionId"],
@@ -292,6 +296,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           sessionId: {
             type: "string",
             description: "Unique session ID.",
+          },
+          output: {
+            type: "string",
+            description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
           },
         },
         required: ["sessionId"],
@@ -442,6 +450,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             description: "Groups of session IDs to compare aggregated averages.",
           },
+          output: {
+            type: "string",
+            description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
+          },
         },
         required: ["sessionIds"],
       },
@@ -461,6 +473,74 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
   return { tools };
 });
+
+function handleOutputWrite(
+  md: string,
+  outputPath?: string,
+  defaultFilename?: string
+): any {
+  if (!outputPath) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: md,
+        },
+      ],
+    };
+  }
+
+  try {
+    let targetPath = outputPath;
+    
+    // Check if the outputPath is a directory or doesn't look like a file
+    let isDir = false;
+    try {
+      if (fs.existsSync(outputPath) && fs.statSync(outputPath).isDirectory()) {
+        isDir = true;
+      }
+    } catch {
+      // If it doesn't exist, check if it doesn't end with .md
+      if (!outputPath.toLowerCase().endsWith(".md")) {
+        isDir = true;
+      }
+    }
+
+    if (isDir) {
+      if (!fs.existsSync(outputPath)) {
+        fs.mkdirSync(outputPath, { recursive: true });
+      }
+      const filename = defaultFilename || `output_${Date.now()}.md`;
+      targetPath = path.join(outputPath, filename);
+    } else {
+      const parentDir = path.dirname(outputPath);
+      if (!fs.existsSync(parentDir)) {
+        fs.mkdirSync(parentDir, { recursive: true });
+      }
+    }
+
+    fs.writeFileSync(targetPath, md, "utf-8");
+    const filename = path.basename(targetPath);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Output successfully saved to: [${filename}](file:///${targetPath.replaceAll("\\", "/")})`,
+        },
+      ],
+    };
+  } catch (e: any) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Error saving output to ${outputPath}: ${e.message}`,
+        },
+      ],
+      isError: true,
+    };
+  }
+}
 
 async function handleListSessions(args: any): Promise<any> {
   const adapter = args?.adapter as string | undefined;
@@ -606,14 +686,8 @@ async function handleGetSessionDetails(args: any): Promise<any> {
     md += `\n`;
   }
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: md,
-      },
-    ],
-  };
+  const outputPath = args?.output as string | undefined;
+  return handleOutputWrite(md, outputPath, `session_${sessionId}.md`);
 }
 
 async function handleGetStepDetails(args: any): Promise<any> {
@@ -723,14 +797,8 @@ async function handleGetSessionArtifacts(args: any): Promise<any> {
     md += `--- \n\n`;
   }
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: md,
-      },
-    ],
-  };
+  const outputPath = args?.output as string | undefined;
+  return handleOutputWrite(md, outputPath, `artifacts_${sessionId}.md`);
 }
 
 async function handleSearchSteps(args: any): Promise<any> {
@@ -934,14 +1002,8 @@ async function handleGetSessionBenchmarks(args: any): Promise<any> {
   }
   md += `\n`;
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: md,
-      },
-    ],
-  };
+  const outputPath = args?.output as string | undefined;
+  return handleOutputWrite(md, outputPath, `benchmarks_${Date.now()}.md`);
 }
 
 // Handle Tool Calls
