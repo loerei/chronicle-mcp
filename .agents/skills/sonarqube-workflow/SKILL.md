@@ -1,41 +1,43 @@
 ---
 name: sonarqube-workflow
-description: SonarQube and SonarCloud unified workflow. Analyze, refactor, and verify code quality. Use when checking SonarQube/SonarCloud issues, running code quality scans, or fixing complexity/security issues.
+description: >
+  Query, inspect, and retrieve code quality issues, duplications, and Quality Gate metrics using SonarQube and SonarCloud MCP servers. Use when checking SonarCloud/SonarQube issues, querying open bugs/smells, or checking Quality Gate/duplication status.
 ---
 
-# SonarQube & SonarCloud Unified Workflow
+# SonarQube & SonarCloud MCP Tooling Guide
 
-Use this skill to optimize analyzing, batch-fixing, and verifying SonarQube/SonarCloud code quality issues with minimal token overhead and waiting cycles.
+Use SonarCloud / SonarQube MCP tools to retrieve details about project issues, quality gates, and code duplications.
 
 ## Quick start
 
-Execute the PowerShell helper scripts bundled with this skill to start containers and run scans:
+### 1. Find Project Key
+If the project key is unknown, search your organization's projects first:
+* Call `sonarcloud:search_my_sonarqube_projects` or `sonarqube:search_my_sonarqube_projects`.
 
-```powershell
-# 1. Start Postgres and SonarQube containers
-.agents/skills/sonarqube-workflow/scripts/start-sonar.ps1
+### 2. Search Issues
+Find all open issues for a project or specific pull request:
+* Call `sonarcloud:search_sonar_issues_in_projects` with `projects=["<projectKey>"]` (Note: the argument name is `projects`, not `projectKeys`) and `issueStatuses=["OPEN"]`.
+* If inspecting a Pull Request, add the `pullRequestId` (ID string) argument (Note: the argument name is `pullRequestId`, not `pullRequest`).
 
-# 2. Run scanner (auto-detects project key, prompts/reads token)
-.agents/skills/sonarqube-workflow/scripts/run-scanner.ps1 -Token "YOUR_TOKEN"
-```
+> [!IMPORTANT]
+> **Avoid Scope Confusion**: When analyzing issues for an active Pull Request, **you MUST provide the `pullRequestId` argument**. If `pullRequestId` is omitted, SonarCloud will return all open issues across the default branch (`main`/`master`), which may lead to modifying pre-existing code to resolve old project issues instead of focusing on the current PR's changes.
 
-## Workflows
+### 3. Retrieve Duplications
+Search for files containing duplicated blocks, and extract precise line ranges:
+* Call `sonarcloud:search_duplicated_files` with `projectKey="<projectKey>"`.
+* Call `sonarcloud:get_duplications` with `key="<fileKey>"` and optional `pullRequest="<pullRequest>"`.
 
-### Clean-Code Action Checklist
+## Tool Usage Workflows
 
-* [ ] **Refresh Search Index First**: If files were recently changed locally or in git, update the jCodeMunch index *before* performing any searches:
-  - Call `jcodemunch:index_folder` with `path` and `use_ai_summaries=false` (incremental update).
-* [ ] **Batch-Retrieve Open Issues**: Query all open issues for the target component/file in one step using `sonarqube:search_sonar_issues_in_projects` with `issueStatuses=["OPEN"]`. Do NOT query them one-by-one.
-* [ ] **Batch-Refactor Violations**:
-  - Solve multiple related smells (negated conditions, optional chaining, redundant types) in the target file at once.
-  - For surgical search-and-replace, always use `patchitright:patch_file`.
-* [ ] **Verify Locally First**: Run all local unit tests (e.g. `npx vitest run` or `npm test`) *before* executing the Sonar scanner. Fix any logic errors immediately.
-* [ ] **Run local scan**: Execute the local scan command using the PowerShell helper to update the SonarQube database.
-* [ ] **Safe PR Flow**: Before creating or merging pull requests, clear env variables: `$env:GITHUB_TOKEN=$null` to avoid GitHub CLI conflicts.
+### Quality Gate Status Verification
+Check the remote Quality Gate metrics (duplication %, coverage, vulnerabilities):
+* Call `sonarcloud:get_project_quality_gate_status` with `projectKey="<projectKey>"` (or include `pullRequest`).
 
-## Advanced features
+### Detail Issue Code Inspection
+Look up the exact rules or component metrics:
+* Call `sonarcloud:show_rule` with `key="<ruleKey>"` to get explanation details.
+* Call `sonarcloud:get_component_measures` with `projectKey="<projectKey>"` (Note: the argument name is `projectKey`, not `component`) and `metricKeys=["duplicated_lines_density", "security_rating"]`.
 
-For detailed properties, configurations, common Sonar violations, and MCP tool quick-reference tables (so you do not have to read JSON schemas), see:
-* [REFERENCE.md](REFERENCE.md)
-* Script: [start-sonar.ps1](scripts/start-sonar.ps1)
-* Script: [run-scanner.ps1](scripts/run-scanner.ps1)
+## Remediation Policy
+
+* **Cognitive Complexity (S3776)**: Always flag these as ACCEPTED using the status transition tool (`change_sonar_issue_status`). Never rewrite code or split deep functions just to satisfy SonarQube's complexity metrics, as it promotes shallow helper modules. Structural refactoring should only be driven by `/improve-codebase-architecture` and user design discussions.
