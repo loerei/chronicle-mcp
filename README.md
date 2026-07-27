@@ -108,6 +108,26 @@ Alternatively, you can enable auto-syncing by setting the `CHRONICLE_AUTO_SYNC` 
 
 ## Tools
 
+### Tool Selection Router
+
+```mermaid
+flowchart TD
+    Task["Need Session History or Tool Step Context"] --> Choice{"What is the query objective?"}
+    
+    Choice -->|"Search past solutions / natural query"| SearchHist["1. search_history(query, scope)"]
+    SearchHist --> ViewSess["2. get_session_details(sessionId, conversationStepsOnly=true)"]
+    
+    Choice -->|"Read MOST RECENT dialogue turns first"| ReadRecent["get_session_details(sessionId, reverseSteps=true, conversationStepsOnly=true)"]
+    
+    Choice -->|"Read SPECIFIC turn range (e.g. turns 5 to 10)"| ReadRange["get_session_details(sessionId, startConversationStep=5, endConversationStep=10)"]
+    
+    Choice -->|"Debug failed tool call / error traceback"| SearchError["1. search_steps(status='ERROR', type='MCP_TOOL')"]
+    SearchError --> InspectStep["2. get_step_details(sessionId, stepIndex)"]
+    
+    Choice -->|"Export session logs / benchmarks to disk"| ExportDisk["get_session_details or get_session_benchmarks with output='path'"]
+```
+
+- **`chronicle_guide`**: Self-guide tool providing usage patterns, tool selection matrix, and token-saving rules.
 - **`sync_history`**: Triggers incremental synchronization of local history logs (hidden when auto-sync is active).
 - **`list_sessions`**: Lists synced sessions with optional filter parameters (`adapter`, `projectPath`, `scope`, `limit`). Supports automatically resolving the current project workspace when `scope: "workspace"`.
 - **`get_session_details`**: Retrieves formatted Markdown of a session's conversation history. Supports range slicing (`startStep`/`endStep`), optional detailed blocks (`includeToolCalls`, `includeCallResults`), and `excludeContent` to omit large payloads to prevent token bloat.
