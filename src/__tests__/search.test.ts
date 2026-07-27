@@ -295,7 +295,7 @@ describe("Chronicle Search Engine Tests", () => {
 
   it("should return valid chronicle_guide documentation structure", () => {
     // Import handleChronicleGuide logic check
-    const guideText = "chronicle-mcp (v1.1.0)";
+    const guideText = "chronicle-mcp (v1.2.0)";
     assert.ok(guideText.includes("chronicle-mcp"));
   });
 });
