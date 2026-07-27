@@ -11,6 +11,7 @@
 
 ### 2. Mandatory Chronicle MCP Tool Usage
 When asked to read, query, summarize, or search past conversations, sessions, tool executions, or errors, you MUST use the registered `chronicle-mcp` tools:
+- **`chronicle_guide`**: Call first when starting history exploration to review token-saving rules, decision tree, and parameter guidelines.
 - **`list_sessions`**: Retrieve history metadata and session IDs.
 - **`get_session_details`**: Retrieve formatted conversation summaries with optional range slicing and tool details.
 - **`get_step_details`**: Inspect raw JSON structures of specific steps.

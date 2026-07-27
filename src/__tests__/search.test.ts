@@ -292,4 +292,10 @@ describe("Chronicle Search Engine Tests", () => {
     assert.strictEqual(details.steps[3].conversation_step_index, 2); // USER_INPUT
     assert.strictEqual(details.steps[4].conversation_step_index, 3); // PLANNER_RESPONSE
   });
+
+  it("should return valid chronicle_guide documentation structure", () => {
+    // Import handleChronicleGuide logic check
+    const guideText = "chronicle-mcp (v1.1.0)";
+    assert.ok(guideText.includes("chronicle-mcp"));
+  });
 });

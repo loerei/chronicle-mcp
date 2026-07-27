@@ -176,6 +176,14 @@ const conversationStepParams = {
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   const tools: any[] = [
     {
+      name: "chronicle_guide",
+      description: "Self-guide tool providing usage patterns, tool selection matrix, and token-saving rules for chronicle-mcp.",
+      inputSchema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
       name: "list_sessions",
       description: "List indexed development sessions.",
       inputSchema: {
@@ -540,6 +548,76 @@ function handleOutputWrite(
       isError: true,
     };
   }
+}
+
+function handleChronicleGuide(): any {
+  const guideContent = {
+    version: "1.1.0",
+    content: `## chronicle-mcp (v1.1.0)
+
+Local conversation history, step-level tool inspection, and prompt benchmarking companion.
+
+### Tool & Parameter Decision Router
+
+\`\`\`mermaid
+flowchart TD
+    Task["Need Session History or Tool Step Context"] --> Choice{"What is the query objective?"}
+    
+    Choice -->|"Search past solutions / natural query"| SearchHist["1. Call search_history(query, scope='workspace'|'all')"]
+    SearchHist --> ViewSess["2. Call get_session_details(sessionId, conversationStepsOnly=true)"]
+    
+    Choice -->|"Read MOST RECENT dialogue turns first"| ReadRecent["Call get_session_details(sessionId, reverseSteps=true, conversationStepsOnly=true)"]
+    
+    Choice -->|"Read SPECIFIC turn range (e.g. turns 5 to 10)"| ReadRange["Call get_session_details(sessionId, startConversationStep=5, endConversationStep=10)"]
+    
+    Choice -->|"Debug failed tool call / error traceback"| SearchError["1. Call search_steps(status='ERROR', type='MCP_TOOL')"]
+    SearchError --> InspectStep["2. Call get_step_details(sessionId, stepIndex)"]
+    
+    Choice -->|"Export session logs / benchmarks to disk"| ExportDisk["Call get_session_details or get_session_benchmarks with output='path'"]
+\`\`\`
+
+### Session Reading Directives
+* **Read Recent Turns First**: ALWAYS set \`reverseSteps=true\` in \`get_session_details\` or \`get_step_details\` when investigating recent context or latest user feedback to avoid parsing old steps.
+* **Enforce User Scope**: MUST set \`scope="workspace"\` when user restricts request to current project; set \`scope="all"\` when searching across repositories.
+* **Dialogue-Only Reading**: MUST set \`conversationStepsOnly=true\` when user wants to read human-assistant dialogue, skipping intermediate tool execution payloads.
+* **Turn Slicing**: Use \`startConversationStep\` and \`endConversationStep\` (1-based conversation index) to retrieve specific dialogue windows.
+* **Session Listing**: ALWAYS set \`sortBy="active"\` in \`list_sessions\` to retrieve recently active sessions first.
+
+### Tool Matrix
+
+| Tool Name | Call this tool when... | DO NOT call when... |
+| :--- | :--- | :--- |
+| \`list_sessions\` | Finding active sessions by \`scope\`, \`adapter\`, \`timeRange\`, or \`sortBy='active'\`. | Inspecting session content (use \`get_session_details\`). |
+| \`search_history\` | Searching past solutions using natural language queries. | Searching for exact tool names, error statuses, or code tracebacks (use \`search_steps\`). |
+| \`search_steps\` | Filtering execution steps by \`status='ERROR'\`, \`toolName\`, \`serverName\`, or \`type\`. | Searching for high-level semantic concepts or past user intent (use \`search_history\`). |
+| \`get_session_details\` | Reading structured user-assistant conversation history for a session. | Inspecting raw parameters/results of a single step (use \`get_step_details\`). |
+| \`get_step_details\` | Retrieving raw JSON arguments, thinking blocks, or error tracebacks of specific step indexes. | Reading full session conversation flows (use \`get_session_details\`). |
+| \`get_session_benchmarks\` | Comparing token usage, duration, or cache hit rates across session groups. | Retrieving actual code or conversation text. |
+| \`get_session_artifacts\` | Retrieving generated plan or walkthrough markdown files for a session. | Reading raw step logs or tool execution details. |
+| \`chronicle_guide\` | Self-guide tool providing usage patterns, tool selection matrix, and token-saving rules. | Executing queries against sessions or steps. |
+
+### Token Optimization & Parameter Rules
+* \`excludeContent=true\`: MUST set in \`get_session_details\` or \`search_steps\` when inspecting step metadata to prevent token bloat.
+* \`output="<absolute_path>"\`: MUST pass in \`get_session_details\` or \`get_session_benchmarks\` to write files directly to disk.
+
+### Failure Recovery
+* **Session not found**: If \`get_session_details\` returns \`Session not found\`, call \`sync_history\` to index recent log files.
+* **Empty search results**: If \`search_steps\` returns \`[]\`, widen search by setting \`scope="all"\` or removing \`toolName\` filters.
+* **Context Window Truncation**: If response payload is too large, re-query with \`excludeContent=true\` and use \`get_step_details\` only for target \`stepIndex\`.
+
+### Critical Directives
+* **NEVER** use file reading tools on raw log files (\`transcript.jsonl\`, \`state.vscdb\`). ALWAYS use \`chronicle-mcp\` tools.
+* **ALWAYS** delegate file writing to server via \`output\` parameter instead of receiving text payloads and writing manually.`
+  };
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(guideContent, null, 2),
+      },
+    ],
+  };
 }
 
 async function handleListSessions(args: any): Promise<any> {
@@ -1016,6 +1094,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     switch (name) {
+      case "chronicle_guide":
+        return handleChronicleGuide();
       case "list_sessions":
         return await handleListSessions(args);
       case "get_session_details":
