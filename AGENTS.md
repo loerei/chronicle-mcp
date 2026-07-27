@@ -1,7 +1,7 @@
-# Chronicle MCP Agent Guidelines (AGENTS.md)
+# Chronicle MCP Agent Guidelines
 
 > [!IMPORTANT]
-> This file is the source of truth for any agent operating in this repository. All agents must read and strictly adhere to these rules.
+> Global Policies apply to this repository by default. This file contains repository-specific rules for chronicle-mcp.
 
 ## Code Intelligence & History Exploration Rules
 
