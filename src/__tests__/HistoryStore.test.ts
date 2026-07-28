@@ -380,6 +380,104 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       store.close();
     });
 
+    it("should fetch session relationships (parent, ancestors, children, siblings) and support parentId filtering", () => {
+      const store = storeFactory();
+      const dummyEmbeddings: SessionEmbeddings = { summary: [0.1, 0.2], chunks: new Map() };
+
+      const rootSession: SessionData = {
+        id: "root-1",
+        adapter: "antigravity",
+        title: "Root Session",
+        projectPath: "/test",
+        createdAt: 1000,
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [],
+      };
+
+      const child1: SessionData = {
+        id: "child-1",
+        adapter: "antigravity",
+        title: "Child 1",
+        projectPath: "/test",
+        createdAt: 2000,
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [],
+        parentId: "root-1"
+      };
+
+      const child2: SessionData = {
+        id: "child-2",
+        adapter: "antigravity",
+        title: "Child 2",
+        projectPath: "/test",
+        createdAt: 2100,
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [],
+        parentId: "root-1"
+      };
+
+      const grandchild1: SessionData = {
+        id: "grandchild-1",
+        adapter: "antigravity",
+        title: "Grandchild 1",
+        projectPath: "/test",
+        createdAt: 3000,
+        firstPrompt: "",
+        secondPrompt: "",
+        chunks: [],
+        parentId: "child-1"
+      };
+
+      store.save(rootSession, dummyEmbeddings);
+      store.save(child1, dummyEmbeddings);
+      store.save(child2, dummyEmbeddings);
+      store.save(grandchild1, dummyEmbeddings);
+
+      // Test parentId: "root" filtering
+      const rootQuery = store.query({ parentId: "root" });
+      assert.strictEqual(rootQuery.sessions.length, 1);
+      assert.strictEqual(rootQuery.sessions[0].id, "root-1");
+
+      // Test parentId: "root-1" filtering
+      const childrenQuery = store.query({ parentId: "root-1" });
+      assert.strictEqual(childrenQuery.sessions.length, 2);
+
+      // Test getSessionRelationship for grandchild-1
+      const relGrandchild = store.getSessionRelationship("grandchild-1");
+      assert.notStrictEqual(relGrandchild, null);
+      assert.strictEqual(relGrandchild?.sessionId, "grandchild-1");
+      assert.strictEqual(relGrandchild?.rootSessionId, "root-1");
+      assert.strictEqual(relGrandchild?.ancestors.length, 2);
+      assert.strictEqual(relGrandchild?.ancestors[0].id, "root-1"); // top-down
+      assert.strictEqual(relGrandchild?.ancestors[1].id, "child-1");
+      assert.strictEqual(relGrandchild?.parent?.id, "child-1");
+
+      // Test getSessionRelationship for child-1 (has sibling child-2 and child grandchild-1)
+      const relChild1 = store.getSessionRelationship("child-1");
+      assert.notStrictEqual(relChild1, null);
+      assert.strictEqual(relChild1?.siblings.length, 1);
+      assert.strictEqual(relChild1?.siblings[0].id, "child-2");
+      assert.strictEqual(relChild1?.children.length, 1);
+      assert.strictEqual(relChild1?.children[0].id, "grandchild-1");
+
+      // Test root session relationship (siblings must be empty, parent null)
+      const relRoot = store.getSessionRelationship("root-1");
+      assert.notStrictEqual(relRoot, null);
+      assert.strictEqual(relRoot?.parent, null);
+      assert.strictEqual(relRoot?.ancestors.length, 0);
+      assert.strictEqual(relRoot?.siblings.length, 0);
+      assert.strictEqual(relRoot?.children.length, 2);
+
+      // Test 404 non-existent session
+      const rel404 = store.getSessionRelationship("non-existent");
+      assert.strictEqual(rel404, null);
+
+      store.close();
+    });
+
     it("should incrementally save additional chunks and steps without overwriting existing ones", () => {
       const store = storeFactory();
 

@@ -10,7 +10,30 @@ export interface SessionData {
   chunks: ChunkData[];
   steps?: StepData[];
   subagentIds?: string[];
+  childSessionIds?: string[];
   parentId?: string | null;
+}
+
+export interface SessionRelationshipNode {
+  id: string;
+  adapter: string;
+  title: string;
+  projectPath: string | null;
+  createdAt: number;
+  lastActiveAt?: number;
+  parentId?: string | null;
+  depth?: number;
+  children?: SessionRelationshipNode[];
+}
+
+export interface SessionRelationshipResult {
+  sessionId: string;
+  rootSessionId: string;
+  parent: SessionRelationshipNode | null;
+  ancestors: SessionRelationshipNode[];
+  current: SessionRelationshipNode;
+  children: SessionRelationshipNode[];
+  siblings: SessionRelationshipNode[];
 }
 
 export interface StepData {

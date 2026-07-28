@@ -200,6 +200,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "string",
             description: "Filter sessions by adapter: 'antigravity' or 'cursor'.",
           },
+          parentId: {
+            type: "string",
+            description: "Filter sessions by parent session ID. Use 'root' or 'null' to filter top-level root sessions only.",
+          },
           limit: {
             type: "number",
             description: "Max number of sessions to return",
@@ -226,6 +230,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             default: "active"
           },
         },
+      },
+    },
+    {
+      name: "get_session_relationship",
+      description: "Expose parent session, child subagent sessions, siblings, and ancestry hierarchy for a given session ID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          sessionId: {
+            type: "string",
+            description: "Session ID to explore relationships for.",
+          },
+          includeAncestors: {
+            type: "boolean",
+            description: "Include ancestor chain up to root session.",
+            default: true,
+          },
+          maxDepth: {
+            type: "integer",
+            description: "Maximum depth for recursive child subagent tree graph.",
+            default: 2,
+            minimum: 1,
+            maximum: 10,
+          },
+        },
+        required: ["sessionId"],
       },
     },
     {
@@ -602,6 +632,8 @@ flowchart TD
     
     Choice -->|"Analyze tool call frequency & counts"| ToolStats["Call get_tool_usage_stats(limit=30, scope='workspace'|'all')"]
     
+    Choice -->|"Explore subagent hierarchy tree graph"| RelTree["Call get_session_relationship(sessionId, maxDepth=2)"]
+    
     Choice -->|"Export session logs / benchmarks to disk"| ExportDisk["Call get_session_details or get_session_benchmarks with output='path'"]
 \`\`\`
 
@@ -619,7 +651,8 @@ flowchart TD
 
 | Tool Name | Call this tool when... | DO NOT call when... |
 | :--- | :--- | :--- |
-| \`list_sessions\` | Finding active sessions by \`scope\`, \`adapter\`, \`timeRange\`, or \`sortBy='active'\`. | Inspecting session content (use \`get_session_details\`). |
+| \`list_sessions\` | Finding active sessions by \`scope\`, \`adapter\`, \`timeRange\`, \`parentId\` ('root'|'<id>'), or \`sortBy='active'\`. | Inspecting session content (use \`get_session_details\`). |
+| \`get_session_relationship\` | Exploring parent, ancestors, children tree graph, or siblings for a session ID. | Querying step content or tool execution results (use \`query_transcript\`). |
 | \`search_history\` | Searching past solutions using natural language queries. | Searching for exact tool names, error statuses, or code tracebacks (use \`search_steps\`). |
 | \`search_steps\` | Filtering execution steps by \`query\`, \`status='ERROR'\`, \`toolName\`, \`serverName\`, or \`type\`. | Searching for high-level semantic concepts or past user intent (use \`search_history\`). |
 | \`get_session_details\` | Reading structured user-assistant conversation history, subagent links, or parent session for a session. | Inspecting raw parameters/results of a single step (use \`get_step_details\`). |
@@ -656,6 +689,7 @@ flowchart TD
 
 async function handleListSessions(args: any): Promise<any> {
   const adapter = args?.adapter as string | undefined;
+  const parentId = args?.parentId as string | undefined;
   const limit = (args?.limit as number) || 10;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as ScopeType | undefined;
@@ -665,6 +699,7 @@ async function handleListSessions(args: any): Promise<any> {
   const store = getStore();
   const result = store.query({
     adapter,
+    parentId,
     projectPath,
     scope,
     limit,
@@ -679,7 +714,9 @@ async function handleListSessions(args: any): Promise<any> {
     project_path: s.projectPath,
     created_at: s.createdAt,
     last_active_at: s.lastActiveAt,
-    first_prompt: s.firstPrompt
+    first_prompt: s.firstPrompt,
+    parent_id: s.parentId || null,
+    child_session_ids: s.childSessionIds || []
   }));
 
   return {
@@ -687,6 +724,48 @@ async function handleListSessions(args: any): Promise<any> {
       {
         type: "text",
         text: JSON.stringify(rows, null, 2),
+      },
+    ],
+  };
+}
+
+async function handleGetSessionRelationship(args: any): Promise<any> {
+  const sessionId = args?.sessionId as string | undefined;
+  if (!sessionId) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Error: Missing required parameter 'sessionId'.",
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  const maxDepth = typeof args?.maxDepth === "number" ? args.maxDepth : 2;
+  const includeAncestors = args?.includeAncestors !== false;
+
+  const store = getStore();
+  const rel = store.getSessionRelationship(sessionId, maxDepth, includeAncestors);
+
+  if (!rel) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Session '${sessionId}' not found.`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(rel, null, 2),
       },
     ],
   };
@@ -976,6 +1055,34 @@ export async function handleQueryTranscript(args: any): Promise<any> {
           stepObj.tool_result = toolResult;
         }
 
+        if (step.type === "INVOKE_SUBAGENT" || (step.toolCalls && step.toolCalls.includes("invoke_subagent"))) {
+          let subagentIds: string[] = [];
+          if (step.toolCalls) {
+            try {
+              const parsedCalls = JSON.parse(step.toolCalls);
+              const callsArray = Array.isArray(parsedCalls) ? parsedCalls : [parsedCalls];
+              for (const call of callsArray) {
+                if (call.name === "invoke_subagent" || call.name?.endsWith("invoke_subagent")) {
+                  const callArgs = call.args || call.arguments;
+                  if (callArgs?.Subagents && Array.isArray(callArgs.Subagents)) {
+                    for (const sub of callArgs.Subagents) {
+                      if (sub.conversationId) subagentIds.push(sub.conversationId);
+                    }
+                  }
+                }
+              }
+            } catch {
+              // ignore JSON parse error
+            }
+          }
+          if (subagentIds.length === 0 && s.childSessionIds && s.childSessionIds.length > 0) {
+            subagentIds = s.childSessionIds;
+          }
+          if (subagentIds.length > 0) {
+            stepObj.subagent_session_ids = subagentIds;
+          }
+        }
+
         stepsWithSessionId.push(stepObj);
       }
     }
@@ -1218,6 +1325,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "chronicle_guide":
         return handleChronicleGuide();
+      case "list_sessions":
+        return await handleListSessions(args);
+      case "get_session_relationship":
+        return await handleGetSessionRelationship(args);
       case "query_transcript":
         return await handleQueryTranscript(args);
       case "get_session_details":
