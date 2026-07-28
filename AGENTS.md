@@ -12,6 +12,7 @@
 ### 2. Mandatory Chronicle MCP Tool Usage
 When asked to read, query, summarize, or search past conversations, sessions, tool executions, or errors, you MUST use the registered `chronicle-mcp` tools:
 - **`chronicle_guide`**: Call first when starting history exploration to review token-saving rules, decision tree, and parameter guidelines.
+- **`sync_history`**: Call `sync_history(force=true)` before querying recent history to ensure all un-indexed log entries from disk are indexed into the database.
 - **`query_transcript`**: Primary tool to read, query, filter, slice, or export transcript entries by `categories` and `sort` modes.
 - **`list_sessions`**: Retrieve history metadata and session IDs.
 - **`search_history`**: Perform semantic vector search over past turns.

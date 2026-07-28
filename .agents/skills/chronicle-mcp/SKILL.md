@@ -45,6 +45,7 @@ Do NOT read raw JSONL log files directly. Use `chronicle-mcp` tools to access hi
 
 ## Workflows & Best Practices
 
+- [ ] **Pre-Query History Sync**: Call `sync_history(force=true)` before querying recent sessions or after major task milestones to ensure all un-indexed log entries from disk are indexed.
 - [ ] **Read Recent Turns First**: ALWAYS set `sort="time_new_to_old"` when investigating recent context or latest user feedback.
 - [ ] **Dialogue-Only Reading**: Set `categories=["conversation_steps"]` when reading human-assistant dialogue, skipping tool payloads.
 - [ ] **Targeted Tool Output Extraction**: Set `categories=["tool_results"]` and `toolName="patch_file"` to retrieve execution outputs directly.

@@ -606,6 +606,7 @@ flowchart TD
 \`\`\`
 
 ### Session Reading & Hierarchy Directives
+* **Pre-Query Sync Directive**: Call \`sync_history\` (or \`sync_history(force=true)\`) before querying recent sessions or after major task milestones to ensure all un-indexed log entries from disk are indexed before retrieval.
 * **Read Recent Turns First**: ALWAYS set \`reverseSteps=true\` in \`get_session_details\` or \`get_step_details\` when investigating recent context or latest user feedback to avoid parsing old steps.
 * **Enforce User Scope**: MUST set \`scope="workspace"\` when user restricts request to current project; set \`scope="all"\` when searching across repositories.
 * **Dialogue-Only Reading**: MUST set \`conversationStepsOnly=true\` when user wants to read human-assistant dialogue, skipping intermediate tool execution payloads.
