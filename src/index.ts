@@ -1055,7 +1055,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
           stepObj.tool_result = toolResult;
         }
 
-        if (step.type === "INVOKE_SUBAGENT" || (step.toolCalls && step.toolCalls.includes("invoke_subagent"))) {
+        if (step.type === "INVOKE_SUBAGENT" || step.toolCalls?.includes("invoke_subagent")) {
           let subagentIds: string[] = [];
           if (step.toolCalls) {
             try {
@@ -1075,7 +1075,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
               // ignore JSON parse error
             }
           }
-          if (subagentIds.length === 0 && s.childSessionIds && s.childSessionIds.length > 0) {
+          if (subagentIds.length === 0 && s.childSessionIds?.length) {
             subagentIds = s.childSessionIds;
           }
           if (subagentIds.length > 0) {

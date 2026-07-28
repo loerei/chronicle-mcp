@@ -685,7 +685,7 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
 
     const rootSessionId = ancestors.length > 0 ? ancestors[0].id : currentSession.id;
-    const parent = ancestors.length > 0 ? ancestors[ancestors.length - 1] : null;
+    const parent = ancestors.at(-1) ?? null;
 
     let siblings: SessionRelationshipNode[] = [];
     if (currentSession.parentId) {
@@ -1268,7 +1268,7 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     const rootSessionId = ancestors.length > 0 ? ancestors[0].id : currentSessionRow.id;
-    const parent = ancestors.length > 0 ? ancestors[ancestors.length - 1] : null;
+    const parent = ancestors.at(-1) ?? null;
 
     let siblings: SessionRelationshipNode[] = [];
     if (currentSessionRow.parent_id) {
