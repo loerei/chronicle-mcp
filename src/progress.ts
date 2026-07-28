@@ -20,13 +20,13 @@ export interface ProgressReporterOptions {
 }
 
 export class ProgressReporter {
-  private notify: ProgressNotify | null;
-  private label: string;
-  private barWidth: number;
-  private minStep: number;
-  private minIntervalMs: number;
-  private stallTimeoutMs: number;
-  private onStall?: (done: number, total: number, detail: string) => void;
+  private readonly notify: ProgressNotify | null;
+  private readonly label: string;
+  private readonly barWidth: number;
+  private readonly minStep: number;
+  private readonly minIntervalMs: number;
+  private readonly stallTimeoutMs: number;
+  private readonly onStall?: (done: number, total: number, detail: string) => void;
 
   private lastSentProgress = 0;
   private lastSendTs = 0;
