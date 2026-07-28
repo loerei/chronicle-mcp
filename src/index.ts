@@ -11,7 +11,7 @@ import os from "node:os";
 import { getStore, getDb } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
 import { getEmbeddingClient } from "./embeddings.js";
-import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks, getToolUsageStats } from "./search.js";
+import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks, getToolUsageStats, generateInteractiveContextChartHtml } from "./search.js";
 
 let activeSync: Promise<void> | null = null;
 let lastSyncTime = 0;
@@ -461,6 +461,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           output: {
             type: "string",
             description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
+          },
+          linechart_output: {
+            type: "string",
+            description: "Optional absolute path to export an interactive HTML line chart visualizing context window size over steps with Checkpoints and conversational steps highlighted.",
           },
         },
         required: ["sessionIds"],
@@ -1087,6 +1091,21 @@ async function handleGetSessionBenchmarks(args: any): Promise<any> {
     md += `| ${sessionLink}<br>\`${m.sessionId.slice(0, 8)}\` | ${groupName} | ${m.totalSteps} | ${m.toolCallsCount} | ${durationText} | ${m.cumulativeInputTokens.toLocaleString()} | ${m.cacheHitRate.toFixed(1)}% | ${m.estimatedCostSavings.toFixed(1)}% | ${m.peakContextSize.toLocaleString()} | ${m.estimatedOutputTokens.toLocaleString()} | ${m.errorStepsCount} |\n`;
   }
   md += `\n`;
+
+  const linechartPath = (args?.linechart_output || args?.linechartOutput) as string | undefined;
+  if (linechartPath && sessionIds && sessionIds.length > 0) {
+    const store = getStore();
+    for (const sid of sessionIds) {
+      const qResult = store.query({ sessionId: sid, includeSteps: true });
+      const sess = qResult.sessions[0];
+      if (sess && qResult.steps) {
+        const chartHtml = generateInteractiveContextChartHtml(sid, sess.title || sid, qResult.steps);
+        const chartResult = await handleOutputWrite(chartHtml, linechartPath, `context_chart_${sid.slice(0, 8)}.html`);
+        const writtenText = chartResult.content?.[0]?.text || "";
+        md += `> **Interactive Context Window Chart**: ${writtenText}\n\n`;
+      }
+    }
+  }
 
   const outputPath = args?.output as string | undefined;
   return handleOutputWrite(md, outputPath, `benchmarks_${Date.now()}.md`);

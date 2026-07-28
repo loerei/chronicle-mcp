@@ -250,4 +250,20 @@ describe("Benchmarking Logic", () => {
     // Verified that cache simulation ran without throwing errors
     assert.ok(m.cumulativeInputTokens > 0);
   });
+
+  it("should generate interactive HTML line chart HTML string correctly", async () => {
+    const { generateInteractiveContextChartHtml } = await import("../search.js");
+    const steps: StepData[] = [
+      { stepIndex: 0, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Hello" },
+      { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Hi" },
+      { stepIndex: 2, type: "CHECKPOINT", source: "SYSTEM", status: "DONE", content: "{{ CHECKPOINT 1 }}" }
+    ];
+
+    const html = generateInteractiveContextChartHtml("test-chart-id", "Test Session Chart", steps);
+    assert.ok(html.includes("<!DOCTYPE html>"));
+    assert.ok(html.includes("Context Window Timeline"));
+    assert.ok(html.includes("CHECKPOINT 1"));
+    assert.ok(html.includes("test-chart-id"));
+    assert.ok(html.includes("svg"));
+  });
 });
