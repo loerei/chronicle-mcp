@@ -266,4 +266,36 @@ describe("Benchmarking Logic", () => {
     assert.ok(html.includes("test-chart-id"));
     assert.ok(html.includes("svg"));
   });
+
+  it("should include cumulative output tokens area chart elements in generated HTML", async () => {
+    const { generateInteractiveContextChartHtml } = await import("../search.js");
+    const steps: StepData[] = [
+      { stepIndex: 0, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Hello world" },
+      { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response one" },
+      { stepIndex: 2, type: "MCP_TOOL", source: "SYSTEM", status: "DONE", content: "Tool result" },
+      { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response two" },
+    ];
+
+    const html = generateInteractiveContextChartHtml("output-test-id", "Output Token Test", steps);
+
+    // SVG output area elements
+    assert.ok(html.includes('id="output-area"'), "Missing output-area polygon");
+    assert.ok(html.includes('id="output-line"'), "Missing output-line polyline");
+    assert.ok(html.includes('id="output-area-gradient"'), "Missing output-area-gradient");
+    assert.ok(html.includes('#ef4444'), "Missing red color for output chart");
+
+    // Controls bar toggle
+    assert.ok(html.includes('id="toggle-output"'), "Missing toggle-output checkbox");
+    assert.ok(html.includes('Cumulative Output Area'), "Missing Cumulative Output Area label");
+
+    // Tooltip and pinned card output fields
+    assert.ok(html.includes('Cumulative Output'), "Missing Cumulative Output in tooltip");
+    assert.ok(html.includes('id="pinned-output"'), "Missing pinned-output element");
+
+    // Stats badge
+    assert.ok(html.includes('Total Output'), "Missing Total Output stat badge");
+
+    // Data should include outputContext field
+    assert.ok(html.includes('outputContext'), "Missing outputContext in pointsData");
+  });
 });

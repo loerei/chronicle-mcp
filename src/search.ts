@@ -361,6 +361,7 @@ export interface StepContextPoint {
   source: string;
   tokens: number;
   cumulativeContextSize: number;
+  cumulativeOutputTokens: number;
   isConversational: boolean;
   isCheckpoint: boolean;
   contentPreview: string;
@@ -382,6 +383,7 @@ export function generateInteractiveContextChartHtml(
   const points: StepContextPoint[] = [];
   let activeStartIndex = 0;
   let currentContextSize = 0;
+  let runningOutputTokens = 0;
   let checkpointCount = 0;
   let conversationalCount = 0;
   let peakContextSize = 0;
@@ -391,6 +393,7 @@ export function generateInteractiveContextChartHtml(
     const tokens = stepTokens[i] || 0;
     const isCheckpoint = step.type === "CHECKPOINT";
     const isConversational = step.source === "USER_EXPLICIT" || step.type === "USER_INPUT";
+    const isPlannerResponse = step.type === "PLANNER_RESPONSE" || step.source === "MODEL";
 
     if (isCheckpoint) {
       activeStartIndex = i;
@@ -398,6 +401,9 @@ export function generateInteractiveContextChartHtml(
     }
     if (isConversational) {
       conversationalCount++;
+    }
+    if (isPlannerResponse) {
+      runningOutputTokens += tokens;
     }
 
     currentContextSize = sumTokens(stepTokens, activeStartIndex, i + 1);
@@ -414,6 +420,7 @@ export function generateInteractiveContextChartHtml(
       source: step.source || "",
       tokens,
       cumulativeContextSize: currentContextSize,
+      cumulativeOutputTokens: runningOutputTokens,
       isConversational,
       isCheckpoint,
       contentPreview: previewStr,
@@ -432,7 +439,8 @@ export function generateInteractiveContextChartHtml(
   const totalWidth = Math.max(1200, paddingLeft + paddingRight + points.length * stepSpacing);
   const innerWidth = totalWidth - paddingLeft - paddingRight;
 
-  const rawMax = Math.max(10000, peakContextSize * 1.1);
+  const maxValTokens = Math.max(peakContextSize, runningOutputTokens);
+  const rawMax = Math.max(10000, maxValTokens * 1.1);
   const majorUnit = rawMax >= 200000 ? 50000 : 10000;
   const maxVal = Math.ceil(rawMax / majorUnit) * majorUnit;
   const minorStep = maxVal > 300000 ? 5000 : 1000;
@@ -485,10 +493,12 @@ export function generateInteractiveContextChartHtml(
   }
 
   const polylineCoords = points.map((p, idx) => `${getX(idx).toFixed(1)},${getY(p.cumulativeContextSize).toFixed(1)}`).join(" ");
+  const outputPolylineCoords = points.map((p, idx) => `${getX(idx).toFixed(1)},${getY(p.cumulativeOutputTokens).toFixed(1)}`).join(" ");
   const firstX = getX(0).toFixed(1);
   const lastX = getX(points.length - 1).toFixed(1);
   const baselineY = (chartHeight - paddingBottom).toFixed(1);
   const areaPolygonCoords = `${firstX},${baselineY} ${polylineCoords} ${lastX},${baselineY}`;
+  const outputAreaPolygonCoords = `${firstX},${baselineY} ${outputPolylineCoords} ${lastX},${baselineY}`;
 
   let checkpointsHtml = "";
   let dataPointsHtml = "";
@@ -561,6 +571,7 @@ export function generateInteractiveContextChartHtml(
     source: p.source,
     tokens: p.tokens,
     context: p.cumulativeContextSize,
+    outputContext: p.cumulativeOutputTokens,
     isCkpt: p.isCheckpoint,
     isConv: p.isConversational,
     preview: p.contentPreview,
@@ -623,6 +634,7 @@ export function generateInteractiveContextChartHtml(
     .dot-conv { background-color: var(--accent-cyan); }
     .dot-ckpt { background-color: var(--accent-red); }
     .dot-line { background-color: #6366f1; }
+    .dot-output { background-color: #ef4444; }
     
     /* Custom Scrollbar */
     ::-webkit-scrollbar {
@@ -784,6 +796,7 @@ export function generateInteractiveContextChartHtml(
     <div class="stats-row">
       <div class="stat-badge">Total Steps: <strong>${points.length}</strong></div>
       <div class="stat-badge">Peak Context: <strong>${peakContextSize.toLocaleString()} tokens</strong></div>
+      <div class="stat-badge">Total Output: <strong>${runningOutputTokens.toLocaleString()} tokens</strong></div>
       <div class="stat-badge">Checkpoints: <strong>${checkpointCount}</strong></div>
       <div class="stat-badge">Conversational Turns: <strong>${conversationalCount}</strong></div>
     </div>
@@ -791,6 +804,7 @@ export function generateInteractiveContextChartHtml(
 
   <div class="controls-bar">
     <label class="control-item"><input type="checkbox" id="toggle-line" checked /> <span class="dot dot-line"></span> Context Window Area</label>
+    <label class="control-item"><input type="checkbox" id="toggle-output" checked /> <span class="dot dot-output"></span> Cumulative Output Area</label>
     <label class="control-item"><input type="checkbox" id="toggle-conv" checked /> <span class="dot dot-conv"></span> Conversational Steps (User)</label>
     <label class="control-item"><input type="checkbox" id="toggle-ckpt" checked /> <span class="dot dot-ckpt"></span> Checkpoint Markers</label>
     <div style="display: flex; gap: 8px; align-items: center; margin-left: auto;">
@@ -819,8 +833,14 @@ export function generateInteractiveContextChartHtml(
           <stop offset="0%" stop-color="#6366f1" stop-opacity="0.45"/>
           <stop offset="100%" stop-color="#6366f1" stop-opacity="0.03"/>
         </linearGradient>
+        <linearGradient id="output-area-gradient" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#ef4444" stop-opacity="0.40"/>
+          <stop offset="100%" stop-color="#ef4444" stop-opacity="0.03"/>
+        </linearGradient>
       </defs>
       <g id="layer-ygrid">${yGridHtml}</g>
+      <polygon id="output-area" fill="url(#output-area-gradient)" points="${outputAreaPolygonCoords}" />
+      <polyline id="output-line" fill="none" stroke="#ef4444" stroke-width="2" stroke-dasharray="3 3" points="${outputPolylineCoords}" />
       <polygon id="context-area" fill="url(#area-gradient)" points="${areaPolygonCoords}" />
       <polyline id="context-line" fill="none" stroke="#6366f1" stroke-width="2.5" points="${polylineCoords}" />
       <g id="layer-checkpoints">${checkpointsHtml}</g>
@@ -847,6 +867,7 @@ export function generateInteractiveContextChartHtml(
     </div>
     <div class="pinned-body">
       <div class="row">Context Window: <span id="pinned-context">-</span></div>
+      <div class="row">Cumulative Output: <span id="pinned-output">-</span></div>
       <div class="row">Step Tokens: <span id="pinned-tokens">-</span></div>
       <div class="row">Source: <span id="pinned-source">-</span></div>
       <div class="row">Created At: <span id="pinned-created">-</span></div>
@@ -941,13 +962,17 @@ export function generateInteractiveContextChartHtml(
       }));
 
       const polylineCoords = currentPositions.map(p => p.cx.toFixed(1) + ',' + p.cy.toFixed(1)).join(' ');
+      const outputPolylineCoords = currentPositions.map((p, idx) => p.cx.toFixed(1) + ',' + getY(pointsData[idx].outputContext).toFixed(1)).join(' ');
       const firstX = currentPositions[0].cx.toFixed(1);
       const lastX = currentPositions[currentPositions.length - 1].cx.toFixed(1);
       const baselineY = (chartHeight - paddingBottom).toFixed(1);
       const areaPolygonCoords = firstX + ',' + baselineY + ' ' + polylineCoords + ' ' + lastX + ',' + baselineY;
+      const outputAreaPolygonCoords = firstX + ',' + baselineY + ' ' + outputPolylineCoords + ' ' + lastX + ',' + baselineY;
 
       document.getElementById('context-area').setAttribute('points', areaPolygonCoords);
       document.getElementById('context-line').setAttribute('points', polylineCoords);
+      document.getElementById('output-area').setAttribute('points', outputAreaPolygonCoords);
+      document.getElementById('output-line').setAttribute('points', outputPolylineCoords);
 
       let checkpointsHtml = '';
       let checkpointNum = 0;
@@ -1032,6 +1057,7 @@ export function generateInteractiveContextChartHtml(
 
       document.getElementById('pinned-title').textContent = 'Step #' + p.stepIndex + ' - ' + tagStr;
       document.getElementById('pinned-context').textContent = p.context.toLocaleString() + ' tokens';
+      document.getElementById('pinned-output').textContent = (p.outputContext || 0).toLocaleString() + ' tokens';
       document.getElementById('pinned-tokens').textContent = p.tokens.toLocaleString() + ' tokens';
       document.getElementById('pinned-source').textContent = p.source || 'N/A';
       document.getElementById('pinned-created').textContent = p.createdAt;
@@ -1069,6 +1095,7 @@ export function generateInteractiveContextChartHtml(
           tooltip.innerHTML =
             '<div class="title">Step #' + p.stepIndex + ' - ' + tagStr + '</div>' +
             '<div class="row">Context Window: <span>' + p.context.toLocaleString() + ' tokens</span></div>' +
+            '<div class="row">Cumulative Output: <span>' + (p.outputContext || 0).toLocaleString() + ' tokens</span></div>' +
             '<div class="row">Step Tokens: <span>' + p.tokens.toLocaleString() + ' tokens</span></div>' +
             '<div class="row">Source: <span>' + (p.source || 'N/A') + '</span></div>' +
             '<div class="hint">(Click point to pin & expand full content)</div>';
@@ -1175,6 +1202,11 @@ export function generateInteractiveContextChartHtml(
       const display = e.target.checked ? 'block' : 'none';
       document.getElementById('context-area').style.display = display;
       document.getElementById('context-line').style.display = display;
+    });
+    document.getElementById('toggle-output').addEventListener('change', (e) => {
+      const display = e.target.checked ? 'block' : 'none';
+      document.getElementById('output-area').style.display = display;
+      document.getElementById('output-line').style.display = display;
     });
     document.getElementById('toggle-conv').addEventListener('change', (e) => {
       const display = e.target.checked ? 'block' : 'none';
