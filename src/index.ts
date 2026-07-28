@@ -12,10 +12,9 @@ import { getStore, getDb, StepCategory, StepSortMode } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
 import { getEmbeddingClient } from "./embeddings.js";
 import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks, getToolUsageStats, generateInteractiveContextChartHtml } from "./search.js";
+import { ProgressReporter, ProgressNotify } from "./progress.js";
 
 let activeSync: Promise<void> | null = null;
-let lastSyncTime = 0;
-const SYNC_COOLDOWN_MS = 5000;
 
 type ScopeType = "workspace" | "all";
 
@@ -100,12 +99,7 @@ async function syncSingleSession(s: any, store: any): Promise<boolean> {
 }
 
 // Incremental Indexing function
-export async function syncHistory(force: boolean = false): Promise<void> {
-  const now = Date.now();
-  if (!force && now - lastSyncTime < SYNC_COOLDOWN_MS) {
-    return;
-  }
-
+export async function syncHistory(force: boolean = false, reporter?: ProgressReporter): Promise<void> {
   if (activeSync) {
     return activeSync;
   }
@@ -116,7 +110,7 @@ export async function syncHistory(force: boolean = false): Promise<void> {
 
     for (const adapter of ADAPTERS) {
       try {
-        const sessions = await adapter.discoverSessions();
+        const sessions = await adapter.discoverSessions(reporter);
         let newCount = 0;
 
         for (const s of sessions) {
@@ -133,8 +127,8 @@ export async function syncHistory(force: boolean = false): Promise<void> {
         console.error(`[Chronicle MCP] Adapter "${adapter.name}" failed:`, e.message);
       }
     }
+    reporter?.finish("Sync completed!");
     console.error("[Chronicle MCP] Sync completed!");
-    lastSyncTime = Date.now();
   })();
 
   try {
@@ -1316,10 +1310,28 @@ async function handleGetSessionBenchmarks(args: any): Promise<any> {
 // Handle Tool Calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const progressToken = (request.params as any)?._meta?.progressToken;
+
+  let progressNotify: ProgressNotify | null = null;
+  if (progressToken) {
+    progressNotify = (progress, total, message) => {
+      return server.notification({
+        method: "notifications/progress",
+        params: {
+          progressToken,
+          progress,
+          total: total ?? 1.0,
+          message,
+        },
+      });
+    };
+  }
+
+  const reporter = new ProgressReporter(progressNotify, { label: "Syncing" });
 
   try {
     if (isAutoSyncEnabled() && name !== "sync_history") {
-      await syncHistory();
+      await syncHistory(false, reporter);
     }
 
     switch (name) {
@@ -1346,7 +1358,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_session_benchmarks":
         return await handleGetSessionBenchmarks(args);
       case "sync_history":
-        await syncHistory(true);
+        await syncHistory(true, reporter);
         return {
           content: [
             {

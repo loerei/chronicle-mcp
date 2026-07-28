@@ -48,7 +48,7 @@ export class AntigravityAdapter implements HistoryAdapter {
     }
   }
 
-  async discoverSessions(): Promise<SessionData[]> {
+  async discoverSessions(reporter?: any): Promise<SessionData[]> {
     const homedir = os.homedir();
     const brainDir = path.join(homedir, ".gemini", "antigravity", "brain");
 
@@ -63,11 +63,16 @@ export class AntigravityAdapter implements HistoryAdapter {
     const sessions: SessionData[] = [];
     const globalTitleMap = new Map<string, string>(); // sessionId -> title extracted from logs
 
-    for (const sid of sessionDirs) {
+    const total = sessionDirs.length;
+    reporter?.start(total, "Scanning Antigravity sessions...");
+
+    for (let i = 0; i < sessionDirs.length; i++) {
+      const sid = sessionDirs[i];
       const session = this.parseSingleSession(sid, brainDir, globalTitleMap);
       if (session) {
         sessions.push(session);
       }
+      reporter?.update(i + 1, total, session?.title || sid);
     }
 
     // Resolve titles globally
