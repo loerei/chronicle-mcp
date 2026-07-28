@@ -50,7 +50,7 @@ Conclude explicitly with either:
 
 ### C. PRDs & Feature Specifications
 - [ ] Problem statement & clear scope boundaries defined
-- [ ] User user stories & acceptance criteria unambiguous
+- [ ] User stories & acceptance criteria unambiguous
 - [ ] Security, permission, and data isolation requirements specified
 - [ ] Edge cases (network timeouts, empty data states, rate limits) covered
 

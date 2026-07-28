@@ -256,6 +256,20 @@ function parseTimeRange(timeRange: string): { start: number | null; end: number 
   };
 }
 
+export function isConversationStep(step: StepData): boolean {
+  if (step.type === "USER_INPUT") return true;
+  return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+}
+
+export function matchStepCategory(step: StepData, categories: StepCategory[]): boolean {
+  if (categories.includes("conversation_steps") && isConversationStep(step)) return true;
+  if (categories.includes("tool_calls") && step.toolCalls) return true;
+  if (categories.includes("tool_results") && (step.type === "MCP_TOOL" || step.type === "COMMAND" || step.source === "SYSTEM" || step.toolCalls)) return true;
+  if (categories.includes("thinking") && step.thinking && step.thinking.trim() !== "") return true;
+  if (categories.includes("system_events") && (step.type === "CHECKPOINT" || step.status === "ERROR" || step.type === "INVOKE_SUBAGENT" || step.source === "SYSTEM")) return true;
+  return false;
+}
+
 export class InMemoryHistoryStore implements HistoryStore {
   private readonly sessionsMap = new Map<string, Omit<SessionData, "chunks"> & { summary_vector?: number[] }>();
   private readonly stepsMap = new Map<string, StepData[]>();
@@ -400,8 +414,7 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   private isConversationStep(step: StepData): boolean {
-    if (step.type === "USER_INPUT") return true;
-    return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+    return isConversationStep(step);
   }
 
   private matchStepQueryAndTool(step: StepData, options: QueryOptions): boolean {
@@ -413,12 +426,7 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   private matchStepCategory(step: StepData, categories: StepCategory[]): boolean {
-    if (categories.includes("conversation_steps") && this.isConversationStep(step)) return true;
-    if (categories.includes("tool_calls") && step.toolCalls) return true;
-    if (categories.includes("tool_results") && (step.type === "MCP_TOOL" || step.type === "COMMAND" || step.source === "SYSTEM" || step.toolCalls)) return true;
-    if (categories.includes("thinking") && step.thinking && step.thinking.trim() !== "") return true;
-    if (categories.includes("system_events") && (step.type === "CHECKPOINT" || step.status === "ERROR" || step.type === "INVOKE_SUBAGENT" || step.source === "SYSTEM")) return true;
-    return false;
+    return matchStepCategory(step, categories);
   }
 
   private matchStep(step: StepData, options: QueryOptions): boolean {
@@ -773,6 +781,10 @@ export class SqliteHistoryStore implements HistoryStore {
       createdAt: row.created_at ?? undefined,
       ...(row.tool_result ? { tool_result: row.tool_result } : {}) as any
     };
+
+    if (options.categories && options.categories.length > 0) {
+      if (!matchStepCategory(step, options.categories)) return;
+    }
 
     if (options.toolName !== undefined || options.serverName !== undefined) {
       if (!step.toolCalls) return;

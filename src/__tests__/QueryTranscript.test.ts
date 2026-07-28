@@ -90,6 +90,20 @@ describe("QueryTranscript Unit & Integration Suite", () => {
     assert.ok(data[1].tool_calls);
   });
 
+  it("should normalize categories when passed an empty array", async () => {
+    const res = await handleQueryTranscript({
+      sessionId: "sess-query-test-1",
+      categories: [],
+    });
+    assert.strictEqual(res.isError, undefined);
+    const data = JSON.parse(res.content[0].text);
+    assert.strictEqual(data.length, 4);
+    assert.strictEqual(data[0].step_index, 0);
+    assert.strictEqual(data[1].step_index, 1);
+    assert.ok(data[1].thinking);
+    assert.ok(data[1].tool_calls);
+  });
+
   it("should extract specified categories only", async () => {
     const res = await handleQueryTranscript({
       sessionId: "sess-query-test-1",

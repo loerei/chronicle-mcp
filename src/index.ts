@@ -1074,7 +1074,6 @@ async function handleSearchSteps(args: any): Promise<any> {
   const categories: StepCategory[] = [];
   if (args?.conversationStepsOnly) categories.push("conversation_steps");
   if (args?.includeToolResults) categories.push("tool_calls", "tool_results");
-  if (args?.excludeContent) categories.push("tool_calls");
 
   return handleQueryTranscript({
     ...args,
