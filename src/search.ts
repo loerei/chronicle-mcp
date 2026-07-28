@@ -513,11 +513,13 @@ export function generateInteractiveContextChartHtml(
     let fillColor = "#6366f1";
     let radius = 3;
     let pointClass = "point-normal";
+    let hitClass = "hit-target";
 
     if (p.isConversational) {
       fillColor = "#10b981";
       radius = 5;
       pointClass = "point-conversational";
+      hitClass += " hit-target-conversational";
     } else if (p.isCheckpoint) {
       fillColor = "#ef4444";
       radius = 6;
@@ -527,7 +529,7 @@ export function generateInteractiveContextChartHtml(
     dataPointsHtml += `<circle class="${pointClass}" cx="${cx}" cy="${cy}" r="${radius}" fill="${fillColor}" stroke="#161b22" stroke-width="1.5"/>\n`;
 
     interactiveNodesHtml += `
-      <circle class="hit-target" cx="${cx}" cy="${cy}" r="12" fill="transparent" 
+      <circle class="${hitClass}" cx="${cx}" cy="${cy}" r="12" fill="transparent" 
         data-idx="${idx}"
       />\n`;
 
@@ -969,11 +971,13 @@ export function generateInteractiveContextChartHtml(
         let fillColor = '#6366f1';
         let radius = 3;
         let pointClass = 'point-normal';
+        let hitClass = 'hit-target';
 
         if (p.isConv) {
           fillColor = '#10b981';
           radius = 5;
           pointClass = 'point-conversational';
+          hitClass += ' hit-target-conversational';
         } else if (p.isCkpt) {
           fillColor = '#ef4444';
           radius = 6;
@@ -982,7 +986,7 @@ export function generateInteractiveContextChartHtml(
 
         dataPointsHtml += '<circle class="' + pointClass + '" cx="' + cx + '" cy="' + cy + '" r="' + radius + '" fill="' + fillColor + '" stroke="#161b22" stroke-width="1.5"/>';
 
-        interactiveNodesHtml += '<circle class="hit-target" cx="' + cx + '" cy="' + cy + '" r="12" fill="transparent" data-idx="' + idx + '"/>';
+        interactiveNodesHtml += '<circle class="' + hitClass + '" cx="' + cx + '" cy="' + cy + '" r="12" fill="transparent" data-idx="' + idx + '"/>';
 
         if (idx % 5 === 0 || p.isConv || p.isCkpt || idx === pointsData.length - 1) {
           let labelColor = '#8b949e';
@@ -1140,11 +1144,10 @@ export function generateInteractiveContextChartHtml(
       }
 
       // Default Scroll or Shift+Scroll -> Horizontal scrolling across steps
-      if (e.shiftKey) return;
-
-      if (e.deltaY !== 0) {
+      const delta = e.deltaX !== 0 ? e.deltaX : e.deltaY;
+      if (delta !== 0) {
         e.preventDefault();
-        viewport.scrollLeft += e.deltaY;
+        viewport.scrollLeft += delta;
       }
     }, { passive: false });
 
@@ -1174,7 +1177,8 @@ export function generateInteractiveContextChartHtml(
       document.getElementById('context-line').style.display = display;
     });
     document.getElementById('toggle-conv').addEventListener('change', (e) => {
-      document.querySelectorAll('.point-conversational').forEach(el => el.style.display = e.target.checked ? 'block' : 'none');
+      const display = e.target.checked ? 'block' : 'none';
+      document.querySelectorAll('.point-conversational, .hit-target-conversational').forEach(el => el.style.display = display);
     });
     document.getElementById('toggle-ckpt').addEventListener('change', (e) => {
       document.getElementById('layer-checkpoints').style.display = e.target.checked ? 'block' : 'none';
