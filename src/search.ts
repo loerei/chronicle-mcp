@@ -103,7 +103,8 @@ interface StepAnalysis {
   maxCreatedAt: number;
   errorStepsCount: number;
   toolCallsCount: number;
-  stepTokens: number[];
+  stepContextTokens: number[];
+  stepThinkingTokens: number[];
 }
 
 function countToolCalls(toolCalls: string | undefined): number {
@@ -121,7 +122,8 @@ function analyzeSteps(steps: StepData[]): StepAnalysis {
   let maxCreatedAt = -Infinity;
   let errorStepsCount = 0;
   let toolCallsCount = 0;
-  const stepTokens: number[] = [];
+  const stepContextTokens: number[] = [];
+  const stepThinkingTokens: number[] = [];
 
   for (const step of steps) {
     if (step.createdAt !== undefined) {
@@ -138,11 +140,12 @@ function analyzeSteps(steps: StepData[]): StepAnalysis {
     const contentStr = step.content || "";
     const thinkingStr = step.thinking || "";
     const toolCallsStr = step.toolCalls || "";
-    const stepText = contentStr + thinkingStr + toolCallsStr;
-    stepTokens.push(stepText ? encoder.encode(stepText).length : 0);
+    const contextText = contentStr + toolCallsStr;
+    stepContextTokens.push(contextText ? encoder.encode(contextText).length : 0);
+    stepThinkingTokens.push(thinkingStr ? encoder.encode(thinkingStr).length : 0);
   }
 
-  return { minCreatedAt, maxCreatedAt, errorStepsCount, toolCallsCount, stepTokens };
+  return { minCreatedAt, maxCreatedAt, errorStepsCount, toolCallsCount, stepContextTokens, stepThinkingTokens };
 }
 
 interface CachingMetrics {
@@ -161,7 +164,7 @@ function sumTokens(tokens: number[], start: number, end: number): number {
   return sum;
 }
 
-function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetrics {
+function simulateCaching(steps: StepData[], stepContextTokens: number[], stepThinkingTokens: number[]): CachingMetrics {
   let cumulativeInputTokens = 0;
   let cacheHitTokens = 0;
   let cacheMissTokens = 0;
@@ -182,16 +185,16 @@ function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetric
     let miss = 0;
 
     if (lastModelCallIndex === -1 || lastModelCallIndex < activeStartIndex) {
-      miss = sumTokens(stepTokens, activeStartIndex, i);
+      miss = sumTokens(stepContextTokens, activeStartIndex, i);
     } else {
-      hit = sumTokens(stepTokens, activeStartIndex, lastModelCallIndex + 1);
-      miss = sumTokens(stepTokens, lastModelCallIndex + 1, i);
+      hit = sumTokens(stepContextTokens, activeStartIndex, lastModelCallIndex + 1);
+      miss = sumTokens(stepContextTokens, lastModelCallIndex + 1, i);
     }
 
     cumulativeInputTokens += (hit + miss);
     cacheHitTokens += hit;
     cacheMissTokens += miss;
-    estimatedOutputTokens += stepTokens[i];
+    estimatedOutputTokens += stepContextTokens[i] + stepThinkingTokens[i];
 
     lastModelCallIndex = i;
   }
@@ -218,9 +221,9 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
     const analysis = analyzeSteps(steps);
     errorStepsCount = analysis.errorStepsCount;
     toolCallsCount = analysis.toolCallsCount;
-    const stepTokens = analysis.stepTokens;
+    const { stepContextTokens, stepThinkingTokens } = analysis;
 
-    const cache = simulateCaching(steps, stepTokens);
+    const cache = simulateCaching(steps, stepContextTokens, stepThinkingTokens);
     cumulativeInputTokens = cache.cumulativeInputTokens;
     cacheHitTokens = cache.cacheHitTokens;
     cacheMissTokens = cache.cacheMissTokens;
@@ -228,7 +231,7 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
     const lastModelCallIndex = cache.lastModelCallIndex;
 
     if (lastModelCallIndex === -1) {
-      const total = stepTokens.reduce((a, b) => a + b, 0);
+      const total = stepContextTokens.reduce((a, b) => a + b, 0);
       cacheMissTokens = total;
       cumulativeInputTokens = total;
     }
@@ -240,13 +243,13 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
         activeStartIndex = i;
       }
       if (steps[i].type === "PLANNER_RESPONSE") {
-        const currentContextSize = sumTokens(stepTokens, activeStartIndex, i);
+        const currentContextSize = sumTokens(stepContextTokens, activeStartIndex, i);
         if (currentContextSize > maxContextSize) {
           maxContextSize = currentContextSize;
         }
       }
     }
-    peakContextSize = maxContextSize > 0 ? maxContextSize : stepTokens.reduce((a, b) => a + b, 0);
+    peakContextSize = maxContextSize > 0 ? maxContextSize : stepContextTokens.reduce((a, b) => a + b, 0);
 
     if (cumulativeInputTokens > 0) {
       cacheHitRate = (cacheHitTokens / cumulativeInputTokens) * 100;
@@ -378,7 +381,7 @@ export function generateInteractiveContextChartHtml(
   }
 
   const analysis = analyzeSteps(steps);
-  const stepTokens = analysis.stepTokens;
+  const { stepContextTokens, stepThinkingTokens } = analysis;
 
   const points: StepContextPoint[] = [];
   let activeStartIndex = 0;
@@ -390,7 +393,7 @@ export function generateInteractiveContextChartHtml(
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    const tokens = stepTokens[i] || 0;
+    const tokens = stepContextTokens[i] || 0;
     const isCheckpoint = step.type === "CHECKPOINT";
     const isConversational = step.source === "USER_EXPLICIT" || step.type === "USER_INPUT";
     const isPlannerResponse = step.type === "PLANNER_RESPONSE";
@@ -403,10 +406,10 @@ export function generateInteractiveContextChartHtml(
       conversationalCount++;
     }
     if (isPlannerResponse) {
-      runningOutputTokens += tokens;
+      runningOutputTokens += tokens + (stepThinkingTokens[i] || 0);
     }
 
-    currentContextSize = sumTokens(stepTokens, activeStartIndex, i + 1);
+    currentContextSize = sumTokens(stepContextTokens, activeStartIndex, i + 1);
     if (currentContextSize > peakContextSize) {
       peakContextSize = currentContextSize;
     }
