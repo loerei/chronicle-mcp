@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { getStore, getDb } from "./db.js";
+import { getStore, getDb, StepCategory, StepSortMode } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
 import { getEmbeddingClient } from "./embeddings.js";
 import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks, getToolUsageStats, generateInteractiveContextChartHtml } from "./search.js";
@@ -23,6 +23,13 @@ export function isAutoSyncEnabled(): boolean {
   return (
     process.env.CHRONICLE_AUTO_SYNC === "true" ||
     process.argv.includes("--auto-sync")
+  );
+}
+
+export function isLegacyToolsEnabled(): boolean {
+  return (
+    process.env.CHRONICLE_ENABLE_LEGACY_TOOLS === "true" ||
+    process.argv.includes("--enable-legacy-tools")
   );
 }
 
@@ -222,77 +229,89 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
     },
     {
-      name: "get_session_details",
-      description: "Retrieve conversational history and steps of a specific session.",
+      name: "query_transcript",
+      description: "Read, query, filter, slice, and export session transcript entries, tool calls, and execution results using categories and sort modes.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: {
             type: "string",
-            description: "Unique session ID.",
+            description: "Filter by session ID. If omitted, searches across all indexed sessions.",
           },
-          includeToolCalls: {
-            type: "boolean",
-            description: "Include tool calls in the history.",
-            default: false,
-          },
-          includeCallResults: {
-            type: "boolean",
-            description: "Include tool calls and their execution results.",
-            default: false,
+          stepIndex: {
+            type: "integer",
+            description: "Retrieve a single specific step index within a session.",
           },
           startStep: {
-            type: "number",
-            description: "Start step index (inclusive) for slicing history.",
+            type: "integer",
+            description: "Start step index (inclusive) for slicing.",
           },
           endStep: {
-            type: "number",
-            description: "End step index (inclusive) for slicing history.",
+            type: "integer",
+            description: "End step index (inclusive) for slicing.",
           },
-          excludeContent: {
-            type: "boolean",
-            description: "Exclude content and thinking fields to prevent token bloat.",
-            default: false,
+          startConversationStep: {
+            type: "integer",
+            description: "Start 1-based conversation turn index (inclusive).",
           },
-          includeTimestamps: {
-            type: "boolean",
-            description: "Include step creation timestamps in the output.",
-            default: false,
+          endConversationStep: {
+            type: "integer",
+            description: "End 1-based conversation turn index (inclusive).",
+          },
+          query: {
+            type: "string",
+            description: "Text query to find in content, thinking, or tool calls.",
+          },
+          toolName: {
+            type: "string",
+            description: "Filter by executed tool name (e.g. patch_file, view_file).",
+          },
+          serverName: {
+            type: "string",
+            description: "Filter by MCP server name (e.g. patchitright, chronicle).",
+          },
+          type: {
+            type: "string",
+            description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND).",
+          },
+          status: {
+            type: "string",
+            description: "Filter by step status (e.g. DONE, ERROR).",
+          },
+          scope: {
+            type: "string",
+            enum: ["workspace", "all"],
+            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
+            default: "all",
+          },
+          projectPath: {
+            type: "string",
+            description: "Filter by absolute workspace path.",
+          },
+          categories: {
+            type: "array",
+            items: {
+              type: "string",
+              enum: ["conversation_steps", "tool_calls", "tool_results", "thinking", "system_events"],
+            },
+            description: "List of information categories to extract. Both omitting property and passing empty array [] default to all 5 categories.",
+          },
+          sort: {
+            type: "string",
+            enum: ["time_old_to_new", "time_new_to_old", "category"],
+            description: "Output sort and grouping mode.",
+            default: "time_old_to_new",
+          },
+          limit: {
+            type: "integer",
+            description: "Max number of steps/entries to return",
+            default: 20,
           },
           output: {
             type: "string",
-            description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
+            description: "Absolute path to output file (.md or .json) or directory to write results directly.",
           },
-          ...conversationStepParams,
         },
-        required: ["sessionId"],
-      },
-    },
-    {
-      name: "get_step_details",
-      description: "Retrieve content, thinking, and tool execution details for specific step indexes in a session.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          sessionId: {
-            type: "string",
-            description: "Unique session ID.",
-          },
-          stepIndex: {
-            type: "number",
-            description: "Index of a single step to retrieve.",
-          },
-          startStep: {
-            type: "number",
-            description: "Start step index (inclusive) for range retrieval.",
-          },
-          endStep: {
-            type: "number",
-            description: "End step index (inclusive) for range retrieval.",
-          },
-          ...conversationStepParams,
-        },
-        required: ["sessionId"],
       },
     },
     {
@@ -311,64 +330,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
         },
         required: ["sessionId"],
-      },
-    },
-    {
-      name: "search_steps",
-      description: "Search across indexed steps by text query, step type, status, or tool name.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          query: {
-            type: "string",
-            description: "Text query to find in content, thinking, or tool calls.",
-          },
-          sessionId: {
-            type: "string",
-            description: "Filter by session ID.",
-          },
-          type: {
-            type: "string",
-            description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND).",
-          },
-          status: {
-            type: "string",
-            description: "Filter by step status (e.g. DONE, ERROR).",
-          },
-          limit: {
-            type: "number",
-            description: "Max number of steps to return",
-            default: 10,
-          },
-          projectPath: {
-            type: "string",
-            description: "Filter by absolute workspace path.",
-          },
-          scope: {
-            type: "string",
-            enum: ["workspace", "all"],
-            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
-            default: "all"
-          },
-          toolName: {
-            type: "string",
-            description: "Filter by executed tool name.",
-          },
-          serverName: {
-            type: "string",
-            description: "Filter by MCP server name.",
-          },
-          excludeContent: {
-            type: "boolean",
-            description: "Exclude content and thinking fields to prevent token bloat.",
-            default: false,
-          },
-          conversationStepsOnly: {
-            type: "boolean",
-            description: "Filter search results to conversation steps only.",
-            default: false,
-          },
-        },
       },
     },
     {
@@ -483,6 +444,66 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     });
   }
 
+  if (isLegacyToolsEnabled()) {
+    tools.push(
+      {
+        name: "get_session_details",
+        description: "[Legacy Wrapper] Retrieve conversational history and steps of a specific session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string", description: "Unique session ID." },
+            includeToolCalls: { type: "boolean", default: false },
+            includeCallResults: { type: "boolean", default: false },
+            startStep: { type: "number" },
+            endStep: { type: "number" },
+            excludeContent: { type: "boolean", default: false },
+            includeTimestamps: { type: "boolean", default: false },
+            output: { type: "string" },
+            ...conversationStepParams,
+          },
+          required: ["sessionId"],
+        },
+      },
+      {
+        name: "get_step_details",
+        description: "[Legacy Wrapper] Retrieve content, thinking, and tool execution details for specific step indexes in a session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            sessionId: { type: "string", description: "Unique session ID." },
+            stepIndex: { type: "number" },
+            startStep: { type: "number" },
+            endStep: { type: "number" },
+            ...conversationStepParams,
+          },
+          required: ["sessionId"],
+        },
+      },
+      {
+        name: "search_steps",
+        description: "[Legacy Wrapper] Search across indexed steps by text query, step type, status, or tool name.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            sessionId: { type: "string" },
+            type: { type: "string" },
+            status: { type: "string" },
+            limit: { type: "number", default: 10 },
+            projectPath: { type: "string" },
+            scope: { type: "string", enum: ["workspace", "all"], default: "all" },
+            toolName: { type: "string" },
+            serverName: { type: "string" },
+            excludeContent: { type: "boolean", default: false },
+            conversationStepsOnly: { type: "boolean", default: false },
+            includeToolResults: { type: "boolean", default: false },
+          },
+        },
+      }
+    );
+  }
+
   return { tools };
 });
 
@@ -585,6 +606,7 @@ flowchart TD
 \`\`\`
 
 ### Session Reading & Hierarchy Directives
+* **Pre-Query Sync Directive**: Call \`sync_history\` (or \`sync_history(force=true)\`) before querying recent sessions or after major task milestones to ensure all un-indexed log entries from disk are indexed before retrieval.
 * **Read Recent Turns First**: ALWAYS set \`reverseSteps=true\` in \`get_session_details\` or \`get_step_details\` when investigating recent context or latest user feedback to avoid parsing old steps.
 * **Enforce User Scope**: MUST set \`scope="workspace"\` when user restricts request to current project; set \`scope="all"\` when searching across repositories.
 * **Dialogue-Only Reading**: MUST set \`conversationStepsOnly=true\` when user wants to read human-assistant dialogue, skipping intermediate tool execution payloads.
@@ -670,6 +692,48 @@ async function handleListSessions(args: any): Promise<any> {
   };
 }
 
+function formatStepToMarkdown(step: any, options?: { includeTimestamps?: boolean; includeCallResults?: boolean }): string {
+  let md = "";
+  const timeStr = (options?.includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
+  const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
+
+  if (step.type === "USER_INPUT") {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
+  } else if (step.type === "PLANNER_RESPONSE") {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
+    if (step.thinking) {
+      md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
+    }
+    if (step.content) {
+      md += `**Assistant**: ${step.content}\n\n`;
+    }
+    if (step.tool_calls) {
+      try {
+        md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
+      } catch {
+        md += `**Tool Calls**: ${step.tool_calls}\n\n`;
+      }
+    }
+    if (step.tool_result) {
+      md += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
+    }
+  } else if (options?.includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND") {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (${step.type})\n`;
+    if (step.source && step.status) {
+      md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
+    }
+    if (step.content) {
+      md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
+    }
+  } else {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (\`${step.type}\`)\n`;
+    if (step.content) {
+      md += `${step.content}\n\n`;
+    }
+  }
+  return md;
+}
+
 async function handleGetSessionDetails(args: any): Promise<any> {
   const sessionId = args?.sessionId as string;
   const includeToolCalls = args?.includeToolCalls as boolean | undefined;
@@ -727,32 +791,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
 
   if (needSteps) {
     for (const step of details.steps) {
-      const timeStr = (includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
-      const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
-      if (step.type === "USER_INPUT") {
-        md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
-      } else if (step.type === "PLANNER_RESPONSE") {
-        md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
-        if (step.thinking) {
-          md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
-        }
-        if (step.content) {
-          md += `**Assistant**: ${step.content}\n\n`;
-        }
-        if (step.tool_calls) {
-          try {
-            md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
-          } catch {
-            md += `**Tool Calls**: ${step.tool_calls}\n\n`;
-          }
-        }
-      } else if (includeCallResults) {
-        md += `### Step ${step.step_index} (${step.type})${convStepIdx}${timeStr}\n`;
-        md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
-        if (step.content) {
-          md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
-        }
-      }
+      md += formatStepToMarkdown(step, { includeTimestamps, includeCallResults });
     }
   } else {
     for (const chunk of details.chunks) {
@@ -781,71 +820,15 @@ async function handleGetSessionDetails(args: any): Promise<any> {
 }
 
 async function handleGetStepDetails(args: any): Promise<any> {
-  const sessionId = args?.sessionId as string;
-  const stepIndex = args?.stepIndex as number | undefined;
-  const startStep = args?.startStep as number | undefined;
-  const endStep = args?.endStep as number | undefined;
-  const conversationStepsOnly = args?.conversationStepsOnly as boolean | undefined;
-  const reverseSteps = args?.reverseSteps as boolean | undefined;
-  const startConversationStep = args?.startConversationStep as number | undefined;
-  const endConversationStep = args?.endConversationStep as number | undefined;
+  const categories: StepCategory[] = [];
+  if (args?.conversationStepsOnly) categories.push("conversation_steps");
+  const sort = args?.reverseSteps ? "time_new_to_old" : "time_old_to_new";
 
-  const store = getStore();
-  const sessionResult = store.query({ sessionId });
-  if (sessionResult.sessions.length === 0) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Session "${sessionId}" not found.`,
-        },
-      ],
-      isError: true,
-    };
-  }
-
-  const result = store.query({
-    sessionId,
-    includeSteps: true,
-    startStep: stepIndex ?? startStep,
-    endStep: stepIndex ?? endStep,
-    conversationStepsOnly,
-    reverseSteps,
-    startConversationStep,
-    endConversationStep,
+  return handleQueryTranscript({
+    ...args,
+    categories: categories.length > 0 ? categories : undefined,
+    sort,
   });
-
-  const allConvResult = store.query({
-    sessionId,
-    includeSteps: true,
-    conversationStepsOnly: true
-  });
-  const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
-  const convStepIndexMap = new Map<number, number>();
-  sortedConvSteps.forEach((step, idx) => {
-    convStepIndexMap.set(step.stepIndex, idx + 1);
-  });
-
-  const steps = result.steps.map(s => ({
-    step_index: s.stepIndex,
-    type: s.type,
-    source: s.source,
-    status: s.status,
-    content: s.content ?? null,
-    thinking: s.thinking ?? null,
-    tool_calls: s.toolCalls ?? null,
-    created_at: s.createdAt ?? null,
-    conversation_step_index: convStepIndexMap.get(s.stepIndex) ?? null
-  }));
-
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(steps, null, 2),
-      },
-    ],
-  };
 }
 
 async function handleGetSessionArtifacts(args: any): Promise<any> {
@@ -891,23 +874,38 @@ async function handleGetSessionArtifacts(args: any): Promise<any> {
   return handleOutputWrite(md, outputPath, `artifacts_${sessionId}.md`);
 }
 
-async function handleSearchSteps(args: any): Promise<any> {
-  const queryText = args?.query as string;
+export async function handleQueryTranscript(args: any): Promise<any> {
   const sessionId = args?.sessionId as string | undefined;
-  const type = args?.type as string | undefined;
-  const status = args?.status as string | undefined;
-  const limit = (args?.limit as number) || 10;
-  const projectPath = args?.projectPath as string | undefined;
-  const scope = args?.scope as "workspace" | "all" | undefined;
+  const stepIndex = args?.stepIndex as number | undefined;
+  const startStep = args?.startStep as number | undefined;
+  const endStep = args?.endStep as number | undefined;
+  const startConversationStep = args?.startConversationStep as number | undefined;
+  const endConversationStep = args?.endConversationStep as number | undefined;
+  const queryText = args?.query as string | undefined;
   const toolName = args?.toolName as string | undefined;
   const serverName = args?.serverName as string | undefined;
-  const excludeContent = args?.excludeContent as boolean | undefined;
-  const conversationStepsOnly = args?.conversationStepsOnly as boolean | undefined;
+  const type = args?.type as string | undefined;
+  const status = args?.status as string | undefined;
+  const limit = (args?.limit as number) || 20;
+  const projectPath = args?.projectPath as string | undefined;
+  const scope = args?.scope as "workspace" | "all" | undefined;
+  let categories = args?.categories as StepCategory[] | undefined;
+  const sortMode: StepSortMode = args?.sort || "time_old_to_new";
+  const outputPath = args?.output as string | undefined;
+
+  // Normalize categories if omitted or empty
+  if (!categories || categories.length === 0) {
+    categories = ["conversation_steps", "tool_calls", "tool_results", "thinking", "system_events"];
+  }
 
   const store = getStore();
-  const result = store.query({
+  const queryResult = store.query({
     sessionId,
-    includeSteps: true,
+    stepIndex,
+    startStep,
+    endStep,
+    startConversationStep,
+    endConversationStep,
     stepQuery: queryText,
     stepType: type,
     stepStatus: status,
@@ -915,21 +913,22 @@ async function handleSearchSteps(args: any): Promise<any> {
     scope,
     toolName,
     serverName,
-    excludeContent,
-    conversationStepsOnly,
+    includeSteps: true,
+    categories,
+    sort: sortMode,
   });
 
   const stepsWithSessionId: any[] = [];
   const convStepIndexMaps = new Map<string, Map<number, number>>();
 
-  for (const s of result.sessions) {
+  for (const s of queryResult.sessions) {
     if (s.steps) {
       let convMap = convStepIndexMaps.get(s.id);
       if (!convMap) {
         const allConvResult = store.query({
           sessionId: s.id,
           includeSteps: true,
-          conversationStepsOnly: true
+          conversationStepsOnly: true,
         });
         const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
         convMap = new Map<number, number>();
@@ -940,35 +939,131 @@ async function handleSearchSteps(args: any): Promise<any> {
       }
 
       for (const step of s.steps) {
-        stepsWithSessionId.push({
+        let toolResult: any = (step as any).tool_result;
+        if (categories.includes("tool_results") && !toolResult && (step.toolCalls || (step as any).tool_calls)) {
+          const nextStep = s.steps.find((ns: any) => ns.stepIndex === step.stepIndex + 1);
+          if (nextStep && (nextStep.type === "MCP_TOOL" || nextStep.type === "COMMAND" || nextStep.source === "SYSTEM")) {
+            toolResult = {
+              step_index: nextStep.stepIndex,
+              type: nextStep.type,
+              source: nextStep.source,
+              status: nextStep.status,
+              content: nextStep.content ?? null,
+            };
+          }
+        }
+
+        const stepObj: any = {
           session_id: s.id,
           step_index: step.stepIndex,
           type: step.type,
           source: step.source,
           status: step.status,
-          ...(excludeContent ? {} : {
-            content: step.content ?? null,
-            thinking: step.thinking ?? null,
-          }),
-          tool_calls: step.toolCalls ?? null,
           created_at: step.createdAt ?? null,
-          conversation_step_index: convMap.get(step.stepIndex) ?? null
-        });
+          conversation_step_index: convMap.get(step.stepIndex) ?? null,
+        };
+
+        if (categories.includes("conversation_steps") || (categories.includes("system_events") && !categories.includes("tool_results"))) {
+          stepObj.content = step.content ?? null;
+        }
+        if (categories.includes("thinking")) {
+          stepObj.thinking = step.thinking ?? null;
+        }
+        if (categories.includes("tool_calls")) {
+          stepObj.tool_calls = step.toolCalls ?? null;
+        }
+        if (categories.includes("tool_results") && toolResult !== undefined) {
+          stepObj.tool_result = toolResult;
+        }
+
+        stepsWithSessionId.push(stepObj);
       }
     }
   }
 
-  stepsWithSessionId.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
+  // Sort logic
+  if (sortMode === "time_new_to_old") {
+    stepsWithSessionId.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
+  } else if (sortMode === "time_old_to_new") {
+    stepsWithSessionId.sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0));
+  }
+
   const rows = stepsWithSessionId.slice(0, limit);
+
+  let finalPayload: any = rows;
+
+  // Group by category if sort === "category"
+  if (sortMode === "category") {
+    const grouped: Record<string, any[]> = {
+      conversation_steps: [],
+      tool_calls: [],
+      tool_results: [],
+      thinking: [],
+      system_events: [],
+    };
+
+    for (const step of rows) {
+      if (categories.includes("conversation_steps") && (step.type === "USER_INPUT" || (step.type === "PLANNER_RESPONSE" && step.content))) {
+        grouped.conversation_steps.push(step);
+      }
+      if (categories.includes("tool_calls") && step.tool_calls) {
+        grouped.tool_calls.push(step);
+      }
+      if (categories.includes("tool_results") && (step.type === "MCP_TOOL" || step.type === "COMMAND" || step.tool_result)) {
+        grouped.tool_results.push(step);
+      }
+      if (categories.includes("thinking") && step.thinking) {
+        grouped.thinking.push(step);
+      }
+      if (categories.includes("system_events") && (step.type === "CHECKPOINT" || step.status === "ERROR" || step.source === "SYSTEM")) {
+        grouped.system_events.push(step);
+      }
+    }
+    finalPayload = grouped;
+  }
+
+  // Handle Output file export if specified
+  if (outputPath) {
+    let outputText = "";
+    if (outputPath.endsWith(".json")) {
+      outputText = JSON.stringify(finalPayload, null, 2);
+    } else {
+      // Format as readable markdown transcript documentation
+      let md = `# Session Transcript: ${sessionId || "Query Result"}\n\n`;
+      if (Array.isArray(finalPayload)) {
+        for (const step of finalPayload) {
+          md += formatStepToMarkdown(step, { includeTimestamps: true, includeCallResults: true });
+        }
+      } else {
+        outputText = `# Transcript Query Export\n\n\`\`\`json\n${JSON.stringify(finalPayload, null, 2)}\n\`\`\`\n`;
+        md = outputText;
+      }
+
+      outputText = md;
+    }
+
+    return handleOutputWrite(outputText, outputPath, `transcript_${sessionId || "query"}.md`);
+  }
 
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify(rows, null, 2),
+        text: JSON.stringify(finalPayload, null, 2),
       },
     ],
   };
+}
+
+async function handleSearchSteps(args: any): Promise<any> {
+  const categories: StepCategory[] = [];
+  if (args?.conversationStepsOnly) categories.push("conversation_steps");
+  if (args?.includeToolResults) categories.push("tool_calls", "tool_results");
+
+  return handleQueryTranscript({
+    ...args,
+    categories: categories.length > 0 ? categories : undefined,
+  });
 }
 
 async function handleSearchHistory(args: any): Promise<any> {
@@ -1123,8 +1218,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "chronicle_guide":
         return handleChronicleGuide();
-      case "list_sessions":
-        return await handleListSessions(args);
+      case "query_transcript":
+        return await handleQueryTranscript(args);
       case "get_session_details":
         return await handleGetSessionDetails(args);
       case "get_step_details":

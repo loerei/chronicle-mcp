@@ -12,9 +12,9 @@
 ### 2. Mandatory Chronicle MCP Tool Usage
 When asked to read, query, summarize, or search past conversations, sessions, tool executions, or errors, you MUST use the registered `chronicle-mcp` tools:
 - **`chronicle_guide`**: Call first when starting history exploration to review token-saving rules, decision tree, and parameter guidelines.
+- **`sync_history`**: Call `sync_history(force=true)` before querying recent history to ensure all un-indexed log entries from disk are indexed into the database.
+- **`query_transcript`**: Primary tool to read, query, filter, slice, or export transcript entries by `categories` and `sort` modes.
 - **`list_sessions`**: Retrieve history metadata and session IDs.
-- **`get_session_details`**: Retrieve formatted conversation summaries with optional range slicing and tool details.
-- **`get_step_details`**: Inspect raw JSON structures of specific steps.
-- **`get_session_benchmarks`**: View execution steps, tool calls, BPE token counts, and caching stats.
 - **`search_history`**: Perform semantic vector search over past turns.
-- **`search_steps`**: Retrieve specific tool call parameters, thinking blocks, or execution errors (e.g. by filtering `status="ERROR"` and `type="MCP_TOOL"`).
+- **`get_session_benchmarks`**: View execution steps, tool calls, BPE token counts, and caching stats.
+- **`get_session_artifacts`**: Retrieve generated plan or walkthrough markdown files.

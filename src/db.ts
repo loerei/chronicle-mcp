@@ -168,11 +168,15 @@ export interface SessionEmbeddings {
   chunks: Map<number, number[]>; // maps stepIndex -> chunkVector
 }
 
+export type StepCategory = "conversation_steps" | "tool_calls" | "tool_results" | "thinking" | "system_events";
+export type StepSortMode = "time_old_to_new" | "time_new_to_old" | "category";
+
 export interface QueryOptions {
   sessionId?: string;
   adapter?: string;
   projectPath?: string;
   scope?: "workspace" | "all";
+  stepIndex?: number;
   startStep?: number;
   endStep?: number;
   stepQuery?: string;
@@ -189,6 +193,9 @@ export interface QueryOptions {
   reverseSteps?: boolean;
   startConversationStep?: number;
   endConversationStep?: number;
+  includeToolResults?: boolean;
+  categories?: StepCategory[];
+  sort?: StepSortMode;
 }
 
 export interface QueryResult {
@@ -247,6 +254,20 @@ function parseTimeRange(timeRange: string): { start: number | null; end: number 
     start: parseVal(parts[0]),
     end: parseVal(parts[1])
   };
+}
+
+export function isConversationStep(step: StepData): boolean {
+  if (step.type === "USER_INPUT") return true;
+  return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+}
+
+export function matchStepCategory(step: StepData, categories: StepCategory[]): boolean {
+  if (categories.includes("conversation_steps") && isConversationStep(step)) return true;
+  if (categories.includes("tool_calls") && step.toolCalls) return true;
+  if (categories.includes("tool_results") && (step.type === "MCP_TOOL" || step.type === "COMMAND" || step.source === "SYSTEM" || step.toolCalls)) return true;
+  if (categories.includes("thinking") && step.thinking && step.thinking.trim() !== "") return true;
+  if (categories.includes("system_events") && (step.type === "CHECKPOINT" || step.status === "ERROR" || step.type === "INVOKE_SUBAGENT" || step.source === "SYSTEM")) return true;
+  return false;
 }
 
 export class InMemoryHistoryStore implements HistoryStore {
@@ -393,8 +414,7 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   private isConversationStep(step: StepData): boolean {
-    if (step.type === "USER_INPUT") return true;
-    return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+    return isConversationStep(step);
   }
 
   private matchStepQueryAndTool(step: StepData, options: QueryOptions): boolean {
@@ -405,12 +425,22 @@ export class InMemoryHistoryStore implements HistoryStore {
     return true;
   }
 
+  private matchStepCategory(step: StepData, categories: StepCategory[]): boolean {
+    return matchStepCategory(step, categories);
+  }
+
   private matchStep(step: StepData, options: QueryOptions): boolean {
+    if (options.stepIndex !== undefined && step.stepIndex !== options.stepIndex) return false;
     if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
     if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
     if (options.stepType !== undefined && step.type !== options.stepType) return false;
     if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
     if (options.conversationStepsOnly && !this.isConversationStep(step)) return false;
+
+    if (options.categories && options.categories.length > 0) {
+      if (!this.matchStepCategory(step, options.categories)) return false;
+    }
+
     return this.matchStepQueryAndTool(step, options);
   }
 
@@ -420,13 +450,26 @@ export class InMemoryHistoryStore implements HistoryStore {
 
     for (const [sid, steps] of this.stepsMap.entries()) {
       if (!sessionIds.has(sid)) continue;
+      const stepMap = options.includeToolResults ? new Map(steps.map(s => [s.stepIndex, s])) : null;
       for (const step of steps) {
         if (!this.matchStep(step, options)) continue;
 
-        const stepCopy = { ...step };
+        const stepCopy: any = { ...step };
         if (options.excludeContent) {
           delete stepCopy.content;
           delete stepCopy.thinking;
+        }
+        if (options.includeToolResults && step.toolCalls) {
+          const nextStep = stepMap?.get(step.stepIndex + 1);
+          if (nextStep && (nextStep.type === "MCP_TOOL" || nextStep.type === "COMMAND" || nextStep.source === "SYSTEM")) {
+            stepCopy.tool_result = {
+              step_index: nextStep.stepIndex,
+              type: nextStep.type,
+              source: nextStep.source,
+              status: nextStep.status,
+              content: nextStep.content ?? null
+            };
+          }
         }
         matchedSteps.push(stepCopy);
       }
@@ -534,16 +577,32 @@ export class InMemoryHistoryStore implements HistoryStore {
         sessionChunks.reverse();
       }
 
-      const sessionSteps = queryOpts.includeSteps ? (this.stepsMap.get(s.id) || [])
-        .filter(step => this.matchStep(step, queryOpts))
-        .map(step => {
-          const stepCopy = { ...step };
-          if (queryOpts.excludeContent) {
-            delete stepCopy.content;
-            delete stepCopy.thinking;
-          }
-          return stepCopy;
-        }) : undefined;
+      const sessionSteps = queryOpts.includeSteps ? (() => {
+        const steps = this.stepsMap.get(s.id) || [];
+        const stepMap = queryOpts.includeToolResults ? new Map(steps.map(st => [st.stepIndex, st])) : null;
+        return steps
+          .filter(step => this.matchStep(step, queryOpts))
+          .map(step => {
+            const stepCopy: any = { ...step };
+            if (queryOpts.excludeContent) {
+              delete stepCopy.content;
+              delete stepCopy.thinking;
+            }
+            if (queryOpts.includeToolResults && step.toolCalls) {
+              const nextStep = stepMap?.get(step.stepIndex + 1);
+              if (nextStep && (nextStep.type === "MCP_TOOL" || nextStep.type === "COMMAND" || nextStep.source === "SYSTEM")) {
+                stepCopy.tool_result = {
+                  step_index: nextStep.stepIndex,
+                  type: nextStep.type,
+                  source: nextStep.source,
+                  status: nextStep.status,
+                  content: nextStep.content ?? null
+                };
+              }
+            }
+            return stepCopy;
+          });
+      })() : undefined;
 
       if (sessionSteps && queryOpts.reverseSteps) {
         sessionSteps.reverse();
@@ -719,8 +778,13 @@ export class SqliteHistoryStore implements HistoryStore {
       content: row.content ?? undefined,
       thinking: row.thinking ?? undefined,
       toolCalls: row.tool_calls ?? undefined,
-      createdAt: row.created_at ?? undefined
+      createdAt: row.created_at ?? undefined,
+      ...(row.tool_result ? { tool_result: row.tool_result } : {}) as any
     };
+
+    if (options.categories && options.categories.length > 0) {
+      if (!matchStepCategory(step, options.categories)) return;
+    }
 
     if (options.toolName !== undefined || options.serverName !== undefined) {
       if (!step.toolCalls) return;
@@ -899,6 +963,10 @@ export class SqliteHistoryStore implements HistoryStore {
     const thinkingCol = options.excludeContent ? "NULL as thinking" : "thinking";
     let sql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at FROM session_steps WHERE session_id IN (${placeholders})`;
 
+    if (options.stepIndex !== undefined) {
+      sql += " AND step_index = ?";
+      params.push(options.stepIndex);
+    }
     if (options.startStep !== undefined) {
       sql += " AND step_index >= ?";
       params.push(options.startStep);
@@ -985,6 +1053,33 @@ export class SqliteHistoryStore implements HistoryStore {
       const stepParams: any[] = [...sessionIds];
       const stepSql = this.buildStepQuery(placeholders, queryOpts, stepParams);
       stepsRows = db.prepare(stepSql).all(...stepParams) as any[];
+
+      const fetchToolResults = queryOpts.includeToolResults || queryOpts.categories?.includes("tool_results");
+      if (fetchToolResults) {
+        // Fetch all steps for these sessions to map step_index + 1 tool results
+        const allStepsSql = `SELECT session_id, step_index, type, source, status, content FROM session_steps WHERE session_id IN (${placeholders})`;
+        const allStepsRows = db.prepare(allStepsSql).all(...sessionIds) as any[];
+        const nextStepMap = new Map<string, any>();
+        for (const row of allStepsRows) {
+          nextStepMap.set(`${row.session_id}:${row.step_index}`, row);
+        }
+
+        for (const row of stepsRows) {
+          if (row.tool_calls) {
+            const nextKey = `${row.session_id}:${row.step_index + 1}`;
+            const nextRow = nextStepMap.get(nextKey);
+            if (nextRow && (nextRow.type === "MCP_TOOL" || nextRow.type === "COMMAND" || nextRow.source === "SYSTEM")) {
+              row.tool_result = {
+                step_index: nextRow.step_index,
+                type: nextRow.type,
+                source: nextRow.source,
+                status: nextRow.status,
+                content: nextRow.content ?? null
+              };
+            }
+          }
+        }
+      }
     }
 
     const chunksBySession = new Map<string, ChunkData[]>();
