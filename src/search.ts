@@ -393,7 +393,7 @@ export function generateInteractiveContextChartHtml(
     const tokens = stepTokens[i] || 0;
     const isCheckpoint = step.type === "CHECKPOINT";
     const isConversational = step.source === "USER_EXPLICIT" || step.type === "USER_INPUT";
-    const isPlannerResponse = step.type === "PLANNER_RESPONSE" || step.source === "MODEL";
+    const isPlannerResponse = step.type === "PLANNER_RESPONSE";
 
     if (isCheckpoint) {
       activeStartIndex = i;
