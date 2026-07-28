@@ -54,7 +54,7 @@ export interface ChunkData {
 
 export interface HistoryAdapter {
   name: string;
-  discoverSessions(): Promise<SessionData[]>;
+  discoverSessions(reporter?: any): Promise<SessionData[]>;
 }
 
 export interface SessionBenchmarkMetrics {

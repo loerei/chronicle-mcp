@@ -754,7 +754,7 @@ describe("syncHistory auto-sync and coalescing", () => {
     ADAPTERS[1].discoverSessions = originalDiscover1;
   });
 
-  it("should coalesce concurrent syncHistory calls and respect cooldown", async () => {
+  it("should coalesce concurrent syncHistory calls and sync incrementally", async () => {
     let callCount = 0;
     ADAPTERS[0].discoverSessions = async () => {
       callCount++;
@@ -765,20 +765,16 @@ describe("syncHistory auto-sync and coalescing", () => {
     ADAPTERS[1].discoverSessions = async () => [];
 
     // Trigger two concurrent syncs
-    const p1 = syncHistory(true); // Force bypasses cooldown
+    const p1 = syncHistory(true); // Force bypasses lock if needed
     const p2 = syncHistory(true); // Also concurrent, should coalesce
 
     await Promise.all([p1, p2]);
 
-    // Should only have called discoverSessions once because of coalescing
+    // Should only have called discoverSessions once because of coalescing activeSync
     assert.strictEqual(callCount, 1);
 
-    // Now call again WITHOUT force - should be within the 5-second cooldown and not call discoverSessions again
+    // Call again - syncHistory performs fast incremental check without hard cooldown
     await syncHistory();
-    assert.strictEqual(callCount, 1);
-
-    // Call again WITH force - should bypass cooldown and call discoverSessions
-    await syncHistory(true);
     assert.strictEqual(callCount, 2);
   });
 
