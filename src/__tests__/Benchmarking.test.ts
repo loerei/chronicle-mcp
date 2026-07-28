@@ -176,4 +176,78 @@ describe("Benchmarking Logic", () => {
       "gitnexus/query": 2
     });
   });
+
+  it("should correctly handle CHECKPOINT steps in caching simulation and peakContextSize", async () => {
+    const store = new InMemoryHistoryStore();
+    setStore(store);
+
+    const sessionId = "checkpoint-session-1";
+
+    const steps: StepData[] = [
+      {
+        stepIndex: 0,
+        type: "USER_INPUT",
+        source: "USER_EXPLICIT",
+        status: "DONE",
+        content: "First turn question",
+        createdAt: 1700000000000
+      },
+      {
+        stepIndex: 1,
+        type: "PLANNER_RESPONSE",
+        source: "MODEL",
+        status: "DONE",
+        content: "First turn response",
+        createdAt: 1700000001000
+      },
+      {
+        stepIndex: 2,
+        type: "CHECKPOINT",
+        source: "SYSTEM",
+        status: "DONE",
+        content: "{{ CHECKPOINT 1 }} Summary of truncated content",
+        createdAt: 1700000002000
+      },
+      {
+        stepIndex: 3,
+        type: "USER_INPUT",
+        source: "USER_EXPLICIT",
+        status: "DONE",
+        content: "Second turn question",
+        createdAt: 1700000003000
+      },
+      {
+        stepIndex: 4,
+        type: "PLANNER_RESPONSE",
+        source: "MODEL",
+        status: "DONE",
+        content: "Second turn response",
+        createdAt: 1700000004000
+      }
+    ];
+
+    const session: SessionData = {
+      id: sessionId,
+      adapter: "antigravity",
+      title: "Checkpoint Session",
+      projectPath: "/projects/ckpt",
+      createdAt: 1700000000000,
+      firstPrompt: "First turn question",
+      secondPrompt: "",
+      chunks: [],
+      steps
+    };
+
+    store.save(session, { summary: [0, 0], chunks: new Map() });
+
+    const benchmarks = await computeSessionBenchmarks([sessionId]);
+    assert.strictEqual(benchmarks.length, 1);
+
+    const m = benchmarks[0];
+    assert.strictEqual(m.sessionId, sessionId);
+    assert.strictEqual(m.totalSteps, 5);
+    assert.ok(m.peakContextSize > 0);
+    // Verified that cache simulation ran without throwing errors
+    assert.ok(m.cumulativeInputTokens > 0);
+  });
 });

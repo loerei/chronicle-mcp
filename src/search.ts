@@ -167,18 +167,24 @@ function simulateCaching(steps: StepData[], stepTokens: number[]): CachingMetric
   let cacheMissTokens = 0;
   let estimatedOutputTokens = 0;
   let lastModelCallIndex = -1;
+  let activeStartIndex = 0;
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
+    if (step.type === "CHECKPOINT") {
+      activeStartIndex = i;
+      continue;
+    }
+
     if (step.type !== "PLANNER_RESPONSE") continue;
 
     let hit = 0;
     let miss = 0;
 
-    if (lastModelCallIndex === -1) {
-      miss = sumTokens(stepTokens, 0, i);
+    if (lastModelCallIndex === -1 || lastModelCallIndex < activeStartIndex) {
+      miss = sumTokens(stepTokens, activeStartIndex, i);
     } else {
-      hit = sumTokens(stepTokens, 0, lastModelCallIndex + 1);
+      hit = sumTokens(stepTokens, activeStartIndex, lastModelCallIndex + 1);
       miss = sumTokens(stepTokens, lastModelCallIndex + 1, i);
     }
 
@@ -227,7 +233,20 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
       cumulativeInputTokens = total;
     }
 
-    peakContextSize = stepTokens.reduce((a, b) => a + b, 0);
+    let maxContextSize = 0;
+    let activeStartIndex = 0;
+    for (let i = 0; i < steps.length; i++) {
+      if (steps[i].type === "CHECKPOINT") {
+        activeStartIndex = i;
+      }
+      if (steps[i].type === "PLANNER_RESPONSE") {
+        const currentContextSize = sumTokens(stepTokens, activeStartIndex, i);
+        if (currentContextSize > maxContextSize) {
+          maxContextSize = currentContextSize;
+        }
+      }
+    }
+    peakContextSize = maxContextSize > 0 ? maxContextSize : stepTokens.reduce((a, b) => a + b, 0);
 
     if (cumulativeInputTokens > 0) {
       cacheHitRate = (cacheHitTokens / cumulativeInputTokens) * 100;
