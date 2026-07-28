@@ -2,7 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { SessionData, StepData, ChunkData } from "./adapters/types.js";
+import { SessionData, StepData, ChunkData, SessionRelationshipNode, SessionRelationshipResult } from "./adapters/types.js";
 
 function matchToolCall(call: any, targetServer?: string, targetTool?: string): boolean {
   const name = call.name || "";
@@ -173,6 +173,7 @@ export type StepSortMode = "time_old_to_new" | "time_new_to_old" | "category";
 
 export interface QueryOptions {
   sessionId?: string;
+  parentId?: string | null;
   adapter?: string;
   projectPath?: string;
   scope?: "workspace" | "all";
@@ -218,6 +219,7 @@ export interface HistoryStore {
   save(session: SessionData, embeddings: SessionEmbeddings): void;
   query(options: QueryOptions): QueryResult;
   search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[];
+  getSessionRelationship(sessionId: string, maxDepth?: number, includeAncestors?: boolean): SessionRelationshipResult | null;
   getActiveProjectPath(): string | undefined;
   close(): void;
 }
@@ -345,6 +347,13 @@ export class InMemoryHistoryStore implements HistoryStore {
 
     if (options.sessionId !== undefined) {
       matchedSessions = matchedSessions.filter(s => s.id === options.sessionId);
+    }
+    if (options.parentId !== undefined) {
+      if (options.parentId === "root" || options.parentId === "null" || options.parentId === null) {
+        matchedSessions = matchedSessions.filter(s => !s.parentId);
+      } else {
+        matchedSessions = matchedSessions.filter(s => s.parentId === options.parentId);
+      }
     }
     if (options.adapter !== undefined) {
       matchedSessions = matchedSessions.filter(s => s.adapter === options.adapter);
@@ -564,6 +573,15 @@ export class InMemoryHistoryStore implements HistoryStore {
       matchedChunks.reverse();
     }
 
+    const childrenMap = new Map<string, string[]>();
+    for (const s of this.sessionsMap.values()) {
+      if (s.parentId) {
+        const list = childrenMap.get(s.parentId) || [];
+        list.push(s.id);
+        childrenMap.set(s.parentId, list);
+      }
+    }
+
     const sessionsResult = matchedSessions.map(s => {
       const sessionChunks = (this.chunksMap.get(s.id) || [])
         .filter(c => {
@@ -619,6 +637,7 @@ export class InMemoryHistoryStore implements HistoryStore {
         secondPrompt: s.secondPrompt,
         parentId: s.parentId || null,
         subagentIds: s.subagentIds || [],
+        childSessionIds: childrenMap.get(s.id) || [],
         chunks: sessionChunks,
         ...(sessionSteps === undefined ? {} : { steps: sessionSteps })
       };
@@ -628,6 +647,79 @@ export class InMemoryHistoryStore implements HistoryStore {
       sessions: sessionsResult,
       steps: matchedSteps,
       chunks: matchedChunks
+    };
+  }
+
+  getSessionRelationship(sessionId: string, maxDepth = 2, includeAncestors = true): SessionRelationshipResult | null {
+    const currentSession = this.sessionsMap.get(sessionId);
+    if (!currentSession) return null;
+
+    const toNode = (s: any, depth?: number, children?: SessionRelationshipNode[]): SessionRelationshipNode => ({
+      id: s.id,
+      adapter: s.adapter,
+      title: s.title,
+      projectPath: s.projectPath,
+      createdAt: s.createdAt,
+      lastActiveAt: (s as any).lastActiveAt ?? s.createdAt,
+      parentId: s.parentId || null,
+      depth,
+      children
+    });
+
+    const current = toNode(currentSession, 0);
+
+    const ancestors: SessionRelationshipNode[] = [];
+    if (includeAncestors) {
+      const visited = new Set<string>([sessionId]);
+      let currParentId = currentSession.parentId;
+      const ancestorList: SessionRelationshipNode[] = [];
+      while (currParentId && !visited.has(currParentId)) {
+        visited.add(currParentId);
+        const parentSession = this.sessionsMap.get(currParentId);
+        if (!parentSession) break;
+        ancestorList.push(toNode(parentSession));
+        currParentId = parentSession.parentId;
+      }
+      ancestorList.reverse();
+      ancestors.push(...ancestorList);
+    }
+
+    const rootSessionId = ancestors.length > 0 ? ancestors[0].id : currentSession.id;
+    const parent = ancestors.at(-1) ?? null;
+
+    let siblings: SessionRelationshipNode[] = [];
+    if (currentSession.parentId) {
+      siblings = Array.from(this.sessionsMap.values())
+        .filter(s => s.parentId === currentSession.parentId && s.id !== currentSession.id)
+        .map(s => toNode(s));
+    }
+
+    const targetMaxDepth = Math.min(Math.max(maxDepth, 1), 10);
+    const visitedChildren = new Set<string>([sessionId]);
+
+    const buildChildTree = (parentId: string, depth: number): SessionRelationshipNode[] => {
+      if (depth > targetMaxDepth) return [];
+      const directChildren = Array.from(this.sessionsMap.values()).filter(s => s.parentId === parentId);
+      const nodes: SessionRelationshipNode[] = [];
+      for (const child of directChildren) {
+        if (visitedChildren.has(child.id)) continue;
+        visitedChildren.add(child.id);
+        const subChildren = buildChildTree(child.id, depth + 1);
+        nodes.push(toNode(child, depth, subChildren.length > 0 ? subChildren : undefined));
+      }
+      return nodes;
+    };
+
+    const children = buildChildTree(sessionId, 1);
+
+    return {
+      sessionId,
+      rootSessionId,
+      parent,
+      ancestors,
+      current,
+      children,
+      siblings
     };
   }
 
@@ -910,6 +1002,14 @@ export class SqliteHistoryStore implements HistoryStore {
       where.push("id = ?");
       params.push(options.sessionId);
     }
+    if (options.parentId !== undefined) {
+      if (options.parentId === "root" || options.parentId === "null" || options.parentId === null) {
+        where.push("parent_id IS NULL");
+      } else {
+        where.push("parent_id = ?");
+        params.push(options.parentId);
+      }
+    }
     if (options.adapter !== undefined) {
       where.push("adapter = ?");
       params.push(options.adapter);
@@ -1096,6 +1196,17 @@ export class SqliteHistoryStore implements HistoryStore {
       this.filterAndPushStep(row, queryOpts, stepsBySession, stepsResult);
     }
 
+    const childrenMap = new Map<string, string[]>();
+    if (sessionIds.length > 0) {
+      const childSql = `SELECT id, parent_id FROM sessions WHERE parent_id IN (${placeholders})`;
+      const childRows = db.prepare(childSql).all(...sessionIds) as any[];
+      for (const row of childRows) {
+        const list = childrenMap.get(row.parent_id) || [];
+        list.push(row.id);
+        childrenMap.set(row.parent_id, list);
+      }
+    }
+
     for (const s of sessionsRows) {
       sessionsResult.push({
         id: s.id,
@@ -1107,6 +1218,7 @@ export class SqliteHistoryStore implements HistoryStore {
         firstPrompt: s.first_prompt,
         secondPrompt: s.second_prompt,
         parentId: s.parent_id || null,
+        childSessionIds: childrenMap.get(s.id) || [],
         chunks: chunksBySession.get(s.id) || [],
         steps: queryOpts.includeSteps ? (stepsBySession.get(s.id) || []) : undefined
       });
@@ -1116,6 +1228,82 @@ export class SqliteHistoryStore implements HistoryStore {
       sessions: sessionsResult,
       steps: stepsResult,
       chunks: chunksResult
+    };
+  }
+
+  getSessionRelationship(sessionId: string, maxDepth = 2, includeAncestors = true): SessionRelationshipResult | null {
+    const db = this.db;
+    const currentStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id FROM sessions WHERE id = ?");
+    const currentSessionRow = currentStmt.get(sessionId) as any;
+    if (!currentSessionRow) return null;
+
+    const toNode = (row: any, depth?: number, children?: SessionRelationshipNode[]): SessionRelationshipNode => ({
+      id: row.id,
+      adapter: row.adapter,
+      title: row.title,
+      projectPath: row.project_path ?? row.projectPath ?? null,
+      createdAt: row.created_at ?? row.createdAt,
+      lastActiveAt: row.last_active_at ?? row.lastActiveAt ?? row.created_at ?? row.createdAt,
+      parentId: row.parent_id ?? row.parentId ?? null,
+      depth,
+      children
+    });
+
+    const current = toNode(currentSessionRow, 0);
+
+    const ancestors: SessionRelationshipNode[] = [];
+    if (includeAncestors) {
+      const visited = new Set<string>([sessionId]);
+      let currParentId = currentSessionRow.parent_id;
+      const ancestorList: SessionRelationshipNode[] = [];
+      while (currParentId && !visited.has(currParentId)) {
+        visited.add(currParentId);
+        const parentRow = currentStmt.get(currParentId) as any;
+        if (!parentRow) break;
+        ancestorList.push(toNode(parentRow));
+        currParentId = parentRow.parent_id;
+      }
+      ancestorList.reverse();
+      ancestors.push(...ancestorList);
+    }
+
+    const rootSessionId = ancestors.length > 0 ? ancestors[0].id : currentSessionRow.id;
+    const parent = ancestors.at(-1) ?? null;
+
+    let siblings: SessionRelationshipNode[] = [];
+    if (currentSessionRow.parent_id) {
+      const sibStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id FROM sessions WHERE parent_id = ? AND id != ?");
+      const sibRows = sibStmt.all(currentSessionRow.parent_id, currentSessionRow.id) as any[];
+      siblings = sibRows.map(r => toNode(r));
+    }
+
+    const targetMaxDepth = Math.min(Math.max(maxDepth, 1), 10);
+    const visitedChildren = new Set<string>([sessionId]);
+    const childStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id FROM sessions WHERE parent_id = ?");
+
+    const buildChildTree = (parentId: string, depth: number): SessionRelationshipNode[] => {
+      if (depth > targetMaxDepth) return [];
+      const directChildrenRows = childStmt.all(parentId) as any[];
+      const nodes: SessionRelationshipNode[] = [];
+      for (const childRow of directChildrenRows) {
+        if (visitedChildren.has(childRow.id)) continue;
+        visitedChildren.add(childRow.id);
+        const subChildren = buildChildTree(childRow.id, depth + 1);
+        nodes.push(toNode(childRow, depth, subChildren.length > 0 ? subChildren : undefined));
+      }
+      return nodes;
+    };
+
+    const children = buildChildTree(sessionId, 1);
+
+    return {
+      sessionId,
+      rootSessionId,
+      parent,
+      ancestors,
+      current,
+      children,
+      siblings
     };
   }
 
