@@ -471,6 +471,18 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(relRoot?.siblings.length, 0);
       assert.strictEqual(relRoot?.children.length, 2);
 
+      // Test includeAncestors = false
+      const relNoAncestors = store.getSessionRelationship("grandchild-1", 2, false);
+      assert.notStrictEqual(relNoAncestors, null);
+      assert.strictEqual(relNoAncestors?.parent, null);
+      assert.strictEqual(relNoAncestors?.ancestors.length, 0);
+
+      // Test maxDepth = 1 (should omit grandchild from root children)
+      const relDepth1 = store.getSessionRelationship("root-1", 1);
+      assert.notStrictEqual(relDepth1, null);
+      assert.strictEqual(relDepth1?.children.length, 2);
+      assert.strictEqual(relDepth1?.children[0].children, undefined);
+
       // Test 404 non-existent session
       const rel404 = store.getSessionRelationship("non-existent");
       assert.strictEqual(rel404, null);
