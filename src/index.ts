@@ -692,6 +692,48 @@ async function handleListSessions(args: any): Promise<any> {
   };
 }
 
+function formatStepToMarkdown(step: any, options?: { includeTimestamps?: boolean; includeCallResults?: boolean }): string {
+  let md = "";
+  const timeStr = (options?.includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
+  const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
+
+  if (step.type === "USER_INPUT") {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
+  } else if (step.type === "PLANNER_RESPONSE") {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
+    if (step.thinking) {
+      md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
+    }
+    if (step.content) {
+      md += `**Assistant**: ${step.content}\n\n`;
+    }
+    if (step.tool_calls) {
+      try {
+        md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
+      } catch {
+        md += `**Tool Calls**: ${step.tool_calls}\n\n`;
+      }
+    }
+    if (step.tool_result) {
+      md += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
+    }
+  } else if (options?.includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND") {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (${step.type})\n`;
+    if (step.source && step.status) {
+      md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
+    }
+    if (step.content) {
+      md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
+    }
+  } else {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (\`${step.type}\`)\n`;
+    if (step.content) {
+      md += `${step.content}\n\n`;
+    }
+  }
+  return md;
+}
+
 async function handleGetSessionDetails(args: any): Promise<any> {
   const sessionId = args?.sessionId as string;
   const includeToolCalls = args?.includeToolCalls as boolean | undefined;
@@ -749,32 +791,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
 
   if (needSteps) {
     for (const step of details.steps) {
-      const timeStr = (includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
-      const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
-      if (step.type === "USER_INPUT") {
-        md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
-      } else if (step.type === "PLANNER_RESPONSE") {
-        md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
-        if (step.thinking) {
-          md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
-        }
-        if (step.content) {
-          md += `**Assistant**: ${step.content}\n\n`;
-        }
-        if (step.tool_calls) {
-          try {
-            md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
-          } catch {
-            md += `**Tool Calls**: ${step.tool_calls}\n\n`;
-          }
-        }
-      } else if (includeCallResults) {
-        md += `### Step ${step.step_index} (${step.type})${convStepIdx}${timeStr}\n`;
-        md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
-        if (step.content) {
-          md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
-        }
-      }
+      md += formatStepToMarkdown(step, { includeTimestamps, includeCallResults });
     }
   } else {
     for (const chunk of details.chunks) {
@@ -1015,39 +1032,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
       let md = `# Session Transcript: ${sessionId || "Query Result"}\n\n`;
       if (Array.isArray(finalPayload)) {
         for (const step of finalPayload) {
-          const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
-          const timeStr = step.created_at ? ` (${new Date(step.created_at).toLocaleString()})` : "";
-          if (step.type === "USER_INPUT") {
-            md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
-          } else if (step.type === "PLANNER_RESPONSE") {
-            md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
-            if (step.thinking) {
-              md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
-            }
-            if (step.content) {
-              md += `**Assistant**: ${step.content}\n\n`;
-            }
-            if (step.tool_calls) {
-              try {
-                md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
-              } catch {
-                md += `**Tool Calls**: ${step.tool_calls}\n\n`;
-              }
-            }
-            if (step.tool_result) {
-              md += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
-            }
-          } else if (step.type === "MCP_TOOL" || step.type === "COMMAND") {
-            md += `### Step ${step.step_index}${convStepIdx}${timeStr} (\`${step.type}\`)\n`;
-            if (step.content) {
-              md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
-            }
-          } else {
-            md += `### Step ${step.step_index}${convStepIdx}${timeStr} (\`${step.type}\`)\n`;
-            if (step.content) {
-              md += `${step.content}\n\n`;
-            }
-          }
+          md += formatStepToMarkdown(step, { includeTimestamps: true, includeCallResults: true });
         }
       } else {
         outputText = `# Transcript Query Export\n\n\`\`\`json\n${JSON.stringify(finalPayload, null, 2)}\n\`\`\`\n`;

@@ -1054,7 +1054,7 @@ export class SqliteHistoryStore implements HistoryStore {
       const stepSql = this.buildStepQuery(placeholders, queryOpts, stepParams);
       stepsRows = db.prepare(stepSql).all(...stepParams) as any[];
 
-      const fetchToolResults = queryOpts.includeToolResults || (queryOpts.categories && queryOpts.categories.includes("tool_results"));
+      const fetchToolResults = queryOpts.includeToolResults || queryOpts.categories?.includes("tool_results");
       if (fetchToolResults) {
         // Fetch all steps for these sessions to map step_index + 1 tool results
         const allStepsSql = `SELECT session_id, step_index, type, source, status, content FROM session_steps WHERE session_id IN (${placeholders})`;
