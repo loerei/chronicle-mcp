@@ -406,7 +406,7 @@ export function generateInteractiveContextChartHtml(
     }
 
     const contentRaw = step.content || step.thinking || "";
-    const previewStr = contentRaw.slice(0, 150).replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const previewStr = contentRaw.slice(0, 150).replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
     points.push({
       stepIndex: step.stepIndex ?? i,
@@ -472,7 +472,12 @@ export function generateInteractiveContextChartHtml(
 
     if (is100k || is10k || val === 0) {
       const labelText = val === 0 ? "0 tok" : `${val / 1000}k tok`;
-      const textColor = is100k ? "#c4b5fd" : (is10k ? "#8b949e" : "#6e7681");
+      let textColor = "#6e7681";
+      if (is100k) {
+        textColor = "#c4b5fd";
+      } else if (is10k) {
+        textColor = "#8b949e";
+      }
       const fontWeight = is100k ? "bold" : "normal";
 
       stickyYGridLabelsHtml += `<text x="${paddingLeft - 12}" y="${yPos + 4}" fill="${textColor}" font-size="10" font-weight="${fontWeight}" text-anchor="end" font-family="sans-serif">${labelText}</text>\n`;
