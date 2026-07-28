@@ -266,4 +266,90 @@ describe("Benchmarking Logic", () => {
     assert.ok(html.includes("test-chart-id"));
     assert.ok(html.includes("svg"));
   });
+
+  it("should include cumulative output tokens area chart elements in generated HTML", async () => {
+    const { generateInteractiveContextChartHtml } = await import("../search.js");
+    const steps: StepData[] = [
+      { stepIndex: 0, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Hello world" },
+      { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response one" },
+      { stepIndex: 2, type: "MCP_TOOL", source: "SYSTEM", status: "DONE", content: "Tool result" },
+      { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response two" },
+    ];
+
+    const html = generateInteractiveContextChartHtml("output-test-id", "Output Token Test", steps);
+
+    // SVG output area elements
+    assert.ok(html.includes('id="output-area"'), "Missing output-area polygon");
+    assert.ok(html.includes('id="output-line"'), "Missing output-line polyline");
+    assert.ok(html.includes('id="output-area-gradient"'), "Missing output-area-gradient");
+    assert.ok(html.includes('#ef4444'), "Missing red color for output chart");
+
+    // Controls bar toggle
+    assert.ok(html.includes('id="toggle-output"'), "Missing toggle-output checkbox");
+    assert.ok(html.includes('Cumulative Output Area'), "Missing Cumulative Output Area label");
+
+    // Tooltip and pinned card output fields
+    assert.ok(html.includes('Cumulative Output'), "Missing Cumulative Output in tooltip");
+    assert.ok(html.includes('id="pinned-output"'), "Missing pinned-output element");
+
+    // Stats badge
+    assert.ok(html.includes('Total Output'), "Missing Total Output stat badge");
+
+    // Data should include outputContext field
+    assert.ok(html.includes('outputContext'), "Missing outputContext in pointsData");
+  });
+
+  it("should compute correct cumulative output token values across step types", async () => {
+    const { generateInteractiveContextChartHtml } = await import("../search.js");
+    const steps: StepData[] = [
+      { stepIndex: 0, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Hello world" },
+      { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response one" },
+      { stepIndex: 2, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "Tool result with many tokens" },
+      { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response two", thinking: "Internal reasoning" },
+      { stepIndex: 4, type: "CHECKPOINT", source: "SYSTEM", status: "DONE", content: "{{ CHECKPOINT 1 }}" },
+      { stepIndex: 5, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response three" },
+    ];
+
+    const html = generateInteractiveContextChartHtml("cumval-test", "Cumulative Values Test", steps);
+
+    // Extract base64-encoded pointsData from HTML
+    const b64Match = html.match(/const pointsDataB64 = "([^"]+)"/);
+    assert.ok(b64Match, "Expected base64-encoded pointsData in HTML");
+    const pointsData = JSON.parse(Buffer.from(b64Match[1], "base64").toString("utf-8"));
+
+    assert.strictEqual(pointsData.length, 6, "Should have 6 data points");
+
+    // outputContext must be monotonically non-decreasing
+    for (let i = 1; i < pointsData.length; i++) {
+      assert.ok(pointsData[i].outputContext >= pointsData[i - 1].outputContext,
+        `outputContext must be monotonic: step ${i} (${pointsData[i].outputContext}) < step ${i-1} (${pointsData[i-1].outputContext})`);
+    }
+
+    // Step 0 (USER_INPUT): outputContext should be 0
+    assert.strictEqual(pointsData[0].outputContext, 0, "USER_INPUT should not contribute to cumulative output");
+
+    // Step 2 (MCP_TOOL with source=MODEL): should NOT increase outputContext
+    assert.strictEqual(pointsData[2].outputContext, pointsData[1].outputContext,
+      "MCP_TOOL step should not increase cumulative output even with source=MODEL");
+
+    // Step 1 (PLANNER_RESPONSE): should increase from 0
+    assert.ok(pointsData[1].outputContext > 0, "First PLANNER_RESPONSE should contribute output tokens");
+
+    // Step 3 (PLANNER_RESPONSE with thinking): should include thinking tokens in output
+    assert.ok(pointsData[3].outputContext > pointsData[2].outputContext,
+      "PLANNER_RESPONSE with thinking should increase cumulative output");
+
+    // Step 5 (PLANNER_RESPONSE after CHECKPOINT): output continues accumulating (never resets)
+    assert.ok(pointsData[5].outputContext > pointsData[3].outputContext,
+      "Cumulative output should keep growing after CHECKPOINT");
+
+    // Context window should reset after CHECKPOINT
+    assert.ok(pointsData[5].context < pointsData[3].context,
+      "Context window should drop after CHECKPOINT while output keeps growing");
+
+    // Total Output badge should show final cumulative value
+    const finalOutput = pointsData[pointsData.length - 1].outputContext;
+    assert.ok(html.includes(`Total Output`), "Total Output badge must be present");
+    assert.ok(html.includes(finalOutput.toLocaleString()), `Total Output badge should show ${finalOutput.toLocaleString()}`);
+  });
 });
