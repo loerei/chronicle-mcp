@@ -783,6 +783,16 @@ async function handleGetSessionRelationship(args: any): Promise<any> {
   };
 }
 
+function getStepTypeLabel(step: any, includeCallResults?: boolean): string {
+  if (step.type === "USER_INPUT" || step.type === "PLANNER_RESPONSE") {
+    return "";
+  }
+  if (includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND") {
+    return ` (${step.type})`;
+  }
+  return ` (\`${step.type}\`)`;
+}
+
 function formatStepToMarkdown(step: any, options?: { includeTimestamps?: boolean; includeCallResults?: boolean }): string {
   let md = "";
   const isUndone = Boolean(step.is_undone || step.isUndone);
@@ -817,20 +827,17 @@ function formatStepToMarkdown(step: any, options?: { includeTimestamps?: boolean
     if (step.content) {
       body += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
     }
-  } else {
-    if (step.content) {
-      body += `${step.content}\n\n`;
-    }
+  } else if (step.content) {
+    body += `${step.content}\n\n`;
   }
 
+  const typeLabel = getStepTypeLabel(step, options?.includeCallResults);
   if (isUndone) {
-    const typeLabel = (step.type === "USER_INPUT" || step.type === "PLANNER_RESPONSE") ? "" : ` (\`${step.type}\`)`;
     md += `### Step ${step.step_index}${convStepIdx}${undoneBadge}${timeStr}${typeLabel}\n`;
     md += `> [!NOTE]\n> **[UNDONE / REWOUND STEP]** *(This step was superseded by a later turn rollback)*\n>\n`;
     const quotedBody = body.trim().split("\n").map(line => `> ${line}`).join("\n");
     md += `${quotedBody}\n\n`;
   } else {
-    const typeLabel = (step.type === "USER_INPUT" || step.type === "PLANNER_RESPONSE") ? "" : (options?.includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND" ? ` (${step.type})` : ` (\`${step.type}\`)`);
     md += `### Step ${step.step_index}${convStepIdx}${timeStr}${typeLabel}\n${body}`;
   }
 
@@ -997,7 +1004,12 @@ export async function handleQueryTranscript(args: any): Promise<any> {
   let categories = args?.categories as StepCategory[] | undefined;
   const sortMode: StepSortMode = args?.sort || "time_old_to_new";
   const outputPath = args?.output as string | undefined;
-  const limit = explicitLimit !== undefined ? explicitLimit : (outputPath ? Infinity : 20);
+  let limit = 20;
+  if (explicitLimit !== undefined) {
+    limit = explicitLimit;
+  } else if (outputPath) {
+    limit = Infinity;
+  }
   const includeUndone = Boolean(args?.includeUndone);
 
   // Normalize categories if omitted or empty

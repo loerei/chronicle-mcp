@@ -372,7 +372,7 @@ export class SessionParser {
         };
 
         // Active timeline stack tracking & rollback detection:
-        while (activeStack.length > 0 && activeStack[activeStack.length - 1].stepIndex >= stepIndex) {
+        while (activeStack.length > 0 && activeStack.at(-1)!.stepIndex >= stepIndex) {
           const popped = activeStack.pop()!;
           popped.isUndone = true;
         }
