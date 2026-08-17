@@ -1004,11 +1004,11 @@ export async function handleQueryTranscript(args: any): Promise<any> {
   let categories = args?.categories as StepCategory[] | undefined;
   const sortMode: StepSortMode = args?.sort || "time_old_to_new";
   const outputPath = args?.output as string | undefined;
-  let limit = 20;
+  let limit: number | undefined = 20;
   if (explicitLimit !== undefined) {
     limit = explicitLimit;
   } else if (outputPath) {
-    limit = Infinity;
+    limit = undefined;
   }
   const includeUndone = Boolean(args?.includeUndone);
 
@@ -1138,7 +1138,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
     stepsWithSessionId.sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0));
   }
 
-  const rows = stepsWithSessionId.slice(0, limit);
+  const rows = (limit !== undefined && Number.isFinite(limit)) ? stepsWithSessionId.slice(0, limit) : stepsWithSessionId;
 
   let finalPayload: any = rows;
 

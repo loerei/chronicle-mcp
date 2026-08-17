@@ -774,6 +774,11 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(undone[0].content, "turn 2 (undone)");
       assert.strictEqual(undone[1].content, "reply 2 (undone)");
 
+      // With conversationStepsOnly + includeUndone: true
+      const convUndoneRes = store.query({ sessionId: "session-undone-test", includeSteps: true, includeUndone: true, conversationStepsOnly: true });
+      assert.strictEqual(convUndoneRes.steps.length, 6);
+      assert.strictEqual(convUndoneRes.steps.filter(s => s.isUndone).length, 2);
+
       store.close();
     });
   });
