@@ -111,7 +111,7 @@ function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
 }
 
 export class SessionParser {
-  private static parseStepData(data: any, steps: StepData[], state: { projectPath: string | null; createdAt: number }): void {
+  private static createStepData(data: any, state: { projectPath: string | null; createdAt: number }): StepData {
     const stepType = data.type;
     const stepIndex = data.step_index ?? 0;
     const stepSource = data.source || "";
@@ -132,7 +132,11 @@ export class SessionParser {
       }
     }
 
-    steps.push({
+    if (state.createdAt === 0 && data.created_at) {
+      state.createdAt = new Date(data.created_at).getTime();
+    }
+
+    return {
       stepIndex,
       type: stepType,
       source: stepSource,
@@ -141,11 +145,8 @@ export class SessionParser {
       thinking: stepThinking,
       toolCalls: stepToolCalls,
       createdAt: stepCreatedAt,
-    });
-
-    if (state.createdAt === 0 && data.created_at) {
-      state.createdAt = new Date(data.created_at).getTime();
-    }
+      isUndone: false,
+    };
   }
 
   private static handleUserInput(
@@ -339,50 +340,16 @@ export class SessionParser {
         const data = jsonParse(line);
         if (!data) continue;
 
-        const stepType = data.type;
-        const stepIndex = data.step_index ?? 0;
-        const stepSource = data.source || "";
-        const stepStatus = data.status || "";
-        const stepCreatedAt = data.created_at ? new Date(data.created_at).getTime() : undefined;
-
-        let stepContent = data.content || undefined;
-        let stepThinking = data.thinking || undefined;
-        let stepToolCalls: string | undefined = undefined;
-
-        if (data.tool_calls) {
-          stepToolCalls = JSON.stringify(data.tool_calls);
-          if (!state.projectPath && Array.isArray(data.tool_calls)) {
-            const extracted = extractProjectPathFromToolCalls(data.tool_calls);
-            if (extracted) {
-              state.projectPath = extracted;
-            }
-          }
-        }
-
-        const stepObj: StepData = {
-          stepIndex,
-          type: stepType,
-          source: stepSource,
-          status: stepStatus,
-          content: stepContent,
-          thinking: stepThinking,
-          toolCalls: stepToolCalls,
-          createdAt: stepCreatedAt,
-          isUndone: false,
-        };
+        const stepObj = this.createStepData(data, state);
 
         // Active timeline stack tracking & rollback detection:
-        while (activeStack.length > 0 && activeStack.at(-1)!.stepIndex >= stepIndex) {
+        while (activeStack.length > 0 && activeStack.at(-1)!.stepIndex >= stepObj.stepIndex) {
           const popped = activeStack.pop()!;
           popped.isUndone = true;
         }
 
         steps.push(stepObj);
         activeStack.push(stepObj);
-
-        if (state.createdAt === 0 && data.created_at) {
-          state.createdAt = new Date(data.created_at).getTime();
-        }
       } catch {}
     }
 
