@@ -39,13 +39,21 @@ async function syncSingleSession(s: any, store: any): Promise<boolean> {
     const existingSession = checkResult.sessions[0];
     const existingChunkIndices = new Set(existingSession.chunks.map((c: any) => c.stepIndex));
 
-    const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
+    const stepsResult = store.query({ sessionId: s.id, includeSteps: true, includeUndone: true });
     const existingStepIndices = new Set(stepsResult.steps.map((step: any) => step.stepIndex));
 
     const newChunks = s.chunks.filter((c: any) => !existingChunkIndices.has(c.stepIndex));
     const newSteps = (s.steps || []).filter((step: any) => !existingStepIndices.has(step.stepIndex));
 
-    if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
+    const stepsCountChanged = (s.steps || []).length !== stepsResult.steps.length;
+    const promptChanged = existingSession.firstPrompt !== s.firstPrompt || existingSession.secondPrompt !== s.secondPrompt;
+    const titleChanged = existingSession.title !== s.title;
+
+    const dbUndoneCount = stepsResult.steps.filter((st: any) => st.isUndone).length;
+    const parserUndoneCount = (s.steps || []).filter((st: any) => st.isUndone).length;
+    const undoneCountChanged = dbUndoneCount !== parserUndoneCount;
+
+    if (newChunks.length === 0 && newSteps.length === 0 && !titleChanged && !stepsCountChanged && !promptChanged && !undoneCountChanged) {
       return false;
     }
 
