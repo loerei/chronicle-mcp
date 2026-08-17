@@ -156,4 +156,72 @@ describe("QueryTranscript Unit & Integration Suite", () => {
 
     fs.unlinkSync(tmpOutputFile);
   });
+
+  it("should omit undone steps by default and include them when includeUndone=true with forensic markdown formatting", async () => {
+    store.save(
+      {
+        id: "sess-undone-export-test",
+        title: "Test Undone Export",
+        adapter: "antigravity",
+        projectPath: "d:/Projects/test",
+        createdAt: 1000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          {
+            stepIndex: 0,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "First valid turn",
+            createdAt: 1000,
+            isUndone: false,
+          },
+          {
+            stepIndex: 1,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "Discarded undone turn",
+            createdAt: 1100,
+            isUndone: true,
+          },
+          {
+            stepIndex: 1,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "Surviving replacement turn",
+            createdAt: 1200,
+            isUndone: false,
+          },
+        ],
+      },
+      { chunks: new Map() }
+    );
+
+    // Default: includeUndone = false
+    const resDefault = await handleQueryTranscript({ sessionId: "sess-undone-export-test" });
+    const dataDefault = JSON.parse(resDefault.content[0].text);
+    assert.strictEqual(dataDefault.length, 2);
+    assert.strictEqual(dataDefault[0].content, "First valid turn");
+    assert.strictEqual(dataDefault[1].content, "Surviving replacement turn");
+
+    // With includeUndone = true and Markdown file output
+    const tmpMdFile = path.join(os.tmpdir(), `query_export_undone_${Date.now()}.md`);
+    await handleQueryTranscript({
+      sessionId: "sess-undone-export-test",
+      includeUndone: true,
+      output: tmpMdFile,
+    });
+
+    assert.ok(fs.existsSync(tmpMdFile));
+    const mdContent = fs.readFileSync(tmpMdFile, "utf-8");
+    assert.ok(mdContent.includes("[UNDONE / REWOUND]"));
+    assert.ok(mdContent.includes("Discarded undone turn"));
+    assert.ok(mdContent.includes("Surviving replacement turn"));
+
+    fs.unlinkSync(tmpMdFile);
+  });
 });

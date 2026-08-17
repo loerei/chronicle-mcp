@@ -36,6 +36,7 @@ export async function getSessionDetailsFromDb(
     reverseSteps?: boolean;
     startConversationStep?: number;
     endConversationStep?: number;
+    includeUndone?: boolean;
   } = {}
 ): Promise<any> {
   const store = getStore();
@@ -49,7 +50,8 @@ export async function getSessionDetailsFromDb(
     conversationStepsOnly: options.conversationStepsOnly,
     reverseSteps: options.reverseSteps,
     startConversationStep: options.startConversationStep,
-    endConversationStep: options.endConversationStep
+    endConversationStep: options.endConversationStep,
+    includeUndone: options.includeUndone
   });
 
   const session = result.sessions[0];
@@ -64,7 +66,8 @@ export async function getSessionDetailsFromDb(
   const allConvResult = store.query({
     sessionId,
     includeSteps: true,
-    conversationStepsOnly: true
+    conversationStepsOnly: true,
+    includeUndone: options.includeUndone
   });
   const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
   const convStepIndexMap = new Map<number, number>();
@@ -81,6 +84,7 @@ export async function getSessionDetailsFromDb(
     thinking: s.thinking,
     tool_calls: s.toolCalls,
     created_at: s.createdAt,
+    is_undone: Boolean(s.isUndone || (s as any).is_undone),
     conversation_step_index: convStepIndexMap.get(s.stepIndex) ?? null
   }));
 

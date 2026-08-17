@@ -161,7 +161,7 @@ export class SessionParser {
     chunks: ChunkData[]
   ): void {
     const text = data.content || "";
-    const stepIndex = data.step_index ?? 0;
+    const stepIndex = data.stepIndex ?? data.step_index ?? 0;
 
     // Push previous turn if exists
     if (state.currentTurnUserText) {
@@ -329,6 +329,7 @@ export class SessionParser {
 
     const chunks: ChunkData[] = [];
     const steps: StepData[] = [];
+    const activeStack: StepData[] = [];
     const localTitleMap = new Map<string, string>();
     const subagentIds: string[] = [];
 
@@ -338,9 +339,56 @@ export class SessionParser {
         const data = jsonParse(line);
         if (!data) continue;
 
-        this.parseStepData(data, steps, state);
-        this.processStepType(data, state, chunks, localTitleMap, subagentIds);
+        const stepType = data.type;
+        const stepIndex = data.step_index ?? 0;
+        const stepSource = data.source || "";
+        const stepStatus = data.status || "";
+        const stepCreatedAt = data.created_at ? new Date(data.created_at).getTime() : undefined;
+
+        let stepContent = data.content || undefined;
+        let stepThinking = data.thinking || undefined;
+        let stepToolCalls: string | undefined = undefined;
+
+        if (data.tool_calls) {
+          stepToolCalls = JSON.stringify(data.tool_calls);
+          if (!state.projectPath && Array.isArray(data.tool_calls)) {
+            const extracted = extractProjectPathFromToolCalls(data.tool_calls);
+            if (extracted) {
+              state.projectPath = extracted;
+            }
+          }
+        }
+
+        const stepObj: StepData = {
+          stepIndex,
+          type: stepType,
+          source: stepSource,
+          status: stepStatus,
+          content: stepContent,
+          thinking: stepThinking,
+          toolCalls: stepToolCalls,
+          createdAt: stepCreatedAt,
+          isUndone: false,
+        };
+
+        // Active timeline stack tracking & rollback detection:
+        while (activeStack.length > 0 && activeStack[activeStack.length - 1].stepIndex >= stepIndex) {
+          const popped = activeStack.pop()!;
+          popped.isUndone = true;
+        }
+
+        steps.push(stepObj);
+        activeStack.push(stepObj);
+
+        if (state.createdAt === 0 && data.created_at) {
+          state.createdAt = new Date(data.created_at).getTime();
+        }
       } catch {}
+    }
+
+    // Process the surviving active steps for chunks, prompts, subagents, titles
+    for (const activeStep of activeStack) {
+      this.processStepType(activeStep, state, chunks, localTitleMap, subagentIds);
     }
 
     if (state.currentTurnUserText) {

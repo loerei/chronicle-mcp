@@ -184,6 +184,7 @@ export interface QueryOptions {
   stepType?: string;
   stepStatus?: string;
   includeSteps?: boolean;
+  includeUndone?: boolean;
   limit?: number;
   toolName?: string;
   serverName?: string;
@@ -300,13 +301,8 @@ export class InMemoryHistoryStore implements HistoryStore {
 
   private copySteps(session: SessionData): StepData[] {
     const stepsCopy: StepData[] = [];
-    const seenStepIndexes = new Set<number>();
     if (session.steps) {
       for (const step of session.steps) {
-        if (seenStepIndexes.has(step.stepIndex)) {
-          continue;
-        }
-        seenStepIndexes.add(step.stepIndex);
         stepsCopy.push({
           stepIndex: step.stepIndex,
           type: step.type,
@@ -315,7 +311,8 @@ export class InMemoryHistoryStore implements HistoryStore {
           content: step.content,
           thinking: step.thinking,
           toolCalls: step.toolCalls,
-          createdAt: step.createdAt
+          createdAt: step.createdAt,
+          isUndone: step.isUndone,
         });
       }
     }
@@ -439,6 +436,7 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   private matchStep(step: StepData, options: QueryOptions): boolean {
+    if (!options.includeUndone && step.isUndone) return false;
     if (options.stepIndex !== undefined && step.stepIndex !== options.stepIndex) return false;
     if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
     if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
@@ -542,7 +540,10 @@ export class InMemoryHistoryStore implements HistoryStore {
 
     const steps = this.stepsMap.get(queryOpts.sessionId) || [];
     const convSteps = steps
-      .filter(s => s.type === "USER_INPUT" || (s.type === "PLANNER_RESPONSE" && s.content && s.content.trim() !== ""))
+      .filter(s => {
+        if (!queryOpts.includeUndone && s.isUndone) return false;
+        return s.type === "USER_INPUT" || (s.type === "PLANNER_RESPONSE" && s.content && s.content.trim() !== "");
+      })
       .sort((a, b) => a.stepIndex - b.stepIndex);
 
     if (queryOpts.startConversationStep !== undefined) {
@@ -826,8 +827,8 @@ export class SqliteHistoryStore implements HistoryStore {
         thinking TEXT,
         tool_calls TEXT,
         created_at INTEGER,
-        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-        UNIQUE(session_id, step_index) ON CONFLICT IGNORE
+        is_undone INTEGER DEFAULT 0,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
       );
 
       CREATE INDEX IF NOT EXISTS idx_steps_session ON session_steps(session_id);
@@ -850,6 +851,14 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     try {
+      this.db.exec("ALTER TABLE session_steps ADD COLUMN is_undone INTEGER DEFAULT 0;");
+    } catch (e: any) {
+      if (!e?.message?.includes("duplicate column name")) {
+        console.debug?.("[Chronicle MCP] is_undone alter table failed:", e);
+      }
+    }
+
+    try {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);");
     } catch (e) {
       // Ignore error if column/index already exists
@@ -858,6 +867,10 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   private filterAndPushStep(row: any, options: QueryOptions, stepsBySession: Map<string, StepData[]>, stepsResult: StepData[]): void {
+    if (!options.includeUndone && row.is_undone) {
+      return;
+    }
+
     if (options.conversationStepsOnly && row.type !== "USER_INPUT" && !(row.type === "PLANNER_RESPONSE" && row.content && row.content.trim() !== "")) {
       return;
     }
@@ -871,6 +884,7 @@ export class SqliteHistoryStore implements HistoryStore {
       thinking: row.thinking ?? undefined,
       toolCalls: row.tool_calls ?? undefined,
       createdAt: row.created_at ?? undefined,
+      isUndone: row.is_undone === 1,
       ...(row.tool_result ? { tool_result: row.tool_result } : {}) as any
     };
 
@@ -937,19 +951,31 @@ export class SqliteHistoryStore implements HistoryStore {
         parentId
       );
 
+      const existingChunksRows = db.prepare("SELECT step_index, chunk_vector FROM session_chunks WHERE session_id = ?").all(session.id) as { step_index: number; chunk_vector: string }[];
+      const existingVectors = new Map<number, string>(existingChunksRows.map(r => [r.step_index, r.chunk_vector]));
+
+      db.prepare("DELETE FROM session_steps WHERE session_id = ?").run(session.id);
+      db.prepare("DELETE FROM session_chunks WHERE session_id = ?").run(session.id);
+
       const insertChunk = db.prepare(`
-        INSERT OR IGNORE INTO session_chunks (session_id, step_index, chunk_text, chunk_vector)
+        INSERT INTO session_chunks (session_id, step_index, chunk_text, chunk_vector)
         VALUES (?, ?, ?, ?)
       `);
       for (const chunk of session.chunks) {
-        const vec = embeddings.chunks.get(chunk.stepIndex) || [];
-        insertChunk.run(session.id, chunk.stepIndex, chunk.text, JSON.stringify(vec));
+        let vecStr = "[]";
+        const newVec = embeddings.chunks.get(chunk.stepIndex);
+        if (newVec) {
+          vecStr = JSON.stringify(newVec);
+        } else if (existingVectors.has(chunk.stepIndex)) {
+          vecStr = existingVectors.get(chunk.stepIndex)!;
+        }
+        insertChunk.run(session.id, chunk.stepIndex, chunk.text, vecStr);
       }
 
       if (session.steps) {
         const insertStep = db.prepare(`
-          INSERT OR IGNORE INTO session_steps (session_id, step_index, type, source, status, content, thinking, tool_calls, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO session_steps (session_id, step_index, type, source, status, content, thinking, tool_calls, created_at, is_undone)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         for (const step of session.steps) {
           insertStep.run(
@@ -961,7 +987,8 @@ export class SqliteHistoryStore implements HistoryStore {
             step.content ?? null,
             step.thinking ?? null,
             step.toolCalls ?? null,
-            step.createdAt ?? null
+            step.createdAt ?? null,
+            step.isUndone ? 1 : 0
           );
         }
       }
@@ -1061,8 +1088,11 @@ export class SqliteHistoryStore implements HistoryStore {
   private buildStepQuery(placeholders: string, options: QueryOptions, params: any[]): string {
     const contentCol = options.excludeContent ? "NULL as content" : "content";
     const thinkingCol = options.excludeContent ? "NULL as thinking" : "thinking";
-    let sql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at FROM session_steps WHERE session_id IN (${placeholders})`;
+    let sql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at, is_undone FROM session_steps WHERE session_id IN (${placeholders})`;
 
+    if (!options.includeUndone) {
+      sql += " AND (is_undone = 0 OR is_undone IS NULL)";
+    }
     if (options.stepIndex !== undefined) {
       sql += " AND step_index = ?";
       params.push(options.stepIndex);
@@ -1093,10 +1123,11 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   private resolveConversationSteps(db: any, queryOpts: QueryOptions): void {
+    const undoneClause = queryOpts.includeUndone ? "" : " AND (is_undone = 0 OR is_undone IS NULL)";
     if (queryOpts.startConversationStep !== undefined) {
       const row = db.prepare(`
         SELECT step_index FROM session_steps
-        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))
+        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))${undoneClause}
         ORDER BY step_index ASC
         LIMIT 1 OFFSET ?
       `).get(queryOpts.sessionId, queryOpts.startConversationStep - 1) as { step_index: number } | undefined;
@@ -1109,7 +1140,7 @@ export class SqliteHistoryStore implements HistoryStore {
     if (queryOpts.endConversationStep !== undefined) {
       const row = db.prepare(`
         SELECT step_index FROM session_steps
-        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))
+        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))${undoneClause}
         ORDER BY step_index ASC
         LIMIT 1 OFFSET ?
       `).get(queryOpts.sessionId, queryOpts.endConversationStep - 1) as { step_index: number } | undefined;

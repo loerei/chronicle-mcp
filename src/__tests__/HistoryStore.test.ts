@@ -734,6 +734,48 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
       store.close();
     });
+
+    it("should filter undone steps by default and include them when includeUndone is true", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "session-undone-test",
+        adapter: "antigravity",
+        title: "Undone Steps Test",
+        projectPath: "",
+        createdAt: 1700000000000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "turn 1" },
+          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "reply 1" },
+          { stepIndex: 2, type: "USER_INPUT", source: "USER", status: "DONE", content: "turn 2 (undone)", isUndone: true },
+          { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "reply 2 (undone)", isUndone: true },
+          { stepIndex: 2, type: "USER_INPUT", source: "USER", status: "DONE", content: "turn 2 (active)" },
+          { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "reply 2 (active)" }
+        ]
+      };
+
+      store.save(session, { summary: [0.5, 0.5], chunks: new Map() });
+
+      // Default: includeUndone = false / omitted
+      const defaultRes = store.query({ sessionId: "session-undone-test", includeSteps: true });
+      assert.strictEqual(defaultRes.steps.length, 4);
+      assert.ok(defaultRes.steps.every(s => !s.isUndone));
+      assert.strictEqual(defaultRes.steps[2].content, "turn 2 (active)");
+      assert.strictEqual(defaultRes.steps[3].content, "reply 2 (active)");
+
+      // With includeUndone: true
+      const allRes = store.query({ sessionId: "session-undone-test", includeSteps: true, includeUndone: true });
+      assert.strictEqual(allRes.steps.length, 6);
+      const undone = allRes.steps.filter(s => s.isUndone);
+      assert.strictEqual(undone.length, 2);
+      assert.strictEqual(undone[0].content, "turn 2 (undone)");
+      assert.strictEqual(undone[1].content, "reply 2 (undone)");
+
+      store.close();
+    });
   });
 }
 

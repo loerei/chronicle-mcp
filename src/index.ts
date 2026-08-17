@@ -158,6 +158,11 @@ const conversationStepParams = {
     description: "Include only conversation steps.",
     default: false,
   },
+  includeUndone: {
+    type: "boolean",
+    description: "Include undone / superseded conversation steps.",
+    default: false,
+  },
   reverseSteps: {
     type: "boolean",
     description: "Retrieve history in reverse order.",
@@ -330,6 +335,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "integer",
             description: "Max number of steps/entries to return",
             default: 20,
+          },
+          includeUndone: {
+            type: "boolean",
+            description: "Include undone / rewound steps from superseded conversation branches. Default: false.",
+            default: false,
           },
           output: {
             type: "string",
@@ -767,43 +777,55 @@ async function handleGetSessionRelationship(args: any): Promise<any> {
 
 function formatStepToMarkdown(step: any, options?: { includeTimestamps?: boolean; includeCallResults?: boolean }): string {
   let md = "";
+  const isUndone = Boolean(step.is_undone || step.isUndone);
+  const undoneBadge = isUndone ? " **[UNDONE / REWOUND]**" : "";
   const timeStr = (options?.includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
   const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
 
+  let body = "";
   if (step.type === "USER_INPUT") {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
+    body = `**User**: ${step.content || ""}\n\n`;
   } else if (step.type === "PLANNER_RESPONSE") {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
     if (step.thinking) {
-      md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
+      body += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
     }
     if (step.content) {
-      md += `**Assistant**: ${step.content}\n\n`;
+      body += `**Assistant**: ${step.content}\n\n`;
     }
     if (step.tool_calls) {
       try {
-        md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
+        body += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
       } catch {
-        md += `**Tool Calls**: ${step.tool_calls}\n\n`;
+        body += `**Tool Calls**: ${step.tool_calls}\n\n`;
       }
     }
     if (step.tool_result) {
-      md += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
+      body += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
     }
   } else if (options?.includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND") {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (${step.type})\n`;
     if (step.source && step.status) {
-      md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
+      body += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
     }
     if (step.content) {
-      md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
+      body += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
     }
   } else {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (\`${step.type}\`)\n`;
     if (step.content) {
-      md += `${step.content}\n\n`;
+      body += `${step.content}\n\n`;
     }
   }
+
+  if (isUndone) {
+    const typeLabel = (step.type === "USER_INPUT" || step.type === "PLANNER_RESPONSE") ? "" : ` (\`${step.type}\`)`;
+    md += `### Step ${step.step_index}${convStepIdx}${undoneBadge}${timeStr}${typeLabel}\n`;
+    md += `> [!NOTE]\n> **[UNDONE / REWOUND STEP]** *(This step was superseded by a later turn rollback)*\n>\n`;
+    const quotedBody = body.trim().split("\n").map(line => `> ${line}`).join("\n");
+    md += `${quotedBody}\n\n`;
+  } else {
+    const typeLabel = (step.type === "USER_INPUT" || step.type === "PLANNER_RESPONSE") ? "" : (options?.includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND" ? ` (${step.type})` : ` (\`${step.type}\`)`);
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr}${typeLabel}\n${body}`;
+  }
+
   return md;
 }
 
@@ -819,6 +841,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
   const reverseSteps = args?.reverseSteps as boolean | undefined;
   const startConversationStep = args?.startConversationStep as number | undefined;
   const endConversationStep = args?.endConversationStep as number | undefined;
+  const includeUndone = args?.includeUndone as boolean | undefined;
 
   const details = await getSessionDetailsFromDb(sessionId, {
     includeToolCalls,
@@ -830,6 +853,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
     reverseSteps,
     startConversationStep,
     endConversationStep,
+    includeUndone,
   });
 
   if (!details) {
@@ -965,6 +989,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
   let categories = args?.categories as StepCategory[] | undefined;
   const sortMode: StepSortMode = args?.sort || "time_old_to_new";
   const outputPath = args?.output as string | undefined;
+  const includeUndone = Boolean(args?.includeUndone);
 
   // Normalize categories if omitted or empty
   if (!categories || categories.length === 0) {
@@ -987,6 +1012,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
     toolName,
     serverName,
     includeSteps: true,
+    includeUndone,
     categories,
     sort: sortMode,
   });
@@ -1001,6 +1027,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
         const allConvResult = store.query({
           sessionId: s.id,
           includeSteps: true,
+          includeUndone,
           conversationStepsOnly: true,
         });
         const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
@@ -1033,6 +1060,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
           source: step.source,
           status: step.status,
           created_at: step.createdAt ?? null,
+          is_undone: Boolean(step.isUndone || (step as any).is_undone),
           conversation_step_index: convMap.get(step.stepIndex) ?? null,
         };
 
