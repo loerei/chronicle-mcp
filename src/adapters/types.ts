@@ -45,6 +45,7 @@ export interface StepData {
   thinking?: string;
   toolCalls?: string; // stringified JSON
   createdAt?: number;
+  isUndone?: boolean;
 }
 
 export interface ChunkData {

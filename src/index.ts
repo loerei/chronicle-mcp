@@ -39,13 +39,21 @@ async function syncSingleSession(s: any, store: any): Promise<boolean> {
     const existingSession = checkResult.sessions[0];
     const existingChunkIndices = new Set(existingSession.chunks.map((c: any) => c.stepIndex));
 
-    const stepsResult = store.query({ sessionId: s.id, includeSteps: true });
+    const stepsResult = store.query({ sessionId: s.id, includeSteps: true, includeUndone: true });
     const existingStepIndices = new Set(stepsResult.steps.map((step: any) => step.stepIndex));
 
     const newChunks = s.chunks.filter((c: any) => !existingChunkIndices.has(c.stepIndex));
     const newSteps = (s.steps || []).filter((step: any) => !existingStepIndices.has(step.stepIndex));
 
-    if (newChunks.length === 0 && newSteps.length === 0 && existingSession.title === s.title) {
+    const stepsCountChanged = (s.steps || []).length !== stepsResult.steps.length;
+    const promptChanged = existingSession.firstPrompt !== s.firstPrompt || existingSession.secondPrompt !== s.secondPrompt;
+    const titleChanged = existingSession.title !== s.title;
+
+    const dbUndoneCount = stepsResult.steps.filter((st: any) => st.isUndone).length;
+    const parserUndoneCount = (s.steps || []).filter((st: any) => st.isUndone).length;
+    const undoneCountChanged = dbUndoneCount !== parserUndoneCount;
+
+    if (newChunks.length === 0 && newSteps.length === 0 && !titleChanged && !stepsCountChanged && !promptChanged && !undoneCountChanged) {
       return false;
     }
 
@@ -156,6 +164,11 @@ const conversationStepParams = {
   conversationStepsOnly: {
     type: "boolean",
     description: "Include only conversation steps.",
+    default: false,
+  },
+  includeUndone: {
+    type: "boolean",
+    description: "Include undone / superseded conversation steps.",
     default: false,
   },
   reverseSteps: {
@@ -330,6 +343,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "integer",
             description: "Max number of steps/entries to return",
             default: 20,
+          },
+          includeUndone: {
+            type: "boolean",
+            description: "Include undone / rewound steps from superseded conversation branches. Default: false.",
+            default: false,
           },
           output: {
             type: "string",
@@ -765,45 +783,64 @@ async function handleGetSessionRelationship(args: any): Promise<any> {
   };
 }
 
+function getStepTypeLabel(step: any, includeCallResults?: boolean): string {
+  if (step.type === "USER_INPUT" || step.type === "PLANNER_RESPONSE") {
+    return "";
+  }
+  if (includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND") {
+    return ` (${step.type})`;
+  }
+  return ` (\`${step.type}\`)`;
+}
+
 function formatStepToMarkdown(step: any, options?: { includeTimestamps?: boolean; includeCallResults?: boolean }): string {
   let md = "";
+  const isUndone = Boolean(step.is_undone || step.isUndone);
+  const undoneBadge = isUndone ? " **[UNDONE / REWOUND]**" : "";
   const timeStr = (options?.includeTimestamps && step.created_at) ? ` (${new Date(step.created_at).toLocaleString()})` : "";
   const convStepIdx = step.conversation_step_index ? ` (Conversation Step ${step.conversation_step_index})` : "";
 
+  let body = "";
   if (step.type === "USER_INPUT") {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n**User**: ${step.content || ""}\n\n`;
+    body = `**User**: ${step.content || ""}\n\n`;
   } else if (step.type === "PLANNER_RESPONSE") {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr}\n`;
     if (step.thinking) {
-      md += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
+      body += `**Thinking**:\n\`\`\`\n${step.thinking}\n\`\`\`\n\n`;
     }
     if (step.content) {
-      md += `**Assistant**: ${step.content}\n\n`;
+      body += `**Assistant**: ${step.content}\n\n`;
     }
     if (step.tool_calls) {
       try {
-        md += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
+        body += `**Tool Calls**:\n\`\`\`json\n${JSON.stringify(JSON.parse(step.tool_calls), null, 2)}\n\`\`\`\n\n`;
       } catch {
-        md += `**Tool Calls**: ${step.tool_calls}\n\n`;
+        body += `**Tool Calls**: ${step.tool_calls}\n\n`;
       }
     }
     if (step.tool_result) {
-      md += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
+      body += `**Tool Result** (\`${step.tool_result.type}\`):\n\`\`\`\n${step.tool_result.content || ""}\n\`\`\`\n\n`;
     }
   } else if (options?.includeCallResults || step.type === "MCP_TOOL" || step.type === "COMMAND") {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (${step.type})\n`;
     if (step.source && step.status) {
-      md += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
+      body += `* **Source**: \`${step.source}\` | **Status**: \`${step.status}\`\n\n`;
     }
     if (step.content) {
-      md += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
+      body += `**Result**:\n\`\`\`\n${step.content}\n\`\`\`\n\n`;
     }
-  } else {
-    md += `### Step ${step.step_index}${convStepIdx}${timeStr} (\`${step.type}\`)\n`;
-    if (step.content) {
-      md += `${step.content}\n\n`;
-    }
+  } else if (step.content) {
+    body += `${step.content}\n\n`;
   }
+
+  const typeLabel = getStepTypeLabel(step, options?.includeCallResults);
+  if (isUndone) {
+    md += `### Step ${step.step_index}${convStepIdx}${undoneBadge}${timeStr}${typeLabel}\n`;
+    md += `> [!NOTE]\n> **[UNDONE / REWOUND STEP]** *(This step was superseded by a later turn rollback)*\n>\n`;
+    const quotedBody = body.trim().split("\n").map(line => `> ${line}`).join("\n");
+    md += `${quotedBody}\n\n`;
+  } else {
+    md += `### Step ${step.step_index}${convStepIdx}${timeStr}${typeLabel}\n${body}`;
+  }
+
   return md;
 }
 
@@ -819,6 +856,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
   const reverseSteps = args?.reverseSteps as boolean | undefined;
   const startConversationStep = args?.startConversationStep as number | undefined;
   const endConversationStep = args?.endConversationStep as number | undefined;
+  const includeUndone = args?.includeUndone as boolean | undefined;
 
   const details = await getSessionDetailsFromDb(sessionId, {
     includeToolCalls,
@@ -830,6 +868,7 @@ async function handleGetSessionDetails(args: any): Promise<any> {
     reverseSteps,
     startConversationStep,
     endConversationStep,
+    includeUndone,
   });
 
   if (!details) {
@@ -959,12 +998,19 @@ export async function handleQueryTranscript(args: any): Promise<any> {
   const serverName = args?.serverName as string | undefined;
   const type = args?.type as string | undefined;
   const status = args?.status as string | undefined;
-  const limit = (args?.limit as number) || 20;
+  const explicitLimit = args?.limit !== undefined ? (args.limit as number) : undefined;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as "workspace" | "all" | undefined;
   let categories = args?.categories as StepCategory[] | undefined;
   const sortMode: StepSortMode = args?.sort || "time_old_to_new";
   const outputPath = args?.output as string | undefined;
+  let limit: number | undefined = 20;
+  if (explicitLimit !== undefined) {
+    limit = explicitLimit;
+  } else if (outputPath) {
+    limit = undefined;
+  }
+  const includeUndone = Boolean(args?.includeUndone);
 
   // Normalize categories if omitted or empty
   if (!categories || categories.length === 0) {
@@ -987,6 +1033,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
     toolName,
     serverName,
     includeSteps: true,
+    includeUndone,
     categories,
     sort: sortMode,
   });
@@ -1001,6 +1048,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
         const allConvResult = store.query({
           sessionId: s.id,
           includeSteps: true,
+          includeUndone,
           conversationStepsOnly: true,
         });
         const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
@@ -1033,6 +1081,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
           source: step.source,
           status: step.status,
           created_at: step.createdAt ?? null,
+          is_undone: Boolean(step.isUndone || (step as any).is_undone),
           conversation_step_index: convMap.get(step.stepIndex) ?? null,
         };
 
@@ -1089,7 +1138,7 @@ export async function handleQueryTranscript(args: any): Promise<any> {
     stepsWithSessionId.sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0));
   }
 
-  const rows = stepsWithSessionId.slice(0, limit);
+  const rows = (limit !== undefined && Number.isFinite(limit)) ? stepsWithSessionId.slice(0, limit) : stepsWithSessionId;
 
   let finalPayload: any = rows;
 

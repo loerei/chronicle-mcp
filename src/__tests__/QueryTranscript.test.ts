@@ -156,4 +156,180 @@ describe("QueryTranscript Unit & Integration Suite", () => {
 
     fs.unlinkSync(tmpOutputFile);
   });
+
+  it("should omit undone steps by default and include them when includeUndone=true with forensic markdown formatting", async () => {
+    store.save(
+      {
+        id: "sess-undone-export-test",
+        title: "Test Undone Export",
+        adapter: "antigravity",
+        projectPath: "d:/Projects/test",
+        createdAt: 1000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          {
+            stepIndex: 0,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "First valid turn",
+            createdAt: 1000,
+            isUndone: false,
+          },
+          {
+            stepIndex: 1,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "Discarded undone turn",
+            createdAt: 1100,
+            isUndone: true,
+          },
+          {
+            stepIndex: 1,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "Surviving replacement turn",
+            createdAt: 1200,
+            isUndone: false,
+          },
+        ],
+      },
+      { chunks: new Map() }
+    );
+
+    // Default: includeUndone = false
+    const resDefault = await handleQueryTranscript({ sessionId: "sess-undone-export-test" });
+    const dataDefault = JSON.parse(resDefault.content[0].text);
+    assert.strictEqual(dataDefault.length, 2);
+    assert.strictEqual(dataDefault[0].content, "First valid turn");
+    assert.strictEqual(dataDefault[1].content, "Surviving replacement turn");
+
+    // With includeUndone = true and Markdown file output
+    const tmpMdFile = path.join(os.tmpdir(), `query_export_undone_${Date.now()}.md`);
+    await handleQueryTranscript({
+      sessionId: "sess-undone-export-test",
+      includeUndone: true,
+      output: tmpMdFile,
+    });
+
+    assert.ok(fs.existsSync(tmpMdFile));
+    const mdContent = fs.readFileSync(tmpMdFile, "utf-8");
+    assert.ok(mdContent.includes("[UNDONE / REWOUND]"));
+    assert.ok(mdContent.includes("Discarded undone turn"));
+    assert.ok(mdContent.includes("Surviving replacement turn"));
+
+    fs.unlinkSync(tmpMdFile);
+  });
+
+  it("should export all steps when output is provided without limit (no truncation for large transcripts)", async () => {
+    const largeSessionId = "sess-large-export-test";
+    const numSteps = 25;
+    const steps: any[] = [];
+
+    for (let i = 0; i < numSteps; i++) {
+      steps.push({
+        stepIndex: i,
+        type: i % 2 === 0 ? "USER_INPUT" : "PLANNER_RESPONSE",
+        source: i % 2 === 0 ? "USER" : "MODEL",
+        status: "DONE",
+        content: `Step ${i + 1} content`,
+        createdAt: 1000 + i,
+        isUndone: false,
+      });
+    }
+
+    store.save(
+      {
+        id: largeSessionId,
+        title: "Large Export Session",
+        adapter: "antigravity",
+        projectPath: "d:/Projects/test",
+        createdAt: 1000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps,
+      },
+      { chunks: new Map() }
+    );
+
+    const tmpOutputFile = path.join(os.tmpdir(), `large-transcript-${Date.now()}.md`);
+
+    await handleQueryTranscript({
+      sessionId: largeSessionId,
+      includeUndone: false,
+      output: tmpOutputFile,
+    });
+
+    const contents = fs.readFileSync(tmpOutputFile, "utf-8");
+    for (let i = 0; i < numSteps; i++) {
+      assert.ok(contents.includes(`Step ${i + 1} content`));
+    }
+
+    fs.unlinkSync(tmpOutputFile);
+  });
+
+  it("should include undone steps with isUndone flag in JSON output when includeUndone=true", async () => {
+    const jsonSessionId = "sess-json-undone-export-test";
+    store.save(
+      {
+        id: jsonSessionId,
+        title: "JSON Undone Export Session",
+        adapter: "antigravity",
+        projectPath: "d:/Projects/test",
+        createdAt: 1000,
+        firstPrompt: "init",
+        secondPrompt: "",
+        chunks: [],
+        steps: [
+          {
+            stepIndex: 0,
+            type: "USER_INPUT",
+            source: "USER",
+            status: "DONE",
+            content: "First completed step",
+            createdAt: 1100,
+            isUndone: false,
+          },
+          {
+            stepIndex: 1,
+            type: "PLANNER_RESPONSE",
+            source: "MODEL",
+            status: "DONE",
+            content: "Second completed step",
+            createdAt: 1200,
+            isUndone: false,
+          },
+          {
+            stepIndex: 1,
+            type: "PLANNER_RESPONSE",
+            source: "MODEL",
+            status: "DONE",
+            content: "Third step that was undone",
+            createdAt: 1300,
+            isUndone: true,
+          },
+        ],
+      },
+      { chunks: new Map() }
+    );
+
+    const result: any = await handleQueryTranscript({
+      sessionId: jsonSessionId,
+      includeUndone: true,
+    });
+
+    const steps = JSON.parse(result.content[0].text);
+    assert.strictEqual(steps.length, 3);
+    const undoneSteps = steps.filter((s: any) => s.is_undone === true || s.isUndone === true);
+    const doneSteps = steps.filter((s: any) => !s.is_undone && !s.isUndone);
+
+    assert.strictEqual(undoneSteps.length, 1);
+    assert.strictEqual(doneSteps.length, 2);
+    assert.strictEqual(undoneSteps[0].content, "Third step that was undone");
+  });
 });

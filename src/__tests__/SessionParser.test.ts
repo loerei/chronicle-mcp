@@ -154,6 +154,76 @@ describe("SessionParser Tests", () => {
         "f9e8d7c6-b5a4-3f2e-1d0c-9b8a7f6e5d4c"
       ]);
     });
+
+    it("should detect step index rewinds, mark superseded steps as isUndone, and preserve active surviving timeline", () => {
+      const sessionId = "session-rewind-test";
+      const jsonl = [
+        // Turn 1
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "First question",
+          created_at: "2026-08-18T00:00:00.000Z"
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "First answer",
+          created_at: "2026-08-18T00:00:05.000Z"
+        }),
+        // Turn 2 (Old branch - later undone)
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 2,
+          content: "Undone second question",
+          created_at: "2026-08-18T00:01:00.000Z"
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 3,
+          content: "Undone second answer",
+          created_at: "2026-08-18T00:01:05.000Z"
+        }),
+        // Rollback / Rewind back to step 2 with a new prompt
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 2,
+          content: "Surviving second question",
+          created_at: "2026-08-18T00:02:00.000Z"
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 3,
+          content: "Surviving second answer",
+          created_at: "2026-08-18T00:02:05.000Z"
+        })
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      assert.strictEqual(session.steps?.length, 6);
+      
+      // Check undone steps
+      const undoneSteps = session.steps?.filter(s => s.isUndone);
+      assert.strictEqual(undoneSteps?.length, 2);
+      assert.strictEqual(undoneSteps?.[0].content, "Undone second question");
+      assert.strictEqual(undoneSteps?.[1].content, "Undone second answer");
+
+      // Check active steps
+      const activeSteps = session.steps?.filter(s => !s.isUndone);
+      assert.strictEqual(activeSteps?.length, 4);
+      assert.strictEqual(activeSteps?.[2].content, "Surviving second question");
+      assert.strictEqual(activeSteps?.[3].content, "Surviving second answer");
+
+      // Check session metadata reflects active timeline
+      assert.strictEqual(session.firstPrompt, "First question");
+      assert.strictEqual(session.secondPrompt, "Surviving second question");
+      assert.strictEqual(session.chunks.length, 2);
+      assert.strictEqual(
+        session.chunks[1].text,
+        "User: Surviving second question\nAssistant: Surviving second answer"
+      );
+    });
   });
 
   describe("parseCursorComposer", () => {

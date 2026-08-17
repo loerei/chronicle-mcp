@@ -111,7 +111,7 @@ function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
 }
 
 export class SessionParser {
-  private static parseStepData(data: any, steps: StepData[], state: { projectPath: string | null; createdAt: number }): void {
+  private static createStepData(data: any, state: { projectPath: string | null; createdAt: number }): StepData {
     const stepType = data.type;
     const stepIndex = data.step_index ?? 0;
     const stepSource = data.source || "";
@@ -132,7 +132,11 @@ export class SessionParser {
       }
     }
 
-    steps.push({
+    if (state.createdAt === 0 && data.created_at) {
+      state.createdAt = new Date(data.created_at).getTime();
+    }
+
+    return {
       stepIndex,
       type: stepType,
       source: stepSource,
@@ -141,11 +145,8 @@ export class SessionParser {
       thinking: stepThinking,
       toolCalls: stepToolCalls,
       createdAt: stepCreatedAt,
-    });
-
-    if (state.createdAt === 0 && data.created_at) {
-      state.createdAt = new Date(data.created_at).getTime();
-    }
+      isUndone: false,
+    };
   }
 
   private static handleUserInput(
@@ -161,7 +162,7 @@ export class SessionParser {
     chunks: ChunkData[]
   ): void {
     const text = data.content || "";
-    const stepIndex = data.step_index ?? 0;
+    const stepIndex = data.stepIndex ?? data.step_index ?? 0;
 
     // Push previous turn if exists
     if (state.currentTurnUserText) {
@@ -329,6 +330,7 @@ export class SessionParser {
 
     const chunks: ChunkData[] = [];
     const steps: StepData[] = [];
+    const activeStack: StepData[] = [];
     const localTitleMap = new Map<string, string>();
     const subagentIds: string[] = [];
 
@@ -338,9 +340,22 @@ export class SessionParser {
         const data = jsonParse(line);
         if (!data) continue;
 
-        this.parseStepData(data, steps, state);
-        this.processStepType(data, state, chunks, localTitleMap, subagentIds);
+        const stepObj = this.createStepData(data, state);
+
+        // Active timeline stack tracking & rollback detection:
+        while (activeStack.length > 0 && activeStack.at(-1)!.stepIndex >= stepObj.stepIndex) {
+          const popped = activeStack.pop()!;
+          popped.isUndone = true;
+        }
+
+        steps.push(stepObj);
+        activeStack.push(stepObj);
       } catch {}
+    }
+
+    // Process the surviving active steps for chunks, prompts, subagents, titles
+    for (const activeStep of activeStack) {
+      this.processStepType(activeStep, state, chunks, localTitleMap, subagentIds);
     }
 
     if (state.currentTurnUserText) {
