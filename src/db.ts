@@ -859,6 +859,40 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     try {
+      const stepTableSql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='session_steps'").get() as { sql: string } | undefined)?.sql || "";
+      if (stepTableSql.includes("UNIQUE(session_id, step_index)")) {
+        console.error("[Chronicle MCP] Migrating session_steps table to remove legacy UNIQUE constraint...");
+        this.db.exec("PRAGMA foreign_keys=OFF;");
+        this.db.exec(`
+          BEGIN TRANSACTION;
+          CREATE TABLE session_steps_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            step_index INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL,
+            content TEXT,
+            thinking TEXT,
+            tool_calls TEXT,
+            created_at INTEGER,
+            is_undone INTEGER DEFAULT 0,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+          );
+          INSERT INTO session_steps_new (id, session_id, step_index, type, source, status, content, thinking, tool_calls, created_at, is_undone)
+          SELECT id, session_id, step_index, type, source, status, content, thinking, tool_calls, created_at, COALESCE(is_undone, 0) FROM session_steps;
+          DROP TABLE session_steps;
+          ALTER TABLE session_steps_new RENAME TO session_steps;
+          CREATE INDEX IF NOT EXISTS idx_steps_session ON session_steps(session_id);
+          COMMIT;
+        `);
+        this.db.exec("PRAGMA foreign_keys=ON;");
+      }
+    } catch (e) {
+      console.debug?.("[Chronicle MCP] session_steps unique constraint migration failed:", e);
+    }
+
+    try {
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);");
     } catch (e) {
       // Ignore error if column/index already exists
