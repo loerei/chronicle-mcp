@@ -991,12 +991,13 @@ export async function handleQueryTranscript(args: any): Promise<any> {
   const serverName = args?.serverName as string | undefined;
   const type = args?.type as string | undefined;
   const status = args?.status as string | undefined;
-  const limit = (args?.limit as number) || 20;
+  const explicitLimit = args?.limit !== undefined ? (args.limit as number) : undefined;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as "workspace" | "all" | undefined;
   let categories = args?.categories as StepCategory[] | undefined;
   const sortMode: StepSortMode = args?.sort || "time_old_to_new";
   const outputPath = args?.output as string | undefined;
+  const limit = explicitLimit !== undefined ? explicitLimit : (outputPath ? Infinity : 20);
   const includeUndone = Boolean(args?.includeUndone);
 
   // Normalize categories if omitted or empty
