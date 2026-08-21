@@ -3,7 +3,7 @@ export interface SessionData {
   adapter: string;
   title: string;
   role?: string;
-  projectPath: string | null;
+  projectPath?: string | null;
   createdAt: number;
   lastActiveAt?: number;
   parentId?: string | null;
@@ -19,9 +19,9 @@ export interface SessionData {
   turns?: TurnData[];
 
   /** @deprecated Transitional property for legacy module compatibility during S1 */
-  secondPrompt: any;
+  secondPrompt?: any;
   /** @deprecated Transitional property for legacy module compatibility during S1 */
-  chunks: any;
+  chunks?: any;
   /** @deprecated Transitional property for legacy module compatibility during S1 */
   steps?: StepData[];
   /** @deprecated Transitional property for legacy module compatibility during S1 */
@@ -147,7 +147,7 @@ export interface SearchHistoryResult {
   turnIndex: number;
   title: string;
   role?: string;
-  projectPath: string | null;
+  projectPath?: string | null;
   score: number;
   matchedUserPrompt?: string;
   matchedAssistantSnippet?: string;
@@ -167,7 +167,7 @@ export interface SessionRelationshipNode {
   adapter: string;
   title: string;
   role?: string;
-  projectPath: string | null;
+  projectPath?: string | null;
   createdAt: number;
   lastActiveAt?: number;
   parentId?: string | null;

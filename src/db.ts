@@ -2,169 +2,81 @@ import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
-import { SessionData, StepData, ChunkData, SessionRelationshipNode, SessionRelationshipResult } from "./adapters/types.js";
+import {
+  SessionData,
+  TurnData,
+  StepData,
+  ChunkData,
+  SessionRelationshipNode,
+  SessionRelationshipResult,
+} from "./adapters/types.js";
+import {
+  vectorToBlob,
+  blobToVector,
+  cosineSimilarityFloat32,
+  EMBEDDING_DIMENSION,
+  EMBEDDING_BLOB_SIZE,
+} from "./embeddings.js";
 
-function matchToolCall(call: any, targetServer?: string, targetTool?: string | string[]): boolean {
-  const name = call.name || "";
-  let callServer = "";
-  let callTool = "";
+// ============================================================
+// 1. Interfaces & Option Contracts
+// ============================================================
 
-  if (name === "call_mcp_tool" && call.args) {
-    callServer = call.args.ServerName || "";
-    callTool = call.args.ToolName || "";
-  } else {
-    const parts = name.split("/");
-    if (parts.length === 2) {
-      callServer = parts[0];
-      callTool = parts[1];
-    } else {
-      callTool = name;
-    }
-  }
-
-  let matchesTool = true;
-  let matchesServer = true;
-
-  if (targetTool !== undefined) {
-    if (Array.isArray(targetTool)) {
-      matchesTool = targetTool.some(t => callTool === t || callTool.endsWith("/" + t) || name === t || name.endsWith("/" + t));
-    } else {
-      matchesTool = callTool === targetTool || callTool.endsWith("/" + targetTool) || name === targetTool || name.endsWith("/" + targetTool);
-    }
-  }
-  if (targetServer !== undefined) {
-    matchesServer = callServer === targetServer || name.startsWith(targetServer + "/") || name.includes("_" + targetServer + "_");
-  }
-
-  return matchesTool && matchesServer;
+export interface ListSessionsOptions {
+  projectPath?: string;
+  scope?: "workspace" | "all";
+  role?: string;
+  hasErrors?: boolean;
+  timeRange?: string; // "start:end" epoch ms
+  limit?: number;
+  sortBy?: "active" | "created";
 }
 
-const DB_DIR = path.join(os.homedir(), ".config", "chronicle-mcp");
-const DB_PATH = path.join(DB_DIR, "history.db");
-
-// Ensure directory exists
-if (!fs.existsSync(DB_DIR)) {
-  fs.mkdirSync(DB_DIR, { recursive: true });
+export interface GetTurnsOptions {
+  turnIndex?: number;
+  startTurn?: number;
+  endTurn?: number;
+  lastTurns?: number;
+  includeUndone?: boolean;
+  order?: "chronological" | "reverse_chronological";
+  limit?: number;
 }
 
-let dbInstance: DatabaseSync | null = null;
-
-export function setDb(db: DatabaseSync): void {
-  dbInstance = db;
+export interface GetStepsOptions {
+  turnIndex?: number;
+  stepIndex?: number;
+  category?: "user" | "agent" | "execution" | "system";
+  kind?: "mcp" | "command" | "native" | "subagent";
+  status?: "DONE" | "ERROR" | "PENDING";
+  toolName?: string | string[];
+  serverName?: string;
+  filePath?: string;
+  includeUndone?: boolean;
+  limit?: number;
 }
 
-export function getDb(): DatabaseSync {
-  if (dbInstance) {
-    return dbInstance;
-  }
+export interface VectorSearchResult {
+  sessionId: string;
+  turnIndex: number;
+  title: string;
+  role?: string;
+  projectPath?: string | null;
+  similarity: number;
+  userPrompt: string;
+  assistantSnippet: string;
+  createdAt: number;
+}
 
-  const db = new DatabaseSync(DB_PATH);
-  dbInstance = db;
-
-  // Check if session_chunks needs migration (missing UNIQUE constraint)
-  let needsMigration = false;
-  try {
-    const tableSqlRow = db.prepare(`
-      SELECT sql FROM sqlite_master WHERE type='table' AND name='session_chunks'
-    `).get() as { sql: string } | undefined;
-
-    if (tableSqlRow?.sql && !tableSqlRow.sql.includes("UNIQUE")) {
-      needsMigration = true;
-    }
-  } catch (e) {
-    // Table might not exist yet, which is fine
-    console.debug?.("[Chronicle MCP] Table check for migration failed:", e);
-  }
-
-  if (needsMigration) {
-    console.error("[Chronicle MCP] Upgrading session_chunks table schema to add UNIQUE constraint...");
-    db.exec(`
-      BEGIN TRANSACTION;
-      ALTER TABLE session_chunks RENAME TO session_chunks_old;
-      
-      CREATE TABLE session_chunks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        step_index INTEGER,
-        chunk_text TEXT NOT NULL,
-        chunk_vector TEXT NOT NULL,
-        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-        UNIQUE(session_id, step_index) ON CONFLICT IGNORE
-      );
-
-      INSERT OR IGNORE INTO session_chunks (session_id, step_index, chunk_text, chunk_vector)
-      SELECT session_id, step_index, chunk_text, chunk_vector FROM session_chunks_old;
-
-      DROP TABLE session_chunks_old;
-      COMMIT;
-    `);
-    console.error("[Chronicle MCP] Database upgrade completed successfully.");
-  }
-
-  // Initialize tables
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id TEXT PRIMARY KEY,
-      adapter TEXT NOT NULL,
-      title TEXT NOT NULL,
-      project_path TEXT,
-      created_at INTEGER,
-      last_active_at INTEGER,
-      first_prompt TEXT,
-      second_prompt TEXT,
-      summary_vector TEXT,
-      parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);
-
-    CREATE TABLE IF NOT EXISTS session_chunks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      step_index INTEGER,
-      chunk_text TEXT NOT NULL,
-      chunk_vector TEXT NOT NULL,
-      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-      UNIQUE(session_id, step_index) ON CONFLICT IGNORE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_chunks_session ON session_chunks(session_id);
-
-    CREATE TABLE IF NOT EXISTS session_steps (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      step_index INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      source TEXT NOT NULL,
-      status TEXT NOT NULL,
-      content TEXT,
-      thinking TEXT,
-      tool_calls TEXT,
-      created_at INTEGER,
-      FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-      UNIQUE(session_id, step_index) ON CONFLICT IGNORE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_steps_session ON session_steps(session_id);
-  `);
-
-  try {
-    db.exec("ALTER TABLE sessions ADD COLUMN parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL;");
-  } catch (e: any) {
-    if (!e?.message?.includes("duplicate column name")) {
-      console.debug?.("[Chronicle MCP] Alter table parent_id failed:", e);
-    }
-  }
-
-  try {
-    db.exec("ALTER TABLE sessions ADD COLUMN last_active_at INTEGER;");
-  } catch (e: any) {
-    if (!e?.message?.includes("duplicate column name")) {
-      console.debug?.("[Chronicle MCP] Alter table last_active_at failed:", e);
-    }
-  }
-
-  return db;
+export interface FTSSearchResult {
+  sessionId: string;
+  turnIndex: number;
+  title: string;
+  role?: string;
+  projectPath?: string | null;
+  rank: number;
+  userPrompt: string;
+  assistantSnippet: string;
+  createdAt: number;
 }
 
 export interface SessionEmbeddings {
@@ -172,7 +84,13 @@ export interface SessionEmbeddings {
   chunks: Map<number, number[]>; // maps stepIndex -> chunkVector
 }
 
-export type StepCategory = "conversation_steps" | "tool_calls" | "tool_results" | "thinking" | "system_events";
+export type StepCategory =
+  | "conversation_steps"
+  | "tool_calls"
+  | "tool_results"
+  | "thinking"
+  | "system_events";
+
 export type StepSortMode = "time_old_to_new" | "time_new_to_old" | "category";
 
 export interface QueryOptions {
@@ -214,31 +132,144 @@ export interface SearchResult {
   sessionId: string;
   adapter: string;
   title: string;
-  projectPath: string | null;
+  projectPath?: string | null;
   stepIndex: number | null;
   chunkText: string;
   similarity: number;
 }
 
 export interface HistoryStore {
-  save(session: SessionData, embeddings: SessionEmbeddings): void;
-  query(options: QueryOptions): QueryResult;
-  search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[];
-  getSessionRelationship(sessionId: string, maxDepth?: number, includeAncestors?: boolean): SessionRelationshipResult | null;
+  saveSession(
+    session: SessionData,
+    turns?: TurnData[],
+    steps?: StepData[]
+  ): void;
+  getSession(id: string): SessionData | null;
+  listSessions(options?: ListSessionsOptions): SessionData[];
+  getTurns(sessionId: string, options?: GetTurnsOptions): TurnData[];
+  getSteps(sessionId: string, options?: GetStepsOptions): StepData[];
+  getSessionRelationship(
+    sessionId: string,
+    maxDepth?: number,
+    includeAncestors?: boolean
+  ): SessionRelationshipResult | null;
+  getArtifacts(sessionId: string, includeSubtree?: boolean): string[];
+  searchTurnsVector(
+    queryVector: Float32Array | Buffer | number[],
+    limit: number,
+    options?: { projectPath?: string; scope?: "workspace" | "all" }
+  ): VectorSearchResult[];
+  searchTurnsFTS(
+    queryText: string,
+    limit: number,
+    options?: { projectPath?: string; scope?: "workspace" | "all" }
+  ): FTSSearchResult[];
   getActiveProjectPath(): string | undefined;
   close(): void;
+
+  /** @deprecated Transitional shim for S2 compatibility */
+  save(session: SessionData, embeddings?: SessionEmbeddings): void;
+  /** @deprecated Transitional shim for S2 compatibility */
+  query(options: QueryOptions): QueryResult;
+  /** @deprecated Transitional shim for S2 compatibility */
+  search(
+    queryVector: number[],
+    limit: number,
+    options?: { projectPath?: string; scope?: "workspace" | "all" }
+  ): SearchResult[];
 }
 
-function dotProduct(a: number[], b: number[]): number {
-  let val = 0;
-  const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    val += a[i] * b[i];
+// ============================================================
+// 2. Helper Functions
+// ============================================================
+
+function normalizeTurnVector(vector?: Float32Array | number[]): Buffer {
+  if (!vector || vector.length === 0) {
+    return vectorToBlob(new Float32Array(EMBEDDING_DIMENSION));
   }
-  return val;
+  if (vector.length === EMBEDDING_DIMENSION) {
+    return vectorToBlob(vector);
+  }
+  const padded = new Float32Array(EMBEDDING_DIMENSION);
+  padded.set(vector);
+  return vectorToBlob(padded);
 }
 
-function parseTimeRange(timeRange: string): { start: number | null; end: number | null } | null {
+function normalizeQueryVector(
+  queryVector: Float32Array | Buffer | number[]
+): Float32Array {
+  let floatVec: Float32Array;
+  if (queryVector instanceof Float32Array) {
+    floatVec = queryVector;
+  } else if (Buffer.isBuffer(queryVector)) {
+    floatVec = blobToVector(queryVector);
+  } else {
+    floatVec = new Float32Array(queryVector);
+  }
+
+  if (floatVec.length === EMBEDDING_DIMENSION) {
+    return floatVec;
+  }
+  const padded = new Float32Array(EMBEDDING_DIMENSION);
+  padded.set(floatVec);
+  return padded;
+}
+
+export function matchToolCall(
+  call: any,
+  targetServer?: string,
+  targetTool?: string | string[]
+): boolean {
+  const name = call.name || "";
+  let callServer = "";
+  let callTool = "";
+
+  if (name === "call_mcp_tool" && call.args) {
+    callServer = call.args.ServerName || "";
+    callTool = call.args.ToolName || "";
+  } else {
+    const parts = name.split("/");
+    if (parts.length === 2) {
+      callServer = parts[0];
+      callTool = parts[1];
+    } else {
+      callTool = name;
+    }
+  }
+
+  let matchesTool = true;
+  let matchesServer = true;
+
+  if (targetTool !== undefined) {
+    if (Array.isArray(targetTool)) {
+      matchesTool = targetTool.some(
+        (t) =>
+          callTool === t ||
+          callTool.endsWith("/" + t) ||
+          name === t ||
+          name.endsWith("/" + t)
+      );
+    } else {
+      matchesTool =
+        callTool === targetTool ||
+        callTool.endsWith("/" + targetTool) ||
+        name === targetTool ||
+        name.endsWith("/" + targetTool);
+    }
+  }
+  if (targetServer !== undefined) {
+    matchesServer =
+      callServer === targetServer ||
+      name.startsWith(targetServer + "/") ||
+      name.includes("_" + targetServer + "_");
+  }
+
+  return matchesTool && matchesServer;
+}
+
+export function parseTimeRange(
+  timeRange: string
+): { start: number | null; end: number | null } | null {
   const parts = timeRange.split(":");
   if (parts.length !== 2) return null;
   const parseVal = (val: string): number | null => {
@@ -259,107 +290,295 @@ function parseTimeRange(timeRange: string): { start: number | null; end: number 
   };
   return {
     start: parseVal(parts[0]),
-    end: parseVal(parts[1])
+    end: parseVal(parts[1]),
   };
 }
 
 export function isConversationStep(step: StepData): boolean {
-  if (step.type === "USER_INPUT") return true;
-  return !!(step.type === "PLANNER_RESPONSE" && step.content?.trim());
+  if (step.category === "user" || step.type === "USER_INPUT") return true;
+  return !!(
+    (step.category === "agent" || step.type === "PLANNER_RESPONSE") &&
+    step.content?.trim()
+  );
 }
 
-export function matchStepCategory(step: StepData, categories: StepCategory[]): boolean {
-  if (categories.includes("conversation_steps") && isConversationStep(step)) return true;
-  if (categories.includes("tool_calls") && step.toolCalls) return true;
-  if (categories.includes("tool_results") && (step.type === "MCP_TOOL" || step.type === "COMMAND" || step.source === "SYSTEM" || step.toolCalls)) return true;
-  if (categories.includes("thinking") && step.thinking && step.thinking.trim() !== "") return true;
-  if (categories.includes("system_events") && (step.type === "CHECKPOINT" || step.status === "ERROR" || step.type === "INVOKE_SUBAGENT" || step.source === "SYSTEM")) return true;
+export function matchStepCategory(
+  step: StepData,
+  categories: StepCategory[]
+): boolean {
+  if (categories.includes("conversation_steps") && isConversationStep(step))
+    return true;
+  if (
+    categories.includes("tool_calls") &&
+    (step.toolName || step.toolCalls || step.category === "execution")
+  )
+    return true;
+  if (
+    categories.includes("tool_results") &&
+    (step.kind === "mcp" ||
+      step.kind === "command" ||
+      step.type === "MCP_TOOL" ||
+      step.type === "COMMAND" ||
+      step.source === "SYSTEM" ||
+      step.toolResult)
+  )
+    return true;
+  if (
+    categories.includes("thinking") &&
+    step.thinking &&
+    step.thinking.trim() !== ""
+  )
+    return true;
+  if (
+    categories.includes("system_events") &&
+    (step.category === "system" ||
+      step.type === "CHECKPOINT" ||
+      step.status === "ERROR" ||
+      step.kind === "subagent" ||
+      step.type === "INVOKE_SUBAGENT" ||
+      step.source === "SYSTEM")
+  )
+    return true;
   return false;
 }
 
+// ============================================================
+// 3. Database Initialization & DDL
+// ============================================================
+
+const DB_DIR = path.join(os.homedir(), ".config", "chronicle-mcp");
+const DB_PATH = path.join(DB_DIR, "history.db");
+
+if (!fs.existsSync(DB_DIR)) {
+  fs.mkdirSync(DB_DIR, { recursive: true });
+}
+
+let dbInstance: DatabaseSync | null = null;
+
+export function setDb(db: DatabaseSync): void {
+  dbInstance = db;
+}
+
+let storeInstance: HistoryStore | null = null;
+
+export function setStore(store: HistoryStore): void {
+  storeInstance = store;
+}
+
+export function getStore(): HistoryStore {
+  if (storeInstance) {
+    return storeInstance;
+  }
+  storeInstance = new SqliteHistoryStore(DB_PATH);
+  return storeInstance;
+}
+
+export function initDatabaseSchema(db: DatabaseSync): void {
+  db.exec("PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA journal_mode = WAL;");
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      adapter TEXT NOT NULL,
+      title TEXT NOT NULL,
+      role TEXT,
+      project_path TEXT,
+      created_at INTEGER NOT NULL,
+      last_active_at INTEGER NOT NULL,
+      parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      root_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      depth INTEGER DEFAULT 0,
+      total_turns INTEGER DEFAULT 0,
+      total_steps INTEGER DEFAULT 0,
+      total_tokens INTEGER DEFAULT 0,
+      artifacts TEXT,
+      files_touched TEXT,
+      first_prompt TEXT,
+      metadata TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_role ON sessions(role);
+    CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
+    CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(last_active_at DESC);
+
+    CREATE TABLE IF NOT EXISTS transcript_turns (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      turn_index INTEGER NOT NULL,
+      user_prompt TEXT NOT NULL,
+      assistant_response TEXT,
+      turn_summary TEXT,
+      turn_text TEXT NOT NULL,
+      turn_vector BLOB NOT NULL,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      thinking_tokens INTEGER DEFAULT 0,
+      tool_count INTEGER DEFAULT 0,
+      error_count INTEGER DEFAULT 0,
+      duration_ms INTEGER DEFAULT 0,
+      is_undone INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      UNIQUE(session_id, turn_index, is_undone) ON CONFLICT REPLACE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_turns_session ON transcript_turns(session_id, turn_index);
+    CREATE INDEX IF NOT EXISTS idx_turns_undone ON transcript_turns(session_id, is_undone);
+    CREATE INDEX IF NOT EXISTS idx_turns_errors ON transcript_turns(session_id, error_count);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS transcript_turns_fts USING fts5(
+      user_prompt,
+      assistant_response,
+      turn_text,
+      content='transcript_turns',
+      content_rowid='id'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS trg_turns_ai AFTER INSERT ON transcript_turns BEGIN
+      INSERT INTO transcript_turns_fts(rowid, user_prompt, assistant_response, turn_text)
+      VALUES (new.id, new.user_prompt, new.assistant_response, new.turn_text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_turns_ad AFTER DELETE ON transcript_turns BEGIN
+      INSERT INTO transcript_turns_fts(transcript_turns_fts, rowid, user_prompt, assistant_response, turn_text)
+      VALUES ('delete', old.id, old.user_prompt, old.assistant_response, old.turn_text);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS trg_turns_au AFTER UPDATE ON transcript_turns BEGIN
+      INSERT INTO transcript_turns_fts(transcript_turns_fts, rowid, user_prompt, assistant_response, turn_text)
+      VALUES ('delete', old.id, old.user_prompt, old.assistant_response, old.turn_text);
+      INSERT INTO transcript_turns_fts(rowid, user_prompt, assistant_response, turn_text)
+      VALUES (new.id, new.user_prompt, new.assistant_response, new.turn_text);
+    END;
+
+    CREATE TABLE IF NOT EXISTS transcript_steps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      turn_index INTEGER NOT NULL,
+      step_index INTEGER NOT NULL,
+      step_order INTEGER NOT NULL,
+      category TEXT NOT NULL,
+      kind TEXT,
+      status TEXT NOT NULL,
+      content TEXT,
+      thinking TEXT,
+      tool_name TEXT,
+      server_name TEXT,
+      file_path TEXT,
+      exit_code INTEGER,
+      error_message TEXT,
+      tool_args TEXT,
+      tool_result TEXT,
+      tool_duration_ms INTEGER,
+      subagent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      created_at INTEGER NOT NULL,
+      is_undone INTEGER DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_steps_session_turn ON transcript_steps(session_id, turn_index, step_order);
+    CREATE INDEX IF NOT EXISTS idx_steps_category ON transcript_steps(session_id, category);
+    CREATE INDEX IF NOT EXISTS idx_steps_tool ON transcript_steps(tool_name, server_name);
+    CREATE INDEX IF NOT EXISTS idx_steps_filepath ON transcript_steps(file_path);
+    CREATE INDEX IF NOT EXISTS idx_steps_status ON transcript_steps(session_id, status);
+    CREATE INDEX IF NOT EXISTS idx_steps_subagent ON transcript_steps(subagent_session_id);
+  `);
+}
+
+export function getDb(): DatabaseSync {
+  if (dbInstance) {
+    return dbInstance;
+  }
+
+  const db = new DatabaseSync(DB_PATH);
+  initDatabaseSchema(db);
+  dbInstance = db;
+  return db;
+}
+
+// ============================================================
+// 4. In-Memory History Store (Test Double & Cache)
+// ============================================================
+
 export class InMemoryHistoryStore implements HistoryStore {
-  private readonly sessionsMap = new Map<string, Omit<SessionData, "chunks"> & { summary_vector?: number[] }>();
+  private readonly sessionsMap = new Map<string, SessionData>();
+  private readonly turnsMap = new Map<string, TurnData[]>();
   private readonly stepsMap = new Map<string, StepData[]>();
-  private readonly chunksMap = new Map<string, Array<ChunkData & { chunk_vector: number[] }>>();
 
-  private copyChunks(session: SessionData, embeddings: SessionEmbeddings, chunksByStepIndex: Map<number, ChunkData & { chunk_vector: number[] }>): Array<ChunkData & { chunk_vector: number[] }> {
-    const chunksCopy: Array<ChunkData & { chunk_vector: number[] }> = [];
-    const seenChunkIndexes = new Set<number>();
-    for (const chunk of session.chunks) {
-      if (seenChunkIndexes.has(chunk.stepIndex)) {
-        continue;
-      }
-      seenChunkIndexes.add(chunk.stepIndex);
-      
-      const existingChunk = chunksByStepIndex.get(chunk.stepIndex);
-      const vec = embeddings.chunks.get(chunk.stepIndex) || (existingChunk ? existingChunk.chunk_vector : []);
-      
-      chunksCopy.push({
-        stepIndex: chunk.stepIndex,
-        text: chunk.text,
-        chunk_vector: [...vec]
-      });
+  saveSession(
+    session: SessionData,
+    turns?: TurnData[],
+    steps?: StepData[]
+  ): void {
+    const sessionCopy: SessionData = {
+      ...session,
+      artifacts: session.artifacts ? [...session.artifacts] : [],
+      filesTouched: session.filesTouched ? [...session.filesTouched] : [],
+      metadata: session.metadata ? { ...session.metadata } : {},
+      turns: turns ? turns.map((t) => ({ ...t })) : [],
+      steps: steps ? steps.map((s) => ({ ...s })) : [],
+    };
+    this.sessionsMap.set(session.id, sessionCopy);
+
+    if (turns) {
+      this.turnsMap.set(
+        session.id,
+        turns.map((t) => {
+          let vec: Float32Array;
+          if (!t.turnVector || t.turnVector.length === 0) {
+            vec = new Float32Array(EMBEDDING_DIMENSION);
+          } else if (t.turnVector.length === EMBEDDING_DIMENSION) {
+            vec =
+              t.turnVector instanceof Float32Array
+                ? new Float32Array(t.turnVector)
+                : Float32Array.from(t.turnVector);
+          } else {
+            vec = new Float32Array(EMBEDDING_DIMENSION);
+            vec.set(t.turnVector);
+          }
+          return {
+            ...t,
+            turnVector: vec,
+          };
+        })
+      );
     }
-    return chunksCopy;
-  }
 
-  private copySteps(session: SessionData): StepData[] {
-    const stepsCopy: StepData[] = [];
-    if (session.steps) {
-      for (const step of session.steps) {
-        stepsCopy.push({
-          stepIndex: step.stepIndex,
-          type: step.type,
-          source: step.source,
-          status: step.status,
-          content: step.content,
-          thinking: step.thinking,
-          toolCalls: step.toolCalls,
-          createdAt: step.createdAt,
-          isUndone: step.isUndone,
-        });
-      }
+    if (steps) {
+      this.stepsMap.set(
+        session.id,
+        steps.map((s) => ({ ...s }))
+      );
     }
-    return stepsCopy;
-  }
 
-  private updateSubagents(subagentIds: string[], parentId: string): void {
-    for (const childId of subagentIds) {
-      const childSession = this.sessionsMap.get(childId);
-      if (childSession) {
-        (childSession as any).parentId = parentId;
-      }
-    }
-  }
-
-  private filterSessionsByTimeRange(sessions: any[], timeRange: string): any[] {
-    const range = parseTimeRange(timeRange);
-    if (!range) return sessions;
-    return sessions.filter(s => {
-      const activeTime = (s as any).lastActiveAt ?? s.createdAt;
-      if (range.start !== null && activeTime < range.start) return false;
-      if (range.end !== null && activeTime > range.end) return false;
-      return true;
-    });
-  }
-
-  private filterSessions(options: QueryOptions): any[] {
-    let matchedSessions = Array.from(this.sessionsMap.values());
-
-    if (options.sessionId !== undefined) {
-      matchedSessions = matchedSessions.filter(s => s.id === options.sessionId);
-    }
-    if (options.parentId !== undefined) {
-      if (options.parentId === "root" || options.parentId === "null" || options.parentId === null) {
-        matchedSessions = matchedSessions.filter(s => !s.parentId);
-      } else {
-        matchedSessions = matchedSessions.filter(s => s.parentId === options.parentId);
+    if (session.subagentIds && session.subagentIds.length > 0) {
+      for (const childId of session.subagentIds) {
+        const child = this.sessionsMap.get(childId);
+        if (child) {
+          child.parentId = session.id;
+        }
       }
     }
-    if (options.adapter !== undefined) {
-      matchedSessions = matchedSessions.filter(s => s.adapter === options.adapter);
+  }
+
+  getSession(id: string): SessionData | null {
+    const session = this.sessionsMap.get(id);
+    if (!session) return null;
+    return {
+      ...session,
+      turns: this.getTurns(id, { includeUndone: true }),
+      steps: this.getSteps(id, { includeUndone: true }),
+    };
+  }
+
+  listSessions(options: ListSessionsOptions = {}): SessionData[] {
+    let sessions = Array.from(this.sessionsMap.values());
+
+    if (options.role !== undefined) {
+      sessions = sessions.filter((s) => s.role === options.role);
     }
-    
+
     let resolvedProjectPath = options.projectPath;
     if (resolvedProjectPath === undefined && options.scope === "workspace") {
       resolvedProjectPath = this.getActiveProjectPath();
@@ -367,682 +586,639 @@ export class InMemoryHistoryStore implements HistoryStore {
 
     if (resolvedProjectPath !== undefined) {
       const pathFilter = resolvedProjectPath.toLowerCase();
-      matchedSessions = matchedSessions.filter(s => 
+      sessions = sessions.filter((s) =>
         s.projectPath?.toLowerCase().includes(pathFilter)
       );
     }
 
+    if (options.hasErrors === true) {
+      sessions = sessions.filter((s) => {
+        const turns = this.turnsMap.get(s.id) || [];
+        return turns.some((t) => (t.errorCount ?? 0) > 0);
+      });
+    }
+
     if (options.timeRange !== undefined) {
-      matchedSessions = this.filterSessionsByTimeRange(matchedSessions, options.timeRange);
+      const range = parseTimeRange(options.timeRange);
+      if (range) {
+        sessions = sessions.filter((s) => {
+          const activeTime = s.lastActiveAt ?? s.createdAt;
+          if (range.start !== null && activeTime < range.start) return false;
+          if (range.end !== null && activeTime > range.end) return false;
+          return true;
+        });
+      }
     }
 
     const sortBy = options.sortBy || "active";
-    matchedSessions.sort((a, b) => {
-      const timeA = sortBy === "created" ? a.createdAt : ((a as any).lastActiveAt ?? a.createdAt);
-      const timeB = sortBy === "created" ? b.createdAt : ((b as any).lastActiveAt ?? b.createdAt);
+    sessions.sort((a, b) => {
+      const timeA = sortBy === "created" ? a.createdAt : (a.lastActiveAt ?? a.createdAt);
+      const timeB = sortBy === "created" ? b.createdAt : (b.lastActiveAt ?? b.createdAt);
       return timeB - timeA;
     });
 
     if (options.limit !== undefined) {
-      matchedSessions = matchedSessions.slice(0, options.limit);
+      sessions = sessions.slice(0, options.limit);
     }
-    return matchedSessions;
+
+    return sessions.map((s) => ({ ...s }));
   }
 
-  private filterChunks(sessionIds: Set<string>, options: QueryOptions): ChunkData[] {
-    const matchedChunks: ChunkData[] = [];
-    for (const [sid, chunks] of this.chunksMap.entries()) {
-      if (!sessionIds.has(sid)) continue;
-      for (const chunk of chunks) {
-        if (options.startStep !== undefined && chunk.stepIndex < options.startStep) continue;
-        if (options.endStep !== undefined && chunk.stepIndex > options.endStep) continue;
-        matchedChunks.push({
-          stepIndex: chunk.stepIndex,
-          text: chunk.text
-        });
-      }
+  getTurns(sessionId: string, options: GetTurnsOptions = {}): TurnData[] {
+    let turns = (this.turnsMap.get(sessionId) || []).map((t) => ({ ...t }));
+
+    if (!options.includeUndone) {
+      turns = turns.filter((t) => !t.isUndone);
     }
-    return matchedChunks;
-  }
 
-  private matchStepQuery(step: StepData, query: string): boolean {
-    const contentMatch = step.content?.toLowerCase().includes(query);
-    const thinkingMatch = step.thinking?.toLowerCase().includes(query);
-    const toolCallsMatch = step.toolCalls?.toLowerCase().includes(query);
-    return !!(contentMatch || thinkingMatch || toolCallsMatch);
-  }
+    const maxTurnIndex = turns.length > 0 ? Math.max(...turns.map((t) => t.turnIndex)) : 0;
 
-  private matchStepTool(step: StepData, serverName?: string, toolName?: string | string[]): boolean {
-    if (!step.toolCalls) return false;
-    try {
-      const calls = JSON.parse(step.toolCalls);
-      if (!Array.isArray(calls)) return false;
-      return calls.some(call => matchToolCall(call, serverName, toolName));
-    } catch {
-      return false;
+    let targetTurn = options.turnIndex;
+    if (targetTurn !== undefined && targetTurn < 0) {
+      targetTurn = maxTurnIndex + 1 + targetTurn;
     }
+
+    let startTurn = options.startTurn;
+    if (startTurn !== undefined && startTurn < 0) {
+      startTurn = maxTurnIndex + 1 + startTurn;
+    }
+
+    let endTurn = options.endTurn;
+    if (endTurn !== undefined && endTurn < 0) {
+      endTurn = maxTurnIndex + 1 + endTurn;
+    }
+
+    if (targetTurn !== undefined) {
+      turns = turns.filter((t) => t.turnIndex === targetTurn);
+    }
+    if (startTurn !== undefined) {
+      turns = turns.filter((t) => t.turnIndex >= startTurn!);
+    }
+    if (endTurn !== undefined) {
+      turns = turns.filter((t) => t.turnIndex <= endTurn!);
+    }
+
+    turns.sort((a, b) => a.turnIndex - b.turnIndex);
+
+    if (options.lastTurns !== undefined && options.lastTurns > 0) {
+      turns = turns.slice(-options.lastTurns);
+    }
+
+    if (options.order === "reverse_chronological") {
+      turns.reverse();
+    }
+
+    if (options.limit !== undefined) {
+      turns = turns.slice(0, options.limit);
+    }
+
+    return turns;
   }
 
-  private isConversationStep(step: StepData): boolean {
-    return isConversationStep(step);
-  }
+  getSteps(sessionId: string, options: GetStepsOptions = {}): StepData[] {
+    let steps = (this.stepsMap.get(sessionId) || []).map((s) => ({ ...s }));
 
-  private matchStepQueryAndTool(step: StepData, options: QueryOptions): boolean {
-    if (options.stepQuery !== undefined && !this.matchStepQuery(step, options.stepQuery.toLowerCase())) return false;
+    if (!options.includeUndone) {
+      steps = steps.filter((s) => !s.isUndone);
+    }
+
+    if (options.turnIndex !== undefined) {
+      const turns = this.turnsMap.get(sessionId) || [];
+      const maxTurn = turns.length > 0 ? Math.max(...turns.map((t) => t.turnIndex)) : 0;
+      const resolvedTurn =
+        options.turnIndex < 0 ? maxTurn + 1 + options.turnIndex : options.turnIndex;
+      steps = steps.filter((s) => s.turnIndex === resolvedTurn);
+    }
+
+    if (options.stepIndex !== undefined) {
+      steps = steps.filter((s) => s.stepIndex === options.stepIndex);
+    }
+    if (options.category !== undefined) {
+      steps = steps.filter((s) => s.category === options.category);
+    }
+    if (options.kind !== undefined) {
+      steps = steps.filter((s) => s.kind === options.kind);
+    }
+    if (options.status !== undefined) {
+      steps = steps.filter((s) => s.status === options.status);
+    }
+    if (options.filePath !== undefined) {
+      const fp = options.filePath.toLowerCase();
+      steps = steps.filter((s) => s.filePath?.toLowerCase().includes(fp));
+    }
     if (options.toolName !== undefined || options.serverName !== undefined) {
-      if (!this.matchStepTool(step, options.serverName, options.toolName)) return false;
-    }
-    return true;
-  }
-
-  private matchStepCategory(step: StepData, categories: StepCategory[]): boolean {
-    return matchStepCategory(step, categories);
-  }
-
-  private matchStep(step: StepData, options: QueryOptions): boolean {
-    if (!options.includeUndone && step.isUndone) return false;
-    if (options.stepIndex !== undefined && step.stepIndex !== options.stepIndex) return false;
-    if (options.startStep !== undefined && step.stepIndex < options.startStep) return false;
-    if (options.endStep !== undefined && step.stepIndex > options.endStep) return false;
-    if (options.stepType !== undefined && step.type !== options.stepType) return false;
-    if (options.stepStatus !== undefined && step.status !== options.stepStatus) return false;
-    if (options.conversationStepsOnly && !this.isConversationStep(step)) return false;
-
-    if (options.categories && options.categories.length > 0) {
-      if (!this.matchStepCategory(step, options.categories)) return false;
-    }
-
-    return this.matchStepQueryAndTool(step, options);
-  }
-
-  private filterSteps(sessionIds: Set<string>, options: QueryOptions): StepData[] {
-    const matchedSteps: StepData[] = [];
-    if (!options.includeSteps) return matchedSteps;
-
-    for (const [sid, steps] of this.stepsMap.entries()) {
-      if (!sessionIds.has(sid)) continue;
-      const stepMap = options.includeToolResults ? new Map(steps.map(s => [s.stepIndex, s])) : null;
-      for (const step of steps) {
-        if (!this.matchStep(step, options)) continue;
-
-        const stepCopy: any = { ...step };
-        if (options.excludeContent) {
-          delete stepCopy.content;
-          delete stepCopy.thinking;
-        }
-        if (options.includeToolResults && step.toolCalls) {
-          const nextStep = stepMap?.get(step.stepIndex + 1);
-          if (nextStep && (nextStep.type === "MCP_TOOL" || nextStep.type === "COMMAND" || nextStep.source === "SYSTEM")) {
-            stepCopy.tool_result = {
-              step_index: nextStep.stepIndex,
-              type: nextStep.type,
-              source: nextStep.source,
-              status: nextStep.status,
-              content: nextStep.content ?? null
-            };
+      steps = steps.filter((s) => {
+        if (s.toolName) {
+          if (Array.isArray(options.toolName)) {
+            if (!options.toolName.includes(s.toolName)) return false;
+          } else if (options.toolName && s.toolName !== options.toolName) {
+            return false;
           }
         }
-        matchedSteps.push(stepCopy);
-      }
-    }
-    return matchedSteps;
-  }
-
-  save(session: SessionData, embeddings: SessionEmbeddings): void {
-    const sessionId = session.id;
-
-    let parentId = session.parentId || null;
-    if (!parentId) {
-      const existing = this.sessionsMap.get(sessionId);
-      if (existing && (existing as any).parentId) {
-        parentId = (existing as any).parentId;
-      }
-    }
-    
-    const existingSession = this.sessionsMap.get(sessionId);
-    let summaryVector = undefined;
-    if (embeddings.summary) {
-      summaryVector = [...embeddings.summary];
-    } else if (existingSession) {
-      summaryVector = (existingSession as any).summary_vector;
+        if (options.serverName && s.serverName !== options.serverName) {
+          return false;
+        }
+        return true;
+      });
     }
 
-    const stepTimestamps = (session.steps || []).map(s => s.createdAt).filter((t): t is number => t !== undefined);
-    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : (session.lastActiveAt ?? session.createdAt);
-
-    const sessionCopy = {
-      id: session.id,
-      adapter: session.adapter,
-      title: session.title,
-      projectPath: session.projectPath,
-      createdAt: session.createdAt,
-      lastActiveAt,
-      firstPrompt: session.firstPrompt,
-      secondPrompt: session.secondPrompt,
-      parentId,
-      subagentIds: session.subagentIds || [],
-      summary_vector: summaryVector
-    };
-
-    const existingChunks = this.chunksMap.get(sessionId) || [];
-    const chunksByStepIndex = new Map(existingChunks.map(c => [c.stepIndex, c]));
-    const chunksCopy = this.copyChunks(session, embeddings, chunksByStepIndex);
-    const stepsCopy = this.copySteps(session);
-
-    this.sessionsMap.set(sessionId, sessionCopy);
-    this.chunksMap.set(sessionId, chunksCopy);
-    this.stepsMap.set(sessionId, stepsCopy);
-
-    if (session.subagentIds && session.subagentIds.length > 0) {
-      this.updateSubagents(session.subagentIds, session.id);
-    }
-  }
-
-  private resolveConversationSteps(queryOpts: QueryOptions): void {
-    if (!queryOpts.sessionId) return;
-    if (queryOpts.startConversationStep === undefined && queryOpts.endConversationStep === undefined) return;
-
-    const steps = this.stepsMap.get(queryOpts.sessionId) || [];
-    const convSteps = steps
-      .filter(s => {
-        if (!queryOpts.includeUndone && s.isUndone) return false;
-        return s.type === "USER_INPUT" || (s.type === "PLANNER_RESPONSE" && s.content && s.content.trim() !== "");
-      })
-      .sort((a, b) => a.stepIndex - b.stepIndex);
-
-    if (queryOpts.startConversationStep !== undefined) {
-      const idx = queryOpts.startConversationStep - 1;
-      queryOpts.startStep = (idx >= 0 && idx < convSteps.length) ? convSteps[idx].stepIndex : Infinity;
-    }
-    if (queryOpts.endConversationStep !== undefined) {
-      const idx = queryOpts.endConversationStep - 1;
-      if (idx >= 0 && idx < convSteps.length) {
-        queryOpts.endStep = convSteps[idx].stepIndex;
-      } else if (idx < 0) {
-        queryOpts.endStep = -1;
-      }
-    }
-  }
-
-  query(options: QueryOptions): QueryResult {
-    const queryOpts = { ...options };
-    this.resolveConversationSteps(queryOpts);
-    const matchedSessions = this.filterSessions(queryOpts);
-    const sessionIds = new Set(matchedSessions.map(s => s.id));
-
-    const matchedChunks = this.filterChunks(sessionIds, queryOpts);
-    const matchedSteps = this.filterSteps(sessionIds, queryOpts);
-
-    if (queryOpts.reverseSteps) {
-      matchedSteps.reverse();
-      matchedChunks.reverse();
-    }
-
-    const childrenMap = new Map<string, string[]>();
-    for (const s of this.sessionsMap.values()) {
-      if (s.parentId) {
-        const list = childrenMap.get(s.parentId) || [];
-        list.push(s.id);
-        childrenMap.set(s.parentId, list);
-      }
-    }
-
-    const sessionsResult = matchedSessions.map(s => {
-      const sessionChunks = (this.chunksMap.get(s.id) || [])
-        .filter(c => {
-          if (queryOpts.startStep !== undefined && c.stepIndex < queryOpts.startStep) return false;
-          if (queryOpts.endStep !== undefined && c.stepIndex > queryOpts.endStep) return false;
-          return true;
-        })
-        .map(c => ({ stepIndex: c.stepIndex, text: c.text }));
-
-      if (queryOpts.reverseSteps) {
-        sessionChunks.reverse();
-      }
-
-      const sessionSteps = queryOpts.includeSteps ? (() => {
-        const steps = this.stepsMap.get(s.id) || [];
-        const stepMap = queryOpts.includeToolResults ? new Map(steps.map(st => [st.stepIndex, st])) : null;
-        return steps
-          .filter(step => this.matchStep(step, queryOpts))
-          .map(step => {
-            const stepCopy: any = { ...step };
-            if (queryOpts.excludeContent) {
-              delete stepCopy.content;
-              delete stepCopy.thinking;
-            }
-            if (queryOpts.includeToolResults && step.toolCalls) {
-              const nextStep = stepMap?.get(step.stepIndex + 1);
-              if (nextStep && (nextStep.type === "MCP_TOOL" || nextStep.type === "COMMAND" || nextStep.source === "SYSTEM")) {
-                stepCopy.tool_result = {
-                  step_index: nextStep.stepIndex,
-                  type: nextStep.type,
-                  source: nextStep.source,
-                  status: nextStep.status,
-                  content: nextStep.content ?? null
-                };
-              }
-            }
-            return stepCopy;
-          });
-      })() : undefined;
-
-      if (sessionSteps && queryOpts.reverseSteps) {
-        sessionSteps.reverse();
-      }
-
-      return {
-        id: s.id,
-        adapter: s.adapter,
-        title: s.title,
-        projectPath: s.projectPath,
-        createdAt: s.createdAt,
-        lastActiveAt: (s as any).lastActiveAt ?? s.createdAt,
-        firstPrompt: s.firstPrompt,
-        secondPrompt: s.secondPrompt,
-        parentId: s.parentId || null,
-        subagentIds: s.subagentIds || [],
-        childSessionIds: childrenMap.get(s.id) || [],
-        chunks: sessionChunks,
-        ...(sessionSteps === undefined ? {} : { steps: sessionSteps })
-      };
+    steps.sort((a, b) => {
+      const turnDiff = (a.turnIndex ?? 0) - (b.turnIndex ?? 0);
+      if (turnDiff !== 0) return turnDiff;
+      return (a.stepOrder ?? a.stepIndex) - (b.stepOrder ?? b.stepIndex);
     });
 
-    return {
-      sessions: sessionsResult,
-      steps: matchedSteps,
-      chunks: matchedChunks
-    };
+    if (options.limit !== undefined) {
+      steps = steps.slice(0, options.limit);
+    }
+
+    return steps;
   }
 
-  getSessionRelationship(sessionId: string, maxDepth = 2, includeAncestors = true): SessionRelationshipResult | null {
+  getSessionRelationship(
+    sessionId: string,
+    maxDepth = 10,
+    includeAncestors = true
+  ): SessionRelationshipResult | null {
     const currentSession = this.sessionsMap.get(sessionId);
     if (!currentSession) return null;
 
-    const getFinalOutput = (sessId: string): string | undefined => {
-      const steps = this.stepsMap.get(sessId);
-      if (!steps || steps.length === 0) return undefined;
-      for (let i = steps.length - 1; i >= 0; i--) {
-        const step = steps[i];
-        if ((step.type === "PLANNER_RESPONSE" || step.type === "MODEL_RESPONSE" || step.source === "MODEL") && step.content && step.content.trim() !== "") {
-          return step.content;
+    const buildNode = (s: SessionData, currentDepth: number): SessionRelationshipNode => {
+      const turns = this.turnsMap.get(s.id) || [];
+      const node: SessionRelationshipNode = {
+        id: s.id,
+        adapter: s.adapter,
+        title: s.title,
+        role: s.role,
+        projectPath: s.projectPath,
+        createdAt: s.createdAt,
+        lastActiveAt: s.lastActiveAt,
+        parentId: s.parentId,
+        rootId: s.rootId,
+        depth: currentDepth,
+        totalTurns: turns.length,
+        mandate: s.firstPrompt,
+        artifacts: s.artifacts ? [...s.artifacts] : [],
+      };
+
+      if (currentDepth < maxDepth) {
+        const directChildren = Array.from(this.sessionsMap.values()).filter(
+          (cand) => cand.parentId === s.id
+        );
+        if (directChildren.length > 0) {
+          node.children = directChildren.map((c) => buildNode(c, currentDepth + 1));
         }
       }
-      return undefined;
+      return node;
     };
-
-    const toNode = (s: any, depth?: number, children?: SessionRelationshipNode[]): SessionRelationshipNode => ({
-      id: s.id,
-      adapter: s.adapter,
-      title: s.title,
-      projectPath: s.projectPath,
-      createdAt: s.createdAt,
-      lastActiveAt: (s as any).lastActiveAt ?? s.createdAt,
-      parentId: s.parentId || null,
-      initialPrompt: s.firstPrompt || undefined,
-      finalOutput: getFinalOutput(s.id),
-      depth,
-      children
-    });
-
-    const current = toNode(currentSession, 0);
 
     const ancestors: SessionRelationshipNode[] = [];
+    let rootSessionId = currentSession.id;
+
     if (includeAncestors) {
-      const visited = new Set<string>([sessionId]);
-      let currParentId = currentSession.parentId;
-      const ancestorList: SessionRelationshipNode[] = [];
-      while (currParentId && !visited.has(currParentId)) {
-        visited.add(currParentId);
-        const parentSession = this.sessionsMap.get(currParentId);
-        if (!parentSession) break;
-        ancestorList.push(toNode(parentSession));
-        currParentId = parentSession.parentId;
+      let curParentId = currentSession.parentId;
+      let depthCounter = 1;
+      while (curParentId && depthCounter <= 10) {
+        const pSession = this.sessionsMap.get(curParentId);
+        if (!pSession) break;
+        ancestors.unshift({
+          id: pSession.id,
+          adapter: pSession.adapter,
+          title: pSession.title,
+          role: pSession.role,
+          projectPath: pSession.projectPath,
+          createdAt: pSession.createdAt,
+          lastActiveAt: pSession.lastActiveAt,
+          parentId: pSession.parentId,
+          rootId: pSession.rootId,
+          depth: depthCounter,
+          mandate: pSession.firstPrompt,
+          artifacts: pSession.artifacts ? [...pSession.artifacts] : [],
+        });
+        rootSessionId = pSession.id;
+        curParentId = pSession.parentId;
+        depthCounter++;
       }
-      ancestorList.reverse();
-      ancestors.push(...ancestorList);
     }
 
-    const rootSessionId = ancestors.length > 0 ? ancestors[0].id : currentSession.id;
-    const parent = ancestors.at(-1) ?? null;
+    const parentNode =
+      currentSession.parentId && this.sessionsMap.get(currentSession.parentId)
+        ? buildNode(this.sessionsMap.get(currentSession.parentId)!, 0)
+        : null;
 
-    let siblings: SessionRelationshipNode[] = [];
-    if (currentSession.parentId) {
-      siblings = Array.from(this.sessionsMap.values())
-        .filter(s => s.parentId === currentSession.parentId && s.id !== currentSession.id)
-        .map(s => toNode(s));
-    }
+    const directChildren = Array.from(this.sessionsMap.values()).filter(
+      (s) => s.parentId === currentSession.id
+    );
+    const childrenNodes = directChildren.map((c) => buildNode(c, 1));
 
-    const targetMaxDepth = Math.min(Math.max(maxDepth, 1), 10);
-    const visitedChildren = new Set<string>([sessionId]);
-
-    const buildChildTree = (parentId: string, depth: number): SessionRelationshipNode[] => {
-      if (depth > targetMaxDepth) return [];
-      const directChildren = Array.from(this.sessionsMap.values()).filter(s => s.parentId === parentId);
-      const nodes: SessionRelationshipNode[] = [];
-      for (const child of directChildren) {
-        if (visitedChildren.has(child.id)) continue;
-        visitedChildren.add(child.id);
-        const subChildren = buildChildTree(child.id, depth + 1);
-        nodes.push(toNode(child, depth, subChildren.length > 0 ? subChildren : undefined));
-      }
-      return nodes;
-    };
-
-    const children = buildChildTree(sessionId, 1);
+    const siblings = currentSession.parentId
+      ? Array.from(this.sessionsMap.values())
+          .filter((s) => s.parentId === currentSession.parentId && s.id !== currentSession.id)
+          .map((s) => buildNode(s, 0))
+      : [];
 
     return {
-      sessionId,
+      sessionId: currentSession.id,
       rootSessionId,
-      parent,
+      parent: parentNode,
       ancestors,
-      current,
-      children,
-      siblings
+      current: buildNode(currentSession, 0),
+      children: childrenNodes,
+      siblings,
     };
   }
 
-  search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[] {
-    let candidateSessions = Array.from(this.sessionsMap.values()).filter(s => s.summary_vector !== undefined);
-    
-    let resolvedProjectPath = options?.projectPath;
-    if (resolvedProjectPath === undefined && options?.scope === "workspace") {
+  getArtifacts(sessionId: string, includeSubtree = false): string[] {
+    const session = this.sessionsMap.get(sessionId);
+    if (!session) return [];
+
+    const artifacts = new Set<string>(session.artifacts || []);
+
+    if (includeSubtree) {
+      const gatherChildren = (parentId: string, depth: number) => {
+        if (depth > 10) return;
+        const children = Array.from(this.sessionsMap.values()).filter(
+          (s) => s.parentId === parentId
+        );
+        for (const child of children) {
+          if (child.artifacts) {
+            for (const a of child.artifacts) {
+              artifacts.add(a);
+            }
+          }
+          gatherChildren(child.id, depth + 1);
+        }
+      };
+      gatherChildren(sessionId, 1);
+    }
+
+    return Array.from(artifacts);
+  }
+
+  searchTurnsVector(
+    queryVector: Float32Array | Buffer | number[],
+    limit: number,
+    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+  ): VectorSearchResult[] {
+    const floatVec = normalizeQueryVector(queryVector);
+
+    let resolvedProjectPath = options.projectPath;
+    if (resolvedProjectPath === undefined && options.scope === "workspace") {
       resolvedProjectPath = this.getActiveProjectPath();
     }
 
-    if (resolvedProjectPath) {
-      const pathFilter = resolvedProjectPath.toLowerCase();
-      candidateSessions = candidateSessions.filter(s => 
-        s.projectPath?.toLowerCase().includes(pathFilter)
-      );
-    }
+    const results: VectorSearchResult[] = [];
 
-    const scoredSessions = candidateSessions.map(s => {
-      const sim = dotProduct(queryVector, s.summary_vector!);
-      return { id: s.id, similarity: sim, session: s };
-    });
+    for (const [sid, turns] of this.turnsMap.entries()) {
+      const session = this.sessionsMap.get(sid);
+      if (!session) continue;
 
-    scoredSessions.sort((a, b) => b.similarity - a.similarity);
-    const topSessions = scoredSessions.slice(0, 5);
-    const topSessionIds = new Set(topSessions.map(s => s.id));
+      if (resolvedProjectPath !== undefined) {
+        if (
+          !session.projectPath ||
+          !session.projectPath.toLowerCase().includes(resolvedProjectPath.toLowerCase())
+        ) {
+          continue;
+        }
+      }
 
-    if (topSessions.length === 0) {
-      return [];
-    }
+      for (const turn of turns) {
+        if (turn.isUndone) continue;
+        if (!turn.turnVector) continue;
+        const tVec =
+          turn.turnVector instanceof Float32Array
+            ? turn.turnVector
+            : Float32Array.from(turn.turnVector as number[]);
+        const similarity = cosineSimilarityFloat32(floatVec, tVec);
 
-    const candidateChunks: SearchResult[] = [];
-    for (const [sid, chunks] of this.chunksMap.entries()) {
-      if (!topSessionIds.has(sid)) continue;
-      const session = this.sessionsMap.get(sid)!;
-      for (const chunk of chunks) {
-        const sim = dotProduct(queryVector, chunk.chunk_vector);
-        candidateChunks.push({
+        results.push({
           sessionId: sid,
-          adapter: session.adapter,
+          turnIndex: turn.turnIndex,
           title: session.title,
+          role: session.role,
           projectPath: session.projectPath,
-          stepIndex: chunk.stepIndex,
-          chunkText: chunk.text,
-          similarity: sim
+          similarity,
+          userPrompt: turn.userPrompt,
+          assistantSnippet: (turn.assistantResponse || "").slice(0, 200),
+          createdAt: turn.createdAt ?? session.createdAt,
         });
       }
     }
 
-    candidateChunks.sort((a, b) => b.similarity - a.similarity);
-    return candidateChunks.slice(0, limit);
+    results.sort((a, b) => b.similarity - a.similarity);
+    return results.slice(0, limit);
+  }
+
+  searchTurnsFTS(
+    queryText: string,
+    limit: number,
+    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+  ): FTSSearchResult[] {
+    const query = queryText.toLowerCase();
+    let resolvedProjectPath = options.projectPath;
+    if (resolvedProjectPath === undefined && options.scope === "workspace") {
+      resolvedProjectPath = this.getActiveProjectPath();
+    }
+
+    const results: FTSSearchResult[] = [];
+
+    for (const [sid, turns] of this.turnsMap.entries()) {
+      const session = this.sessionsMap.get(sid);
+      if (!session) continue;
+
+      if (resolvedProjectPath !== undefined) {
+        if (
+          !session.projectPath ||
+          !session.projectPath.toLowerCase().includes(resolvedProjectPath.toLowerCase())
+        ) {
+          continue;
+        }
+      }
+
+      for (const turn of turns) {
+        if (turn.isUndone) continue;
+        const promptMatch = turn.userPrompt?.toLowerCase().includes(query);
+        const respMatch = turn.assistantResponse?.toLowerCase().includes(query);
+        const textMatch = turn.turnText?.toLowerCase().includes(query);
+
+        if (promptMatch || respMatch || textMatch) {
+          results.push({
+            sessionId: sid,
+            turnIndex: turn.turnIndex,
+            title: session.title,
+            role: session.role,
+            projectPath: session.projectPath,
+            rank: -1,
+            userPrompt: turn.userPrompt,
+            assistantSnippet: (turn.assistantResponse || "").slice(0, 200),
+            createdAt: turn.createdAt ?? session.createdAt,
+          });
+        }
+      }
+    }
+
+    return results.slice(0, limit);
   }
 
   getActiveProjectPath(): string | undefined {
-    const sessions = Array.from(this.sessionsMap.values())
-      .filter(s => s.projectPath)
-      .sort((a, b) => b.createdAt - a.createdAt);
-    return sessions[0]?.projectPath || undefined;
+    let mostRecentTime = -1;
+    let mostRecentPath: string | undefined = undefined;
+
+    for (const session of this.sessionsMap.values()) {
+      if (!session.projectPath) continue;
+      const sessionTime = session.lastActiveAt ?? session.createdAt;
+      if (sessionTime > mostRecentTime) {
+        mostRecentTime = sessionTime;
+        mostRecentPath = session.projectPath;
+      }
+    }
+    return mostRecentPath;
   }
 
   close(): void {
     // No-op for in-memory store
   }
+
+  // ============================================================
+  // Transitional Shims for S2 Compatibility
+  // ============================================================
+
+  save(session: SessionData, embeddings?: SessionEmbeddings): void {
+    const turns: TurnData[] = [];
+    const steps: StepData[] = session.steps || [];
+
+    if (session.chunks && session.chunks.length > 0) {
+      let idx = 1;
+      for (const chunk of session.chunks) {
+        const vec = embeddings?.chunks.get(chunk.stepIndex);
+        turns.push({
+          turnIndex: idx++,
+          userPrompt: chunk.text,
+          assistantResponse: "",
+          turnText: chunk.text,
+          turnVector: vec ? Float32Array.from(vec) : new Float32Array(EMBEDDING_DIMENSION),
+        });
+      }
+    }
+
+    this.saveSession(session, turns, steps);
+  }
+
+  query(options: QueryOptions): QueryResult {
+    const sessions = this.listSessions({
+      projectPath: options.projectPath,
+      scope: options.scope,
+      timeRange: options.timeRange,
+      limit: options.limit,
+      sortBy: options.sortBy,
+    });
+
+    const sessionIds = new Set(sessions.map((s) => s.id));
+    let matchedSteps: StepData[] = [];
+    const matchedChunks: ChunkData[] = [];
+
+    for (const sid of sessionIds) {
+      const sSteps = this.getSteps(sid, {
+        stepIndex: options.stepIndex,
+        category: options.categories ? undefined : undefined,
+        status: options.stepStatus as any,
+        includeUndone: options.includeUndone,
+      });
+      matchedSteps = matchedSteps.concat(sSteps);
+    }
+
+    return {
+      sessions,
+      steps: matchedSteps,
+      chunks: matchedChunks,
+    };
+  }
+
+  search(
+    queryVector: number[],
+    limit: number,
+    options?: { projectPath?: string; scope?: "workspace" | "all" }
+  ): SearchResult[] {
+    const results = this.searchTurnsVector(queryVector, limit, options);
+    return results.map((r) => ({
+      sessionId: r.sessionId,
+      adapter: "antigravity",
+      title: r.title,
+      projectPath: r.projectPath,
+      stepIndex: r.turnIndex,
+      chunkText: r.userPrompt,
+      similarity: r.similarity,
+    }));
+  }
 }
+
+// ============================================================
+// 5. SQLite History Store (Production Relational Engine)
+// ============================================================
 
 export class SqliteHistoryStore implements HistoryStore {
   private readonly db: DatabaseSync;
+
   constructor(dbPath: string) {
     this.db = new DatabaseSync(dbPath);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        adapter TEXT NOT NULL,
-        title TEXT NOT NULL,
-        project_path TEXT,
-        created_at INTEGER,
-        last_active_at INTEGER,
-        first_prompt TEXT,
-        second_prompt TEXT,
-        summary_vector TEXT,
-        parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS session_chunks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        step_index INTEGER,
-        chunk_text TEXT NOT NULL,
-        chunk_vector TEXT NOT NULL,
-        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-        UNIQUE(session_id, step_index) ON CONFLICT IGNORE
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_chunks_session ON session_chunks(session_id);
-
-      CREATE TABLE IF NOT EXISTS session_steps (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        step_index INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        source TEXT NOT NULL,
-        status TEXT NOT NULL,
-        content TEXT,
-        thinking TEXT,
-        tool_calls TEXT,
-        created_at INTEGER,
-        is_undone INTEGER DEFAULT 0,
-        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_steps_session ON session_steps(session_id);
-    `);
-
-    try {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL;");
-    } catch (e: any) {
-      if (!e?.message?.includes("duplicate column name")) {
-        console.debug?.("[Chronicle MCP] parent_id alter table failed:", e);
-      }
-    }
-
-    try {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN last_active_at INTEGER;");
-    } catch (e: any) {
-      if (!e?.message?.includes("duplicate column name")) {
-        console.debug?.("[Chronicle MCP] last_active_at alter table failed:", e);
-      }
-    }
-
-    try {
-      this.db.exec("ALTER TABLE session_steps ADD COLUMN is_undone INTEGER DEFAULT 0;");
-    } catch (e: any) {
-      if (!e?.message?.includes("duplicate column name")) {
-        console.debug?.("[Chronicle MCP] is_undone alter table failed:", e);
-      }
-    }
-
-    try {
-      const stepTableSql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='session_steps'").get() as { sql: string } | undefined)?.sql || "";
-      if (stepTableSql.includes("UNIQUE(session_id, step_index)")) {
-        console.error("[Chronicle MCP] Migrating session_steps table to remove legacy UNIQUE constraint...");
-        this.db.exec("PRAGMA foreign_keys=OFF;");
-        try {
-          this.db.exec(`
-            BEGIN TRANSACTION;
-            CREATE TABLE session_steps_new (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              session_id TEXT NOT NULL,
-              step_index INTEGER NOT NULL,
-              type TEXT NOT NULL,
-              source TEXT NOT NULL,
-              status TEXT NOT NULL,
-              content TEXT,
-              thinking TEXT,
-              tool_calls TEXT,
-              created_at INTEGER,
-              is_undone INTEGER DEFAULT 0,
-              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            INSERT INTO session_steps_new (id, session_id, step_index, type, source, status, content, thinking, tool_calls, created_at, is_undone)
-            SELECT id, session_id, step_index, type, source, status, content, thinking, tool_calls, created_at, COALESCE(is_undone, 0) FROM session_steps;
-            DROP TABLE session_steps;
-            ALTER TABLE session_steps_new RENAME TO session_steps;
-            CREATE INDEX IF NOT EXISTS idx_steps_session ON session_steps(session_id);
-            COMMIT;
-          `);
-        } finally {
-          this.db.exec("PRAGMA foreign_keys=ON;");
-        }
-      }
-    } catch (e) {
-      console.debug?.("[Chronicle MCP] session_steps unique constraint migration failed:", e);
-    }
-
-    try {
-      this.db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);");
-    } catch (e) {
-      // Ignore error if column/index already exists
-      console.debug?.("[Chronicle MCP] idx_sessions_parent create index failed:", e);
-    }
+    initDatabaseSchema(this.db);
   }
 
-  private filterAndPushStep(row: any, options: QueryOptions, stepsBySession: Map<string, StepData[]>, stepsResult: StepData[]): void {
-    if (!options.includeUndone && row.is_undone) {
-      return;
-    }
-
-    if (options.conversationStepsOnly && row.type !== "USER_INPUT" && !(row.type === "PLANNER_RESPONSE" && row.content && row.content.trim() !== "")) {
-      return;
-    }
-
-    const step: StepData = {
-      stepIndex: row.step_index,
-      type: row.type,
-      source: row.source,
-      status: row.status,
-      content: row.content ?? undefined,
-      thinking: row.thinking ?? undefined,
-      toolCalls: row.tool_calls ?? undefined,
-      createdAt: row.created_at ?? undefined,
-      isUndone: row.is_undone === 1,
-      ...(row.tool_result ? { tool_result: row.tool_result } : {}) as any
-    };
-
-    if (options.categories && options.categories.length > 0) {
-      if (!matchStepCategory(step, options.categories)) return;
-    }
-
-    if (options.toolName !== undefined || options.serverName !== undefined) {
-      if (!step.toolCalls) return;
-      try {
-        const calls = JSON.parse(step.toolCalls);
-        if (!Array.isArray(calls)) return;
-        const isMatch = calls.some(call => matchToolCall(call, options.serverName, options.toolName));
-        if (!isMatch) return;
-      } catch {
-        return;
-      }
-    }
-
-    const sList = stepsBySession.get(row.session_id) || [];
-    sList.push(step);
-    stepsBySession.set(row.session_id, sList);
-    stepsResult.push(step);
-  }
-
-  save(session: SessionData, embeddings: SessionEmbeddings): void {
+  saveSession(
+    session: SessionData,
+    turns?: TurnData[],
+    steps?: StepData[]
+  ): void {
     const db = this.db;
     db.exec("BEGIN TRANSACTION;");
     try {
       let parentId = session.parentId || null;
       if (!parentId) {
-        const existing = db.prepare("SELECT parent_id FROM sessions WHERE id = ?").get(session.id) as { parent_id: string | null } | undefined;
+        const existing = db
+          .prepare("SELECT parent_id FROM sessions WHERE id = ?")
+          .get(session.id) as { parent_id: string | null } | undefined;
         if (existing) {
           parentId = existing.parent_id;
         }
       }
 
-      const stepTimestamps = (session.steps || []).map(s => s.createdAt).filter((t): t is number => t !== undefined);
-      const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : (session.lastActiveAt ?? session.createdAt);
+      let rootId = session.rootId || null;
+      if (!rootId && parentId) {
+        const parentRow = db
+          .prepare("SELECT root_id FROM sessions WHERE id = ?")
+          .get(parentId) as { root_id: string | null } | undefined;
+        rootId = parentRow?.root_id || parentId;
+      }
 
-      const summaryStr = embeddings.summary ? JSON.stringify(embeddings.summary) : null;
+      const stepTimestamps = (steps || session.steps || [])
+        .map((s) => s.createdAt)
+        .filter((t): t is number => t !== undefined);
+      const lastActiveAt =
+        stepTimestamps.length > 0
+          ? Math.max(...stepTimestamps)
+          : session.lastActiveAt ?? session.createdAt;
+
+      const artifactsJson = session.artifacts ? JSON.stringify(session.artifacts) : null;
+      const filesTouchedJson = session.filesTouched
+        ? JSON.stringify(session.filesTouched)
+        : null;
+      const metadataJson = session.metadata ? JSON.stringify(session.metadata) : null;
+
+      const totalTurns = turns ? turns.length : session.totalTurns ?? 0;
+      const totalSteps = steps ? steps.length : session.totalSteps ?? 0;
+
       db.prepare(`
-        INSERT INTO sessions (id, adapter, title, project_path, created_at, last_active_at, first_prompt, second_prompt, summary_vector, parent_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sessions (
+          id, adapter, title, role, project_path, created_at, last_active_at,
+          parent_id, root_id, depth, total_turns, total_steps, total_tokens,
+          artifacts, files_touched, first_prompt, metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
+          role = COALESCE(excluded.role, role),
           project_path = excluded.project_path,
           created_at = excluded.created_at,
           last_active_at = excluded.last_active_at,
+          parent_id = COALESCE(excluded.parent_id, parent_id),
+          root_id = COALESCE(excluded.root_id, root_id),
+          depth = excluded.depth,
+          total_turns = excluded.total_turns,
+          total_steps = excluded.total_steps,
+          total_tokens = excluded.total_tokens,
+          artifacts = COALESCE(excluded.artifacts, artifacts),
+          files_touched = COALESCE(excluded.files_touched, files_touched),
           first_prompt = excluded.first_prompt,
-          second_prompt = excluded.second_prompt,
-          summary_vector = COALESCE(excluded.summary_vector, summary_vector),
-          parent_id = COALESCE(excluded.parent_id, parent_id)
+          metadata = COALESCE(excluded.metadata, metadata)
       `).run(
         session.id,
         session.adapter,
         session.title,
-        session.projectPath,
+        session.role ?? null,
+        session.projectPath ?? null,
         session.createdAt,
         lastActiveAt,
+        parentId,
+        rootId,
+        session.depth ?? 0,
+        totalTurns,
+        totalSteps,
+        session.totalTokens ?? 0,
+        artifactsJson,
+        filesTouchedJson,
         session.firstPrompt,
-        session.secondPrompt,
-        summaryStr,
-        parentId
+        metadataJson
       );
 
-      const existingChunksRows = db.prepare("SELECT step_index, chunk_vector FROM session_chunks WHERE session_id = ?").all(session.id) as { step_index: number; chunk_vector: string }[];
-      const existingVectors = new Map<number, string>(existingChunksRows.map(r => [r.step_index, r.chunk_vector]));
+      if (turns && turns.length > 0) {
+        db.prepare("DELETE FROM transcript_turns WHERE session_id = ?").run(session.id);
 
-      db.prepare("DELETE FROM session_steps WHERE session_id = ?").run(session.id);
-      db.prepare("DELETE FROM session_chunks WHERE session_id = ?").run(session.id);
+        const insertTurn = db.prepare(`
+          INSERT INTO transcript_turns (
+            session_id, turn_index, user_prompt, assistant_response, turn_summary,
+            turn_text, turn_vector, input_tokens, output_tokens, thinking_tokens,
+            tool_count, error_count, duration_ms, is_undone, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
 
-      const insertChunk = db.prepare(`
-        INSERT INTO session_chunks (session_id, step_index, chunk_text, chunk_vector)
-        VALUES (?, ?, ?, ?)
-      `);
-      for (const chunk of session.chunks) {
-        let vecStr = "[]";
-        const newVec = embeddings.chunks.get(chunk.stepIndex);
-        if (newVec) {
-          vecStr = JSON.stringify(newVec);
-        } else if (existingVectors.has(chunk.stepIndex)) {
-          vecStr = existingVectors.get(chunk.stepIndex)!;
+        for (const turn of turns) {
+          const vectorBlob = normalizeTurnVector(turn.turnVector);
+
+          insertTurn.run(
+            session.id,
+            turn.turnIndex,
+            turn.userPrompt,
+            turn.assistantResponse ?? null,
+            turn.turnSummary ?? null,
+            turn.turnText,
+            vectorBlob,
+            turn.inputTokens ?? 0,
+            turn.outputTokens ?? 0,
+            turn.thinkingTokens ?? 0,
+            turn.toolCount ?? 0,
+            turn.errorCount ?? 0,
+            turn.durationMs ?? 0,
+            turn.isUndone ? 1 : 0,
+            turn.createdAt ?? session.createdAt
+          );
         }
-        insertChunk.run(session.id, chunk.stepIndex, chunk.text, vecStr);
       }
 
-      if (session.steps) {
+      if (steps && steps.length > 0) {
+        db.prepare("DELETE FROM transcript_steps WHERE session_id = ?").run(session.id);
+
         const insertStep = db.prepare(`
-          INSERT INTO session_steps (session_id, step_index, type, source, status, content, thinking, tool_calls, created_at, is_undone)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO transcript_steps (
+            session_id, turn_index, step_index, step_order, category, kind,
+            status, content, thinking, tool_name, server_name, file_path,
+            exit_code, error_message, tool_args, tool_result, tool_duration_ms,
+            subagent_session_id, created_at, is_undone
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        for (const step of session.steps) {
+
+        for (const step of steps) {
           insertStep.run(
             session.id,
+            step.turnIndex ?? 1,
             step.stepIndex,
-            step.type,
-            step.source,
+            step.stepOrder ?? step.stepIndex,
+            step.category ?? "agent",
+            step.kind ?? null,
             step.status,
             step.content ?? null,
             step.thinking ?? null,
-            step.toolCalls ?? null,
-            step.createdAt ?? null,
+            step.toolName ?? null,
+            step.serverName ?? null,
+            step.filePath ?? null,
+            step.exitCode ?? null,
+            step.errorMessage ?? null,
+            step.toolArgs ?? null,
+            step.toolResult ?? null,
+            step.toolDurationMs ?? null,
+            step.subagentSessionId ?? null,
+            step.createdAt ?? session.createdAt,
             step.isUndone ? 1 : 0
           );
         }
@@ -1051,8 +1227,7 @@ export class SqliteHistoryStore implements HistoryStore {
       if (session.subagentIds && session.subagentIds.length > 0) {
         const updateChild = db.prepare("UPDATE sessions SET parent_id = ? WHERE id = ?");
         for (const childId of session.subagentIds) {
-          const res = updateChild.run(session.id, childId);
-          console.error(`[DEBUG] UPDATE childId=${childId} parentId=${session.id} changes=${res.changes}`);
+          updateChild.run(session.id, childId);
         }
       }
 
@@ -1063,51 +1238,71 @@ export class SqliteHistoryStore implements HistoryStore {
     }
   }
 
-  private buildSessionQueryTimeRange(where: string[], params: any[], timeRange: string): void {
-    const range = parseTimeRange(timeRange);
-    if (!range) return;
-    if (range.start !== null) {
-      where.push("COALESCE(last_active_at, created_at) >= ?");
-      params.push(range.start);
-    }
-    if (range.end !== null) {
-      where.push("COALESCE(last_active_at, created_at) <= ?");
-      params.push(range.end);
-    }
+  getSession(id: string): SessionData | null {
+    const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as any;
+    if (!row) return null;
+
+    return {
+      id: row.id,
+      adapter: row.adapter,
+      title: row.title,
+      role: row.role ?? undefined,
+      projectPath: row.project_path,
+      createdAt: row.created_at,
+      lastActiveAt: row.last_active_at,
+      parentId: row.parent_id,
+      rootId: row.root_id,
+      depth: row.depth,
+      totalTurns: row.total_turns,
+      totalSteps: row.total_steps,
+      totalTokens: row.total_tokens,
+      artifacts: row.artifacts ? JSON.parse(row.artifacts) : [],
+      filesTouched: row.files_touched ? JSON.parse(row.files_touched) : [],
+      firstPrompt: row.first_prompt,
+      metadata: row.metadata ? JSON.parse(row.metadata) : {},
+      turns: this.getTurns(id, { includeUndone: true }),
+      steps: this.getSteps(id, { includeUndone: true }),
+    };
   }
 
-  private buildSessionQuery(options: QueryOptions, params: any[]): string {
-    let sql = `SELECT id, adapter, title, project_path, created_at, last_active_at, first_prompt, second_prompt, parent_id FROM sessions`;
+  listSessions(options: ListSessionsOptions = {}): SessionData[] {
+    let sql = `SELECT * FROM sessions`;
     const where: string[] = [];
+    const params: any[] = [];
 
-    if (options.sessionId !== undefined) {
-      where.push("id = ?");
-      params.push(options.sessionId);
+    if (options.role !== undefined) {
+      where.push("role = ?");
+      params.push(options.role);
     }
-    if (options.parentId !== undefined) {
-      if (options.parentId === "root" || options.parentId === "null" || options.parentId === null) {
-        where.push("parent_id IS NULL");
-      } else {
-        where.push("parent_id = ?");
-        params.push(options.parentId);
-      }
-    }
-    if (options.adapter !== undefined) {
-      where.push("adapter = ?");
-      params.push(options.adapter);
-    }
+
     let resolvedProjectPath = options.projectPath;
     if (resolvedProjectPath === undefined && options.scope === "workspace") {
       resolvedProjectPath = this.getActiveProjectPath();
     }
 
     if (resolvedProjectPath !== undefined) {
-      where.push("project_path LIKE ?");
-      params.push(`%${resolvedProjectPath}%`);
+      where.push("LOWER(project_path) LIKE ?");
+      params.push(`%${resolvedProjectPath.toLowerCase()}%`);
+    }
+
+    if (options.hasErrors === true) {
+      where.push(
+        "EXISTS (SELECT 1 FROM transcript_turns WHERE session_id = sessions.id AND error_count > 0)"
+      );
     }
 
     if (options.timeRange !== undefined) {
-      this.buildSessionQueryTimeRange(where, params, options.timeRange);
+      const range = parseTimeRange(options.timeRange);
+      if (range) {
+        if (range.start !== null) {
+          where.push("last_active_at >= ?");
+          params.push(range.start);
+        }
+        if (range.end !== null) {
+          where.push("last_active_at <= ?");
+          params.push(range.end);
+        }
+      }
     }
 
     if (where.length > 0) {
@@ -1115,396 +1310,543 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     const sortBy = options.sortBy || "active";
-    const orderCol = sortBy === "created" ? "created_at" : "COALESCE(last_active_at, created_at)";
-    sql += ` ORDER BY ${orderCol} DESC`;
+    sql += sortBy === "created" ? " ORDER BY created_at DESC" : " ORDER BY last_active_at DESC";
 
     if (options.limit !== undefined) {
       sql += " LIMIT ?";
       params.push(options.limit);
     }
-    return sql;
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    return rows.map((r) => ({
+      id: r.id,
+      adapter: r.adapter,
+      title: r.title,
+      role: r.role ?? undefined,
+      projectPath: r.project_path,
+      createdAt: r.created_at,
+      lastActiveAt: r.last_active_at,
+      parentId: r.parent_id,
+      rootId: r.root_id,
+      depth: r.depth,
+      totalTurns: r.total_turns,
+      totalSteps: r.total_steps,
+      totalTokens: r.total_tokens,
+      artifacts: r.artifacts ? JSON.parse(r.artifacts) : [],
+      filesTouched: r.files_touched ? JSON.parse(r.files_touched) : [],
+      firstPrompt: r.first_prompt,
+      metadata: r.metadata ? JSON.parse(r.metadata) : {},
+    }));
   }
 
-  private buildChunkQuery(placeholders: string, options: QueryOptions, params: any[]): string {
-    let sql = `SELECT session_id, step_index, chunk_text FROM session_chunks WHERE session_id IN (${placeholders})`;
-    if (options.startStep !== undefined) {
-      sql += " AND step_index >= ?";
-      params.push(options.startStep);
-    }
-    if (options.endStep !== undefined) {
-      sql += " AND step_index <= ?";
-      params.push(options.endStep);
-    }
-    const sortDir = options.reverseSteps ? "DESC" : "ASC";
-    sql += ` ORDER BY step_index ${sortDir}`;
-    return sql;
-  }
+  getTurns(sessionId: string, options: GetTurnsOptions = {}): TurnData[] {
+    const maxRow = this.db
+      .prepare("SELECT MAX(turn_index) as max_idx FROM transcript_turns WHERE session_id = ?")
+      .get(sessionId) as { max_idx: number | null } | undefined;
+    const maxTurnIndex = maxRow?.max_idx ?? 0;
 
-  private buildStepQuery(placeholders: string, options: QueryOptions, params: any[]): string {
-    const contentCol = options.excludeContent ? "NULL as content" : "content";
-    const thinkingCol = options.excludeContent ? "NULL as thinking" : "thinking";
-    let sql = `SELECT session_id, step_index, type, source, status, ${contentCol}, ${thinkingCol}, tool_calls, created_at, is_undone FROM session_steps WHERE session_id IN (${placeholders})`;
+    let targetTurn = options.turnIndex;
+    if (targetTurn !== undefined && targetTurn < 0) {
+      targetTurn = maxTurnIndex + 1 + targetTurn;
+    }
+
+    let startTurn = options.startTurn;
+    if (startTurn !== undefined && startTurn < 0) {
+      startTurn = maxTurnIndex + 1 + startTurn;
+    }
+
+    let endTurn = options.endTurn;
+    if (endTurn !== undefined && endTurn < 0) {
+      endTurn = maxTurnIndex + 1 + endTurn;
+    }
+
+    let sql = `SELECT * FROM transcript_turns WHERE session_id = ?`;
+    const params: any[] = [sessionId];
 
     if (!options.includeUndone) {
-      sql += " AND (is_undone = 0 OR is_undone IS NULL)";
+      sql += ` AND is_undone = 0`;
     }
+
+    if (targetTurn !== undefined) {
+      sql += ` AND turn_index = ?`;
+      params.push(targetTurn);
+    }
+    if (startTurn !== undefined) {
+      sql += ` AND turn_index >= ?`;
+      params.push(startTurn);
+    }
+    if (endTurn !== undefined) {
+      sql += ` AND turn_index <= ?`;
+      params.push(endTurn);
+    }
+
+    sql += options.order === "reverse_chronological" ? " ORDER BY turn_index DESC" : " ORDER BY turn_index ASC";
+
+    if (options.lastTurns !== undefined && options.lastTurns > 0) {
+      // Subquery for last N turns
+      sql = `
+        SELECT * FROM (
+          SELECT * FROM transcript_turns
+          WHERE session_id = ? ${!options.includeUndone ? "AND is_undone = 0" : ""}
+          ORDER BY turn_index DESC
+          LIMIT ?
+        )
+        ORDER BY turn_index ASC
+      `;
+      params.length = 0;
+      params.push(sessionId, options.lastTurns);
+    } else if (options.limit !== undefined) {
+      sql += " LIMIT ?";
+      params.push(options.limit);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    return rows.map((r) => ({
+      turnIndex: r.turn_index,
+      userPrompt: r.user_prompt,
+      assistantResponse: r.assistant_response ?? "",
+      turnSummary: r.turn_summary ?? undefined,
+      turnText: r.turn_text,
+      turnVector: r.turn_vector ? blobToVector(r.turn_vector) : new Float32Array(EMBEDDING_DIMENSION),
+      inputTokens: r.input_tokens,
+      outputTokens: r.output_tokens,
+      thinkingTokens: r.thinking_tokens,
+      toolCount: r.tool_count,
+      errorCount: r.error_count,
+      durationMs: r.duration_ms,
+      isUndone: r.is_undone === 1,
+      createdAt: r.created_at,
+    }));
+  }
+
+  getSteps(sessionId: string, options: GetStepsOptions = {}): StepData[] {
+    let sql = `SELECT * FROM transcript_steps WHERE session_id = ?`;
+    const params: any[] = [sessionId];
+
+    if (!options.includeUndone) {
+      sql += ` AND is_undone = 0`;
+    }
+
+    if (options.turnIndex !== undefined) {
+      const maxRow = this.db
+        .prepare("SELECT MAX(turn_index) as max_idx FROM transcript_turns WHERE session_id = ?")
+        .get(sessionId) as { max_idx: number | null } | undefined;
+      const maxTurn = maxRow?.max_idx ?? 0;
+      const resolvedTurn =
+        options.turnIndex < 0 ? maxTurn + 1 + options.turnIndex : options.turnIndex;
+      sql += ` AND turn_index = ?`;
+      params.push(resolvedTurn);
+    }
+
     if (options.stepIndex !== undefined) {
-      sql += " AND step_index = ?";
+      sql += ` AND step_index = ?`;
       params.push(options.stepIndex);
     }
-    if (options.startStep !== undefined) {
-      sql += " AND step_index >= ?";
-      params.push(options.startStep);
-    }
-    if (options.endStep !== undefined) {
-      sql += " AND step_index <= ?";
-      params.push(options.endStep);
-    }
-    if (options.stepType !== undefined) {
-      sql += " AND type = ?";
-      params.push(options.stepType);
-    }
-    if (options.stepStatus !== undefined) {
-      sql += " AND status = ?";
-      params.push(options.stepStatus);
-    }
-    if (options.stepQuery !== undefined) {
-      sql += " AND (content LIKE ? OR thinking LIKE ? OR tool_calls LIKE ?)";
-      params.push(`%${options.stepQuery}%`, `%${options.stepQuery}%`, `%${options.stepQuery}%`);
-    }
-    const sortDir = options.reverseSteps ? "DESC" : "ASC";
-    sql += ` ORDER BY step_index ${sortDir}`;
-    return sql;
-  }
 
-  private resolveConversationSteps(db: any, queryOpts: QueryOptions): void {
-    const undoneClause = queryOpts.includeUndone ? "" : " AND (is_undone = 0 OR is_undone IS NULL)";
-    if (queryOpts.startConversationStep !== undefined) {
-      const row = db.prepare(`
-        SELECT step_index FROM session_steps
-        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))${undoneClause}
-        ORDER BY step_index ASC
-        LIMIT 1 OFFSET ?
-      `).get(queryOpts.sessionId, queryOpts.startConversationStep - 1) as { step_index: number } | undefined;
-      if (row) {
-        queryOpts.startStep = row.step_index;
+    if (options.category !== undefined) {
+      sql += ` AND category = ?`;
+      params.push(options.category);
+    }
+
+    if (options.kind !== undefined) {
+      sql += ` AND kind = ?`;
+      params.push(options.kind);
+    }
+
+    if (options.status !== undefined) {
+      sql += ` AND status = ?`;
+      params.push(options.status);
+    }
+
+    if (options.filePath !== undefined) {
+      sql += ` AND LOWER(file_path) LIKE ?`;
+      params.push(`%${options.filePath.toLowerCase()}%`);
+    }
+
+    if (options.toolName !== undefined) {
+      if (Array.isArray(options.toolName)) {
+        const placeholders = options.toolName.map(() => "?").join(",");
+        sql += ` AND tool_name IN (${placeholders})`;
+        params.push(...options.toolName);
       } else {
-        queryOpts.startStep = Infinity;
+        sql += ` AND tool_name = ?`;
+        params.push(options.toolName);
       }
     }
-    if (queryOpts.endConversationStep !== undefined) {
-      const row = db.prepare(`
-        SELECT step_index FROM session_steps
-        WHERE session_id = ? AND (type = 'USER_INPUT' OR (type = 'PLANNER_RESPONSE' AND content IS NOT NULL AND TRIM(content) != ''))${undoneClause}
-        ORDER BY step_index ASC
-        LIMIT 1 OFFSET ?
-      `).get(queryOpts.sessionId, queryOpts.endConversationStep - 1) as { step_index: number } | undefined;
-      if (row) {
-        queryOpts.endStep = row.step_index;
-      } else {
-        queryOpts.endStep = -1;
-      }
+
+    if (options.serverName !== undefined) {
+      sql += ` AND server_name = ?`;
+      params.push(options.serverName);
     }
+
+    sql += ` ORDER BY turn_index ASC, step_order ASC`;
+
+    if (options.limit !== undefined) {
+      sql += ` LIMIT ?`;
+      params.push(options.limit);
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    return rows.map((r) => ({
+      stepIndex: r.step_index,
+      turnIndex: r.turn_index,
+      stepOrder: r.step_order,
+      category: r.category,
+      kind: r.kind ?? undefined,
+      status: r.status,
+      content: r.content ?? undefined,
+      thinking: r.thinking ?? undefined,
+      toolName: r.tool_name ?? undefined,
+      serverName: r.server_name ?? undefined,
+      filePath: r.file_path ?? undefined,
+      exitCode: r.exit_code ?? undefined,
+      errorMessage: r.error_message ?? undefined,
+      toolArgs: r.tool_args ?? undefined,
+      toolResult: r.tool_result ?? undefined,
+      toolDurationMs: r.tool_duration_ms ?? undefined,
+      subagentSessionId: r.subagent_session_id ?? undefined,
+      createdAt: r.created_at,
+      isUndone: r.is_undone === 1,
+    }));
   }
 
-  query(options: QueryOptions): QueryResult {
-    const db = this.db;
-    const queryOpts = { ...options };
-
-    if (queryOpts.sessionId && (queryOpts.startConversationStep !== undefined || queryOpts.endConversationStep !== undefined)) {
-      this.resolveConversationSteps(db, queryOpts);
-    }
-
-    const sessionParams: any[] = [];
-    const sessionSql = this.buildSessionQuery(queryOpts, sessionParams);
-    const sessionsRows = db.prepare(sessionSql).all(...sessionParams) as any[];
-
-    const sessionsResult: SessionData[] = [];
-    const stepsResult: StepData[] = [];
-    const chunksResult: ChunkData[] = [];
-
-    if (sessionsRows.length === 0) {
-      return { sessions: [], steps: [], chunks: [] };
-    }
-
-    const sessionIds = sessionsRows.map(s => s.id);
-    const placeholders = sessionIds.map(() => "?").join(",");
-
-    const chunkParams: any[] = [...sessionIds];
-    const chunkSql = this.buildChunkQuery(placeholders, queryOpts, chunkParams);
-    const chunksRows = db.prepare(chunkSql).all(...chunkParams) as any[];
-
-    let stepsRows: any[] = [];
-    if (queryOpts.includeSteps) {
-      const stepParams: any[] = [...sessionIds];
-      const stepSql = this.buildStepQuery(placeholders, queryOpts, stepParams);
-      stepsRows = db.prepare(stepSql).all(...stepParams) as any[];
-
-      const fetchToolResults = queryOpts.includeToolResults || queryOpts.categories?.includes("tool_results");
-      if (fetchToolResults) {
-        // Fetch all steps for these sessions to map step_index + 1 tool results
-        const allStepsSql = `SELECT session_id, step_index, type, source, status, content FROM session_steps WHERE session_id IN (${placeholders})`;
-        const allStepsRows = db.prepare(allStepsSql).all(...sessionIds) as any[];
-        const nextStepMap = new Map<string, any>();
-        for (const row of allStepsRows) {
-          nextStepMap.set(`${row.session_id}:${row.step_index}`, row);
-        }
-
-        for (const row of stepsRows) {
-          if (row.tool_calls) {
-            const nextKey = `${row.session_id}:${row.step_index + 1}`;
-            const nextRow = nextStepMap.get(nextKey);
-            if (nextRow && (nextRow.type === "MCP_TOOL" || nextRow.type === "COMMAND" || nextRow.source === "SYSTEM")) {
-              row.tool_result = {
-                step_index: nextRow.step_index,
-                type: nextRow.type,
-                source: nextRow.source,
-                status: nextRow.status,
-                content: nextRow.content ?? null
-              };
-            }
-          }
-        }
-      }
-    }
-
-    const chunksBySession = new Map<string, ChunkData[]>();
-    for (const row of chunksRows) {
-      const cList = chunksBySession.get(row.session_id) || [];
-      const chunk = { stepIndex: row.step_index, text: row.chunk_text };
-      cList.push(chunk);
-      chunksBySession.set(row.session_id, cList);
-      chunksResult.push(chunk);
-    }
-
-    const stepsBySession = new Map<string, StepData[]>();
-    for (const row of stepsRows) {
-      this.filterAndPushStep(row, queryOpts, stepsBySession, stepsResult);
-    }
-
-    const childrenMap = new Map<string, string[]>();
-    if (sessionIds.length > 0) {
-      const childSql = `SELECT id, parent_id FROM sessions WHERE parent_id IN (${placeholders})`;
-      const childRows = db.prepare(childSql).all(...sessionIds) as any[];
-      for (const row of childRows) {
-        const list = childrenMap.get(row.parent_id) || [];
-        list.push(row.id);
-        childrenMap.set(row.parent_id, list);
-      }
-    }
-
-    for (const s of sessionsRows) {
-      sessionsResult.push({
-        id: s.id,
-        adapter: s.adapter,
-        title: s.title,
-        projectPath: s.project_path,
-        createdAt: s.created_at,
-        lastActiveAt: s.last_active_at ?? s.created_at,
-        firstPrompt: s.first_prompt,
-        secondPrompt: s.second_prompt,
-        parentId: s.parent_id || null,
-        childSessionIds: childrenMap.get(s.id) || [],
-        chunks: chunksBySession.get(s.id) || [],
-        steps: queryOpts.includeSteps ? (stepsBySession.get(s.id) || []) : undefined
-      });
-    }
-
-    return {
-      sessions: sessionsResult,
-      steps: stepsResult,
-      chunks: chunksResult
-    };
-  }
-
-  getSessionRelationship(sessionId: string, maxDepth = 2, includeAncestors = true): SessionRelationshipResult | null {
-    const db = this.db;
-    const currentStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id, first_prompt FROM sessions WHERE id = ?");
-    const currentSessionRow = currentStmt.get(sessionId) as any;
-    if (!currentSessionRow) return null;
-
-    const finalOutputStmt = db.prepare("SELECT content FROM session_steps WHERE session_id = ? AND (type = 'PLANNER_RESPONSE' OR type = 'MODEL_RESPONSE' OR source = 'MODEL') AND content IS NOT NULL AND trim(content) != '' ORDER BY step_index DESC LIMIT 1");
-
-    const getFinalOutput = (sessId: string): string | undefined => {
-      const row = finalOutputStmt.get(sessId) as any;
-      return row?.content ?? undefined;
-    };
-
-    const toNode = (row: any, depth?: number, children?: SessionRelationshipNode[]): SessionRelationshipNode => ({
-      id: row.id,
-      adapter: row.adapter,
-      title: row.title,
-      projectPath: row.project_path ?? row.projectPath ?? null,
-      createdAt: row.created_at ?? row.createdAt,
-      lastActiveAt: row.last_active_at ?? row.lastActiveAt ?? row.created_at ?? row.createdAt,
-      parentId: row.parent_id ?? row.parentId ?? null,
-      initialPrompt: row.first_prompt ?? row.firstPrompt ?? undefined,
-      finalOutput: getFinalOutput(row.id),
-      depth,
-      children
-    });
-
-    const current = toNode(currentSessionRow, 0);
+  getSessionRelationship(
+    sessionId: string,
+    maxDepth = 10,
+    includeAncestors = true
+  ): SessionRelationshipResult | null {
+    const current = this.getSession(sessionId);
+    if (!current) return null;
 
     const ancestors: SessionRelationshipNode[] = [];
-    if (includeAncestors) {
-      const visited = new Set<string>([sessionId]);
-      let currParentId = currentSessionRow.parent_id;
-      const ancestorList: SessionRelationshipNode[] = [];
-      while (currParentId && !visited.has(currParentId)) {
-        visited.add(currParentId);
-        const parentRow = currentStmt.get(currParentId) as any;
-        if (!parentRow) break;
-        ancestorList.push(toNode(parentRow));
-        currParentId = parentRow.parent_id;
+    let rootSessionId = current.id;
+
+    if (includeAncestors && current.parentId) {
+      const ancestorSql = `
+        WITH RECURSIVE ancestors_cte(id, parent_id, depth) AS (
+          SELECT id, parent_id, 0 FROM sessions WHERE id = ?
+          UNION ALL
+          SELECT s.id, s.parent_id, a.depth + 1
+          FROM sessions s
+          JOIN ancestors_cte a ON s.id = a.parent_id
+          WHERE a.depth < 10
+        )
+        SELECT s.* FROM sessions s
+        JOIN ancestors_cte a ON s.id = a.id
+        WHERE s.id != ?
+        ORDER BY a.depth DESC
+      `;
+      const ancRows = this.db.prepare(ancestorSql).all(current.parentId, current.id) as any[];
+      for (const row of ancRows) {
+        ancestors.push({
+          id: row.id,
+          adapter: row.adapter,
+          title: row.title,
+          role: row.role ?? undefined,
+          projectPath: row.project_path,
+          createdAt: row.created_at,
+          lastActiveAt: row.last_active_at,
+          parentId: row.parent_id,
+          rootId: row.root_id,
+          depth: row.depth,
+          totalTurns: row.total_turns,
+          mandate: row.first_prompt,
+          artifacts: row.artifacts ? JSON.parse(row.artifacts) : [],
+        });
       }
-      ancestorList.reverse();
-      ancestors.push(...ancestorList);
+      if (ancestors.length > 0) {
+        rootSessionId = ancestors[0].id;
+      }
     }
 
-    const rootSessionId = ancestors.length > 0 ? ancestors[0].id : currentSessionRow.id;
-    const parent = ancestors.at(-1) ?? null;
+    const parentNode = current.parentId
+      ? ancestors.find((a) => a.id === current.parentId) ||
+        (this.getSession(current.parentId) as any)
+      : null;
 
+    // Direct children
+    const childSql = `
+      SELECT * FROM sessions WHERE parent_id = ?
+    `;
+    const childRows = this.db.prepare(childSql).all(current.id) as any[];
+    const childrenNodes: SessionRelationshipNode[] = childRows.map((r) => ({
+      id: r.id,
+      adapter: r.adapter,
+      title: r.title,
+      role: r.role ?? undefined,
+      projectPath: r.project_path,
+      createdAt: r.created_at,
+      lastActiveAt: r.last_active_at,
+      parentId: r.parent_id,
+      rootId: r.root_id,
+      depth: 1,
+      totalTurns: r.total_turns,
+      mandate: r.first_prompt,
+      artifacts: r.artifacts ? JSON.parse(r.artifacts) : [],
+    }));
+
+    // Siblings
     let siblings: SessionRelationshipNode[] = [];
-    if (currentSessionRow.parent_id) {
-      const sibStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id, first_prompt FROM sessions WHERE parent_id = ? AND id != ?");
-      const sibRows = sibStmt.all(currentSessionRow.parent_id, currentSessionRow.id) as any[];
-      siblings = sibRows.map(r => toNode(r));
+    if (current.parentId) {
+      const sibRows = this.db
+        .prepare("SELECT * FROM sessions WHERE parent_id = ? AND id != ?")
+        .all(current.parentId, current.id) as any[];
+      siblings = sibRows.map((r) => ({
+        id: r.id,
+        adapter: r.adapter,
+        title: r.title,
+        role: r.role ?? undefined,
+        projectPath: r.project_path,
+        createdAt: r.created_at,
+        lastActiveAt: r.last_active_at,
+        parentId: r.parent_id,
+        rootId: r.root_id,
+        depth: 0,
+        totalTurns: r.total_turns,
+        mandate: r.first_prompt,
+        artifacts: r.artifacts ? JSON.parse(r.artifacts) : [],
+      }));
     }
 
-    const targetMaxDepth = Math.min(Math.max(maxDepth, 1), 10);
-    const visitedChildren = new Set<string>([sessionId]);
-    const childStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id, first_prompt FROM sessions WHERE parent_id = ?");
-
-    const buildChildTree = (parentId: string, depth: number): SessionRelationshipNode[] => {
-      if (depth > targetMaxDepth) return [];
-      const directChildrenRows = childStmt.all(parentId) as any[];
-      const nodes: SessionRelationshipNode[] = [];
-      for (const childRow of directChildrenRows) {
-        if (visitedChildren.has(childRow.id)) continue;
-        visitedChildren.add(childRow.id);
-        const subChildren = buildChildTree(childRow.id, depth + 1);
-        nodes.push(toNode(childRow, depth, subChildren.length > 0 ? subChildren : undefined));
-      }
-      return nodes;
+    const currentNode: SessionRelationshipNode = {
+      id: current.id,
+      adapter: current.adapter,
+      title: current.title,
+      role: current.role,
+      projectPath: current.projectPath,
+      createdAt: current.createdAt,
+      lastActiveAt: current.lastActiveAt,
+      parentId: current.parentId,
+      rootId: current.rootId,
+      depth: 0,
+      totalTurns: current.totalTurns,
+      mandate: current.firstPrompt,
+      artifacts: current.artifacts,
+      children: childrenNodes,
     };
 
-    const children = buildChildTree(sessionId, 1);
-
     return {
-      sessionId,
+      sessionId: current.id,
       rootSessionId,
-      parent,
+      parent: parentNode,
       ancestors,
-      current,
-      children,
-      siblings
+      current: currentNode,
+      children: childrenNodes,
+      siblings,
     };
   }
 
-  search(queryVector: number[], limit: number, options?: { projectPath?: string; scope?: "workspace" | "all" }): SearchResult[] {
-    const db = this.db;
+  getArtifacts(sessionId: string, includeSubtree = false): string[] {
+    if (!includeSubtree) {
+      const session = this.getSession(sessionId);
+      return session?.artifacts || [];
+    }
 
-    let sessionQuery = `
-      SELECT id, adapter, title, project_path, summary_vector 
-      FROM sessions 
-      WHERE summary_vector IS NOT NULL
+    const sql = `
+      WITH RECURSIVE subtree_cte(id, depth) AS (
+        SELECT id, 0 FROM sessions WHERE id = ?
+        UNION ALL
+        SELECT s.id, st.depth + 1
+        FROM sessions s
+        JOIN subtree_cte st ON s.parent_id = st.id
+        WHERE st.depth < 10
+      )
+      SELECT artifacts FROM sessions
+      WHERE id IN (SELECT id FROM subtree_cte) AND artifacts IS NOT NULL
     `;
-    const sessionParams: any[] = [];
-    
-    let resolvedProjectPath = options?.projectPath;
-    if (resolvedProjectPath === undefined && options?.scope === "workspace") {
+    const rows = this.db.prepare(sql).all(sessionId) as { artifacts: string }[];
+    const result = new Set<string>();
+
+    for (const r of rows) {
+      if (r.artifacts) {
+        try {
+          const arr = JSON.parse(r.artifacts);
+          if (Array.isArray(arr)) {
+            for (const a of arr) result.add(a);
+          }
+        } catch {}
+      }
+    }
+
+    return Array.from(result);
+  }
+
+  searchTurnsVector(
+    queryVector: Float32Array | Buffer | number[],
+    limit: number,
+    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+  ): VectorSearchResult[] {
+    const floatVec = normalizeQueryVector(queryVector);
+
+    let resolvedProjectPath = options.projectPath;
+    if (resolvedProjectPath === undefined && options.scope === "workspace") {
       resolvedProjectPath = this.getActiveProjectPath();
     }
 
-    if (resolvedProjectPath) {
-      sessionQuery += " AND project_path LIKE ?";
-      sessionParams.push(`%${resolvedProjectPath}%`);
-    }
-    const sessions = db.prepare(sessionQuery).all(...sessionParams) as any[];
+    let sql = `
+      SELECT t.session_id, t.turn_index, t.user_prompt, t.assistant_response,
+             t.turn_vector, t.created_at, s.title, s.role, s.project_path
+      FROM transcript_turns t
+      JOIN sessions s ON t.session_id = s.id
+      WHERE t.is_undone = 0
+    `;
+    const params: any[] = [];
 
-    const matchedSessions: { id: string; similarity: number }[] = [];
-
-    for (const s of sessions) {
-      try {
-        const vec = JSON.parse(s.summary_vector) as number[];
-        const sim = dotProduct(queryVector, vec);
-        matchedSessions.push({ id: s.id, similarity: sim });
-      } catch (e) {
-        console.debug?.("[Chronicle MCP] Failed to parse summary vector:", e);
-      }
+    if (resolvedProjectPath !== undefined) {
+      sql += " AND LOWER(s.project_path) LIKE ?";
+      params.push(`%${resolvedProjectPath.toLowerCase()}%`);
     }
 
-    matchedSessions.sort((a, b) => b.similarity - a.similarity);
-    const topSessionIds = matchedSessions.slice(0, 5).map((s) => s.id);
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    const results: VectorSearchResult[] = [];
 
-    if (topSessionIds.length === 0) {
-      return [];
-    }
+    for (const row of rows) {
+      if (!row.turn_vector) continue;
+      const turnVec = blobToVector(row.turn_vector);
+      const similarity = cosineSimilarityFloat32(floatVec, turnVec);
 
-    const placeholders = topSessionIds.map(() => "?").join(",");
-    const chunks = db.prepare(`
-      SELECT c.session_id, c.step_index, c.chunk_text, c.chunk_vector,
-             s.adapter, s.title, s.project_path
-      FROM session_chunks c
-      JOIN sessions s ON c.session_id = s.id
-      WHERE c.session_id IN (${placeholders})
-    `).all(...topSessionIds) as any[];
-
-    const results: SearchResult[] = [];
-
-    for (const c of chunks) {
-      try {
-        const vec = JSON.parse(c.chunk_vector) as number[];
-        const sim = dotProduct(queryVector, vec);
-        results.push({
-          sessionId: c.session_id,
-          adapter: c.adapter,
-          title: c.title,
-          projectPath: c.project_path,
-          stepIndex: c.step_index,
-          chunkText: c.chunk_text,
-          similarity: sim,
-        });
-      } catch (e) {
-        console.debug?.("[Chronicle MCP] Failed to parse chunk vector:", e);
-      }
+      results.push({
+        sessionId: row.session_id,
+        turnIndex: row.turn_index,
+        title: row.title,
+        role: row.role ?? undefined,
+        projectPath: row.project_path,
+        similarity,
+        userPrompt: row.user_prompt,
+        assistantSnippet: (row.assistant_response || "").slice(0, 200),
+        createdAt: row.created_at,
+      });
     }
 
     results.sort((a, b) => b.similarity - a.similarity);
     return results.slice(0, limit);
   }
 
-  getActiveProjectPath(): string | undefined {
-    try {
-      const row = this.db.prepare(`
-        SELECT project_path FROM sessions 
-        WHERE project_path IS NOT NULL AND project_path != '' 
-        ORDER BY created_at DESC LIMIT 1
-      `).get() as { project_path: string } | undefined;
-      return row?.project_path || undefined;
-    } catch (e) {
-      console.debug?.("[Chronicle MCP] getActiveProjectPath failed:", e);
-      return undefined;
+  searchTurnsFTS(
+    queryText: string,
+    limit: number,
+    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+  ): FTSSearchResult[] {
+    let resolvedProjectPath = options.projectPath;
+    if (resolvedProjectPath === undefined && options.scope === "workspace") {
+      resolvedProjectPath = this.getActiveProjectPath();
     }
+
+    let sql = `
+      SELECT f.rowid, f.user_prompt, f.assistant_response, f.turn_text,
+             bm25(transcript_turns_fts) as rank,
+             t.session_id, t.turn_index, t.created_at,
+             s.title, s.role, s.project_path
+      FROM transcript_turns_fts f
+      JOIN transcript_turns t ON f.rowid = t.id
+      JOIN sessions s ON t.session_id = s.id
+      WHERE transcript_turns_fts MATCH ? AND t.is_undone = 0
+    `;
+    const params: any[] = [queryText];
+
+    if (resolvedProjectPath !== undefined) {
+      sql += " AND LOWER(s.project_path) LIKE ?";
+      params.push(`%${resolvedProjectPath.toLowerCase()}%`);
+    }
+
+    sql += " ORDER BY rank LIMIT ?";
+    params.push(limit);
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    return rows.map((r) => ({
+      sessionId: r.session_id,
+      turnIndex: r.turn_index,
+      title: r.title,
+      role: r.role ?? undefined,
+      projectPath: r.project_path,
+      rank: r.rank,
+      userPrompt: r.user_prompt,
+      assistantSnippet: (r.assistant_response || "").slice(0, 200),
+      createdAt: r.created_at,
+    }));
+  }
+
+  getActiveProjectPath(): string | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT project_path FROM sessions WHERE project_path IS NOT NULL ORDER BY last_active_at DESC LIMIT 1"
+      )
+      .get() as { project_path: string } | undefined;
+    return row?.project_path;
   }
 
   close(): void {
-    try {
-      this.db.close();
-    } catch (e) {
-      console.warn("[Chronicle MCP] Failed to close database:", e);
-    }
+    // DatabaseSync instances don't require manual close unless needed
   }
-}
 
-let storeInstance: HistoryStore | null = null;
+  // ============================================================
+  // Transitional Shims for S2 Compatibility
+  // ============================================================
 
-export function setStore(store: HistoryStore): void {
-  storeInstance = store;
-}
+  save(session: SessionData, embeddings?: SessionEmbeddings): void {
+    const turns: TurnData[] = [];
+    const steps: StepData[] = session.steps || [];
 
-export function getStore(): HistoryStore {
-  storeInstance ??= new SqliteHistoryStore(DB_PATH);
-  return storeInstance;
+    if (session.chunks && session.chunks.length > 0) {
+      let idx = 1;
+      for (const chunk of session.chunks) {
+        const vec = embeddings?.chunks.get(chunk.stepIndex);
+        turns.push({
+          turnIndex: idx++,
+          userPrompt: chunk.text,
+          assistantResponse: "",
+          turnText: chunk.text,
+          turnVector: vec ? Float32Array.from(vec) : new Float32Array(EMBEDDING_DIMENSION),
+        });
+      }
+    }
+
+    this.saveSession(session, turns, steps);
+  }
+
+  query(options: QueryOptions): QueryResult {
+    const sessions = this.listSessions({
+      projectPath: options.projectPath,
+      scope: options.scope,
+      timeRange: options.timeRange,
+      limit: options.limit,
+      sortBy: options.sortBy,
+    });
+
+    const sessionIds = new Set(sessions.map((s) => s.id));
+    let matchedSteps: StepData[] = [];
+    const matchedChunks: ChunkData[] = [];
+
+    for (const sid of sessionIds) {
+      const sSteps = this.getSteps(sid, {
+        stepIndex: options.stepIndex,
+        status: options.stepStatus as any,
+        includeUndone: options.includeUndone,
+      });
+      matchedSteps = matchedSteps.concat(sSteps);
+    }
+
+    return {
+      sessions,
+      steps: matchedSteps,
+      chunks: matchedChunks,
+    };
+  }
+
+  search(
+    queryVector: number[],
+    limit: number,
+    options?: { projectPath?: string; scope?: "workspace" | "all" }
+  ): SearchResult[] {
+    const results = this.searchTurnsVector(queryVector, limit, options);
+    return results.map((r) => ({
+      sessionId: r.sessionId,
+      adapter: "antigravity",
+      title: r.title,
+      projectPath: r.projectPath,
+      stepIndex: r.turnIndex,
+      chunkText: r.userPrompt,
+      similarity: r.similarity,
+    }));
+  }
 }
