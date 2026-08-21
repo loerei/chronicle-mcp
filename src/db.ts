@@ -4,7 +4,7 @@ import os from "node:os";
 import fs from "node:fs";
 import { SessionData, StepData, ChunkData, SessionRelationshipNode, SessionRelationshipResult } from "./adapters/types.js";
 
-function matchToolCall(call: any, targetServer?: string, targetTool?: string): boolean {
+function matchToolCall(call: any, targetServer?: string, targetTool?: string | string[]): boolean {
   const name = call.name || "";
   let callServer = "";
   let callTool = "";
@@ -26,7 +26,11 @@ function matchToolCall(call: any, targetServer?: string, targetTool?: string): b
   let matchesServer = true;
 
   if (targetTool !== undefined) {
-    matchesTool = callTool === targetTool || callTool.endsWith("/" + targetTool) || name === targetTool || name.endsWith("/" + targetTool);
+    if (Array.isArray(targetTool)) {
+      matchesTool = targetTool.some(t => callTool === t || callTool.endsWith("/" + t) || name === t || name.endsWith("/" + t));
+    } else {
+      matchesTool = callTool === targetTool || callTool.endsWith("/" + targetTool) || name === targetTool || name.endsWith("/" + targetTool);
+    }
   }
   if (targetServer !== undefined) {
     matchesServer = callServer === targetServer || name.startsWith(targetServer + "/") || name.includes("_" + targetServer + "_");
@@ -186,7 +190,7 @@ export interface QueryOptions {
   includeSteps?: boolean;
   includeUndone?: boolean;
   limit?: number;
-  toolName?: string;
+  toolName?: string | string[];
   serverName?: string;
   excludeContent?: boolean;
   timeRange?: string; // Format: "start:end"
@@ -408,7 +412,7 @@ export class InMemoryHistoryStore implements HistoryStore {
     return !!(contentMatch || thinkingMatch || toolCallsMatch);
   }
 
-  private matchStepTool(step: StepData, serverName?: string, toolName?: string): boolean {
+  private matchStepTool(step: StepData, serverName?: string, toolName?: string | string[]): boolean {
     if (!step.toolCalls) return false;
     try {
       const calls = JSON.parse(step.toolCalls);
@@ -655,6 +659,18 @@ export class InMemoryHistoryStore implements HistoryStore {
     const currentSession = this.sessionsMap.get(sessionId);
     if (!currentSession) return null;
 
+    const getFinalOutput = (sessId: string): string | undefined => {
+      const steps = this.stepsMap.get(sessId);
+      if (!steps || steps.length === 0) return undefined;
+      for (let i = steps.length - 1; i >= 0; i--) {
+        const step = steps[i];
+        if ((step.type === "PLANNER_RESPONSE" || step.type === "MODEL_RESPONSE" || step.source === "MODEL") && step.content && step.content.trim() !== "") {
+          return step.content;
+        }
+      }
+      return undefined;
+    };
+
     const toNode = (s: any, depth?: number, children?: SessionRelationshipNode[]): SessionRelationshipNode => ({
       id: s.id,
       adapter: s.adapter,
@@ -663,6 +679,8 @@ export class InMemoryHistoryStore implements HistoryStore {
       createdAt: s.createdAt,
       lastActiveAt: (s as any).lastActiveAt ?? s.createdAt,
       parentId: s.parentId || null,
+      initialPrompt: s.firstPrompt || undefined,
+      finalOutput: getFinalOutput(s.id),
       depth,
       children
     });
@@ -1301,9 +1319,16 @@ export class SqliteHistoryStore implements HistoryStore {
 
   getSessionRelationship(sessionId: string, maxDepth = 2, includeAncestors = true): SessionRelationshipResult | null {
     const db = this.db;
-    const currentStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id FROM sessions WHERE id = ?");
+    const currentStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id, first_prompt FROM sessions WHERE id = ?");
     const currentSessionRow = currentStmt.get(sessionId) as any;
     if (!currentSessionRow) return null;
+
+    const finalOutputStmt = db.prepare("SELECT content FROM session_steps WHERE session_id = ? AND (type = 'PLANNER_RESPONSE' OR type = 'MODEL_RESPONSE' OR source = 'MODEL') AND content IS NOT NULL AND trim(content) != '' ORDER BY step_index DESC LIMIT 1");
+
+    const getFinalOutput = (sessId: string): string | undefined => {
+      const row = finalOutputStmt.get(sessId) as any;
+      return row?.content ?? undefined;
+    };
 
     const toNode = (row: any, depth?: number, children?: SessionRelationshipNode[]): SessionRelationshipNode => ({
       id: row.id,
@@ -1313,6 +1338,8 @@ export class SqliteHistoryStore implements HistoryStore {
       createdAt: row.created_at ?? row.createdAt,
       lastActiveAt: row.last_active_at ?? row.lastActiveAt ?? row.created_at ?? row.createdAt,
       parentId: row.parent_id ?? row.parentId ?? null,
+      initialPrompt: row.first_prompt ?? row.firstPrompt ?? undefined,
+      finalOutput: getFinalOutput(row.id),
       depth,
       children
     });
@@ -1340,14 +1367,14 @@ export class SqliteHistoryStore implements HistoryStore {
 
     let siblings: SessionRelationshipNode[] = [];
     if (currentSessionRow.parent_id) {
-      const sibStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id FROM sessions WHERE parent_id = ? AND id != ?");
+      const sibStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id, first_prompt FROM sessions WHERE parent_id = ? AND id != ?");
       const sibRows = sibStmt.all(currentSessionRow.parent_id, currentSessionRow.id) as any[];
       siblings = sibRows.map(r => toNode(r));
     }
 
     const targetMaxDepth = Math.min(Math.max(maxDepth, 1), 10);
     const visitedChildren = new Set<string>([sessionId]);
-    const childStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id FROM sessions WHERE parent_id = ?");
+    const childStmt = db.prepare("SELECT id, adapter, title, project_path, created_at, last_active_at, parent_id, first_prompt FROM sessions WHERE parent_id = ?");
 
     const buildChildTree = (parentId: string, depth: number): SessionRelationshipNode[] => {
       if (depth > targetMaxDepth) return [];

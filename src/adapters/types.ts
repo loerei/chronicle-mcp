@@ -22,6 +22,8 @@ export interface SessionRelationshipNode {
   createdAt: number;
   lastActiveAt?: number;
   parentId?: string | null;
+  initialPrompt?: string;
+  finalOutput?: string;
   depth?: number;
   children?: SessionRelationshipNode[];
 }

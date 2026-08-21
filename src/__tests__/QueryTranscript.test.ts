@@ -332,4 +332,29 @@ describe("QueryTranscript Unit & Integration Suite", () => {
     assert.strictEqual(doneSteps.length, 2);
     assert.strictEqual(undoneSteps[0].content, "Third step that was undone");
   });
+
+  it("should filter steps by single toolName string and toolName string array", async () => {
+    const resSingle: any = await handleQueryTranscript({
+      sessionId: "sess-query-test-1",
+      toolName: "patch_file",
+    });
+    const stepsSingle = JSON.parse(resSingle.content[0].text);
+    assert.strictEqual(stepsSingle.length, 1);
+    assert.strictEqual(stepsSingle[0].step_index, 1);
+
+    const resArray: any = await handleQueryTranscript({
+      sessionId: "sess-query-test-1",
+      toolName: ["patch_file", "view_file"],
+    });
+    const stepsArray = JSON.parse(resArray.content[0].text);
+    assert.strictEqual(stepsArray.length, 1);
+    assert.strictEqual(stepsArray[0].step_index, 1);
+
+    const resNone: any = await handleQueryTranscript({
+      sessionId: "sess-query-test-1",
+      toolName: ["non_existent_tool"],
+    });
+    const stepsNone = JSON.parse(resNone.content[0].text);
+    assert.strictEqual(stepsNone.length, 0);
+  });
 });

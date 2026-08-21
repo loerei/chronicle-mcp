@@ -184,6 +184,11 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(resTool.steps.length, 1);
       assert.strictEqual(resTool.steps[0].stepIndex, 2);
 
+      // Filter steps by toolName array
+      const resToolArray = store.query({ includeSteps: true, sessionId: "session-steps", toolName: ["read_graph", "non_existent"] });
+      assert.strictEqual(resToolArray.steps.length, 1);
+      assert.strictEqual(resToolArray.steps[0].stepIndex, 2);
+
       // Filter steps by serverName (TDD Cycle 1)
       const resServer = store.query({ includeSteps: true, sessionId: "session-steps", serverName: "memory" });
       assert.strictEqual(resServer.steps.length, 1);
@@ -390,9 +395,25 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         title: "Root Session",
         projectPath: "/test",
         createdAt: 1000,
-        firstPrompt: "",
+        firstPrompt: "Root initial prompt",
         secondPrompt: "",
         chunks: [],
+        steps: [
+          {
+            stepIndex: 0,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "Root initial prompt"
+          },
+          {
+            stepIndex: 1,
+            type: "PLANNER_RESPONSE",
+            source: "MODEL",
+            status: "DONE",
+            content: "Root final output response"
+          }
+        ]
       };
 
       const child1: SessionData = {
@@ -401,10 +422,26 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         title: "Child 1",
         projectPath: "/test",
         createdAt: 2000,
-        firstPrompt: "",
+        firstPrompt: "Child 1 prompt",
         secondPrompt: "",
         chunks: [],
-        parentId: "root-1"
+        parentId: "root-1",
+        steps: [
+          {
+            stepIndex: 0,
+            type: "USER_INPUT",
+            source: "USER_EXPLICIT",
+            status: "DONE",
+            content: "Child 1 prompt"
+          },
+          {
+            stepIndex: 1,
+            type: "PLANNER_RESPONSE",
+            source: "MODEL",
+            status: "DONE",
+            content: "Child 1 final response"
+          }
+        ]
       };
 
       const child2: SessionData = {
@@ -462,6 +499,8 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(relChild1?.siblings[0].id, "child-2");
       assert.strictEqual(relChild1?.children.length, 1);
       assert.strictEqual(relChild1?.children[0].id, "grandchild-1");
+      assert.strictEqual(relChild1?.current.initialPrompt, "Child 1 prompt");
+      assert.strictEqual(relChild1?.current.finalOutput, "Child 1 final response");
 
       // Test root session relationship (siblings must be empty, parent null)
       const relRoot = store.getSessionRelationship("root-1");
@@ -470,6 +509,8 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(relRoot?.ancestors.length, 0);
       assert.strictEqual(relRoot?.siblings.length, 0);
       assert.strictEqual(relRoot?.children.length, 2);
+      assert.strictEqual(relRoot?.current.initialPrompt, "Root initial prompt");
+      assert.strictEqual(relRoot?.current.finalOutput, "Root final output response");
 
       // Test includeAncestors = false
       const relNoAncestors = store.getSessionRelationship("grandchild-1", 2, false);
