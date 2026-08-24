@@ -1,10 +1,72 @@
-import { getStore, SearchResult as DbSearchResult } from "./db.js";
-import { SessionBenchmarkMetrics, StepData } from "./adapters/types.js";
+import fs from "node:fs";
+import path from "node:path";
+import {
+  getStore,
+  SearchResult as DbSearchResult,
+  SearchHistoryFilter,
+  StepCategory,
+} from "./db.js";
+import { getEmbeddingClient } from "./embeddings.js";
+import { SessionBenchmarkMetrics, StepData, TurnData } from "./adapters/types.js";
 import { getEncoding } from "js-tiktoken";
 
 const encoder = getEncoding("cl100k_base");
 
 export type SearchResult = DbSearchResult;
+
+export { SearchHistoryFilter };
+
+export interface SearchHistoryOptions {
+  query?: string;
+  mode?: "hybrid" | "semantic" | "keyword";
+  scope?: "workspace" | "all";
+  projectPath?: string;
+  filter?: SearchHistoryFilter;
+  limit?: number;
+}
+
+export interface SearchHistoryResult {
+  sessionId: string;
+  turnIndex: number;
+  title: string;
+  role?: string;
+  projectPath?: string | null;
+  score: number;
+  matchedUserPrompt: string;
+  matchedAssistantSnippet: string;
+  createdAt: number;
+  conversationLink: string;
+}
+
+export interface ToolFilterOptions {
+  name?: string | string[];
+  server?: string;
+  status?: "DONE" | "ERROR" | "PENDING";
+  kind?: "mcp" | "command" | "native" | "subagent";
+}
+
+export interface TranscriptQueryOptions {
+  sessionId?: string;
+  turnIndex?: number;
+  startTurn?: number;
+  endTurn?: number;
+  lastTurns?: number;
+  detailLevel?: "compact" | "full" | "summary";
+  include?: ("dialogue" | "thinking" | "executions" | "system_events")[];
+  filePath?: string;
+  toolFilter?: ToolFilterOptions;
+  includeSubtree?: boolean;
+  includeUndone?: boolean;
+  maxResultChars?: number;
+  output?: string;
+}
+
+export interface QueryTranscriptResult {
+  text: string;
+  raw?: any;
+  truncated: boolean;
+  charCount: number;
+}
 
 export function dotProduct(a: number[], b: number[]): number {
   let val = 0;
@@ -15,13 +77,560 @@ export function dotProduct(a: number[], b: number[]): number {
   return val;
 }
 
+function tryFormatPayload(data: any, maxChars: number): string {
+  if (data === undefined || data === null) return "";
+  let text = "";
+  if (typeof data === "string") {
+    try {
+      const parsed = JSON.parse(data);
+      text = JSON.stringify(parsed, null, 2);
+    } catch {
+      // Strip ANSI escape codes
+      text = data.replace(/\x1b\[[0-9;]*m/g, "");
+    }
+  } else {
+    try {
+      text = JSON.stringify(data, null, 2);
+    } catch {
+      text = String(data);
+    }
+  }
+
+  if (maxChars > 0 && text.length > maxChars) {
+    return text.slice(0, maxChars) + `\n... [Truncated: output exceeded ${maxChars} characters]`;
+  }
+  return text;
+}
+
 export async function searchHistory(
-  queryVector: number[],
-  limit = 5,
-  options: { projectPath?: string; scope?: "workspace" | "all" } = {}
-): Promise<SearchResult[]> {
+  optionsOrQueryVector: SearchHistoryOptions | number[] | Float32Array,
+  legacyLimit = 5,
+  legacyOptions: {
+    projectPath?: string;
+    scope?: "workspace" | "all";
+    filter?: SearchHistoryFilter;
+  } = {}
+): Promise<any> {
   const store = getStore();
-  return store.search(queryVector, limit, options);
+
+  // Handle legacy signature (queryVector, limit, options)
+  if (
+    Array.isArray(optionsOrQueryVector) ||
+    optionsOrQueryVector instanceof Float32Array
+  ) {
+    return store.search(
+      Array.from(optionsOrQueryVector as number[]),
+      legacyLimit,
+      legacyOptions
+    );
+  }
+
+  const options: SearchHistoryOptions = optionsOrQueryVector || {};
+  const query = options.query ? options.query.trim() : "";
+  if (!query) {
+    return [];
+  }
+
+  const mode = options.mode || "hybrid";
+  const limit = Math.max(
+    1,
+    typeof options.limit === "number" && !isNaN(options.limit)
+      ? options.limit
+      : 5
+  );
+  const candidateLimit = Math.max(limit * 3, 20);
+  const projectPath = options.projectPath;
+  const scope = options.scope;
+  const filter = options.filter;
+
+  if (mode === "keyword") {
+    const ftsResults = store.searchTurnsFTS(query, limit, {
+      projectPath,
+      scope,
+      filter,
+    });
+    return ftsResults.map((r, idx) => ({
+      sessionId: r.sessionId,
+      turnIndex: r.turnIndex,
+      title: r.title,
+      role: r.role,
+      projectPath: r.projectPath,
+      score: 1 / (60 + idx + 1),
+      matchedUserPrompt: r.userPrompt,
+      matchedAssistantSnippet: r.assistantSnippet,
+      createdAt: r.createdAt,
+      conversationLink: `conversation://${r.sessionId}`,
+    }));
+  }
+
+  if (mode === "semantic") {
+    const [queryVec] = await getEmbeddingClient().embed([query]);
+    const vecResults = store.searchTurnsVector(queryVec, limit, {
+      projectPath,
+      scope,
+      filter,
+    });
+    return vecResults.map((r) => ({
+      sessionId: r.sessionId,
+      turnIndex: r.turnIndex,
+      title: r.title,
+      role: r.role,
+      projectPath: r.projectPath,
+      score: r.similarity,
+      matchedUserPrompt: r.userPrompt,
+      matchedAssistantSnippet: r.assistantSnippet,
+      createdAt: r.createdAt,
+      conversationLink: `conversation://${r.sessionId}`,
+    }));
+  }
+
+  // mode === "hybrid" (Default)
+  const ftsResults = store.searchTurnsFTS(query, candidateLimit, {
+    projectPath,
+    scope,
+    filter,
+  });
+  let vecResults: any[] = [];
+  try {
+    const [queryVec] = await getEmbeddingClient().embed([query]);
+    vecResults = store.searchTurnsVector(queryVec, candidateLimit, {
+      projectPath,
+      scope,
+      filter,
+    });
+  } catch (e: any) {
+    console.error(
+      "[Chronicle Search] Embedding generation fallback to keyword-only:",
+      e?.message || String(e)
+    );
+  }
+
+  const rrfScores = new Map<string, { item: any; rrfScore: number }>();
+
+  // Reciprocal Rank Fusion: RRF(d) = sum 1 / (k + rank), k = 60
+  ftsResults.forEach((r, idx) => {
+    const key = `${r.sessionId}:${r.turnIndex}`;
+    const rank = idx + 1;
+    const score = 1 / (60 + rank);
+    rrfScores.set(key, { item: r, rrfScore: score });
+  });
+
+  vecResults.forEach((r, idx) => {
+    const key = `${r.sessionId}:${r.turnIndex}`;
+    const rank = idx + 1;
+    const score = 1 / (60 + rank);
+    if (rrfScores.has(key)) {
+      rrfScores.get(key)!.rrfScore += score;
+    } else {
+      rrfScores.set(key, { item: r, rrfScore: score });
+    }
+  });
+
+  const candidates = Array.from(rrfScores.values()).map(
+    ({ item, rrfScore }) => ({
+      sessionId: item.sessionId,
+      turnIndex: item.turnIndex,
+      title: item.title,
+      role: item.role,
+      projectPath: item.projectPath,
+      score: rrfScore,
+      matchedUserPrompt: item.userPrompt,
+      matchedAssistantSnippet: item.assistantSnippet,
+      createdAt: item.createdAt,
+      conversationLink: `conversation://${item.sessionId}`,
+    })
+  );
+
+  // Deterministic tie-breaking
+  candidates.sort((a, b) => {
+    const scoreDiff = b.score - a.score;
+    if (Math.abs(scoreDiff) > 1e-9) return scoreDiff;
+    const timeDiff = b.createdAt - a.createdAt;
+    if (timeDiff !== 0) return timeDiff;
+    const sessDiff = a.sessionId.localeCompare(b.sessionId);
+    if (sessDiff !== 0) return sessDiff;
+    return a.turnIndex - b.turnIndex;
+  });
+
+  return candidates.slice(0, limit);
+}
+
+export async function queryTranscript(
+  options: TranscriptQueryOptions = {}
+): Promise<QueryTranscriptResult> {
+  const store = getStore();
+
+  let targetSessionId = options.sessionId;
+  if (!targetSessionId) {
+    const activeProject = store.getActiveProjectPath();
+    if (activeProject) {
+      const recentWorkspaceSessions = store.listSessions({
+        projectPath: activeProject,
+        scope: "workspace",
+        limit: 1,
+      });
+      if (recentWorkspaceSessions.length > 0) {
+        targetSessionId = recentWorkspaceSessions[0].id;
+      }
+    }
+    if (!targetSessionId) {
+      const globalRecent = store.listSessions({ limit: 1 });
+      if (globalRecent.length > 0) {
+        targetSessionId = globalRecent[0].id;
+      }
+    }
+  }
+
+  if (!targetSessionId) {
+    return {
+      text: "No active or indexed sessions found in the workspace.",
+      truncated: false,
+      charCount: 0,
+    };
+  }
+
+  interface AnnotatedTurn extends TurnData {
+    localTurnIndex: number;
+    sessionId: string;
+    role?: string;
+    sessionTitle?: string;
+  }
+
+  let allTurns: AnnotatedTurn[] = [];
+
+  if (options.includeSubtree === true) {
+    const subtreeIds = store.getSubtreeSessionIds(targetSessionId);
+    for (const sid of subtreeIds) {
+      const sess = store.getSession(sid);
+      const turns = store.getTurns(sid, {
+        includeUndone: options.includeUndone,
+      });
+      for (const turn of turns) {
+        allTurns.push({
+          ...turn,
+          localTurnIndex: turn.turnIndex,
+          sessionId: sid,
+          role: sess?.role,
+          sessionTitle: sess?.title,
+        });
+      }
+    }
+    // Stable composite tie-breaking
+    allTurns.sort((a, b) => {
+      const timeDiff = (a.createdAt ?? 0) - (b.createdAt ?? 0);
+      if (timeDiff !== 0) return timeDiff;
+      const sessDiff = a.sessionId.localeCompare(b.sessionId);
+      if (sessDiff !== 0) return sessDiff;
+      return a.turnIndex - b.turnIndex;
+    });
+  } else {
+    const sess = store.getSession(targetSessionId);
+    const turns = store.getTurns(targetSessionId, {
+      includeUndone: options.includeUndone,
+    });
+    allTurns = turns.map((turn) => ({
+      ...turn,
+      localTurnIndex: turn.turnIndex,
+      sessionId: targetSessionId!,
+      role: sess?.role,
+      sessionTitle: sess?.title,
+    }));
+  }
+
+  const T = allTurns.length;
+  if (T === 0) {
+    return {
+      text: `Session "${targetSessionId}" has 0 indexed turns.`,
+      truncated: false,
+      charCount: 0,
+    };
+  }
+
+  const hasExplicitSlicing =
+    options.turnIndex !== undefined ||
+    options.startTurn !== undefined ||
+    options.endTurn !== undefined ||
+    options.lastTurns !== undefined;
+
+  let slicedTurns: AnnotatedTurn[] = [];
+  let cappedNotice = "";
+
+  if (options.turnIndex !== undefined) {
+    const resolvedTurn =
+      options.turnIndex < 0
+        ? Math.max(1, T + 1 + options.turnIndex)
+        : options.turnIndex;
+    slicedTurns = allTurns.filter((_, idx) => idx + 1 === resolvedTurn);
+  } else if (options.lastTurns !== undefined && options.lastTurns > 0) {
+    slicedTurns = allTurns.slice(-options.lastTurns);
+  } else if (
+    options.startTurn !== undefined ||
+    options.endTurn !== undefined
+  ) {
+    const start =
+      options.startTurn !== undefined
+        ? options.startTurn < 0
+          ? Math.max(1, T + 1 + options.startTurn)
+          : options.startTurn
+        : 1;
+    const end =
+      options.endTurn !== undefined
+        ? options.endTurn < 0
+          ? Math.min(T, Math.max(1, T + 1 + options.endTurn))
+          : Math.min(T, options.endTurn)
+        : T;
+
+    if (start <= end) {
+      slicedTurns = allTurns.filter(
+        (_, idx) => idx + 1 >= start && idx + 1 <= end
+      );
+    }
+  } else if (!hasExplicitSlicing && T > 100) {
+    slicedTurns = allTurns.slice(-100);
+    cappedNotice = `\n> [!NOTE]\n> Transcript automatically capped to the last 100 turns. Specify turnIndex or startTurn/endTurn to inspect earlier turns.\n\n`;
+  } else {
+    slicedTurns = allTurns;
+  }
+
+  // Multi-Session Batch Step Loading
+  const sessionTurnMap = new Map<string, number[]>();
+  for (const turn of slicedTurns) {
+    if (!sessionTurnMap.has(turn.sessionId)) {
+      sessionTurnMap.set(turn.sessionId, []);
+    }
+    sessionTurnMap.get(turn.sessionId)!.push(turn.localTurnIndex);
+  }
+
+  const loadedStepsMap = new Map<string, Map<number, StepData[]>>();
+  for (const [sid, turnIndices] of sessionTurnMap.entries()) {
+    const sMap = store.getStepsForTurns(sid, turnIndices, {
+      includeUndone: options.includeUndone,
+    });
+    loadedStepsMap.set(sid, sMap);
+  }
+
+  const detailLevel = options.detailLevel || "compact";
+  const maxResultChars =
+    typeof options.maxResultChars === "number" && options.maxResultChars > 0
+      ? options.maxResultChars
+      : 2500;
+
+  const hasDialogue = !options.include || options.include.includes("dialogue");
+  const hasThinking = !options.include || options.include.includes("thinking");
+  const hasExecutions =
+    !options.include || options.include.includes("executions");
+  const hasSystem =
+    !options.include || options.include.includes("system_events");
+
+  const normalizedFilePath = options.filePath
+    ? options.filePath.replace(/\\/g, "/").toLowerCase()
+    : undefined;
+
+  const toolFilter = options.toolFilter;
+
+  const outputSections: string[] = [];
+
+  if (cappedNotice) {
+    outputSections.push(cappedNotice);
+  }
+
+  for (let i = 0; i < slicedTurns.length; i++) {
+    const turn = slicedTurns[i];
+    const unifiedIndex = allTurns.indexOf(turn) + 1;
+
+    let header = `### [Turn ${unifiedIndex}]`;
+    if (options.includeSubtree === true || turn.sessionId !== targetSessionId) {
+      const roleStr = turn.role ? `Role: ${turn.role}, ` : "";
+      header += ` (${roleStr}Session: ${turn.sessionId}, Local Turn: ${turn.localTurnIndex})`;
+    }
+    outputSections.push(header);
+
+    if (hasDialogue && turn.userPrompt) {
+      if (detailLevel === "compact") {
+        const promptPreview =
+          turn.userPrompt.length > 200
+            ? turn.userPrompt.slice(0, 200) + "..."
+            : turn.userPrompt;
+        outputSections.push(`**User**: ${promptPreview}`);
+      } else {
+        outputSections.push(`**User**:\n${turn.userPrompt}`);
+      }
+    }
+
+    const sessionSteps = loadedStepsMap.get(turn.sessionId);
+    const turnSteps = (sessionSteps?.get(turn.localTurnIndex) || []).filter(
+      (step) => {
+        if (step.category === "execution" && !hasExecutions) return false;
+        if (step.category === "system" && !hasSystem) return false;
+
+        if (normalizedFilePath && step.filePath) {
+          const stepFp = step.filePath.replace(/\\/g, "/").toLowerCase();
+          if (!stepFp.includes(normalizedFilePath)) return false;
+        }
+
+        if (toolFilter) {
+          if (toolFilter.name && step.toolName) {
+            const targetNames = Array.isArray(toolFilter.name)
+              ? toolFilter.name.map((n) => n.toLowerCase())
+              : [toolFilter.name.toLowerCase()];
+            if (!targetNames.includes(step.toolName.toLowerCase())) return false;
+          }
+          if (
+            toolFilter.server &&
+            step.serverName &&
+            step.serverName.toLowerCase() !== toolFilter.server.toLowerCase()
+          ) {
+            return false;
+          }
+          if (
+            toolFilter.status &&
+            step.status.toLowerCase() !== toolFilter.status.toLowerCase()
+          ) {
+            return false;
+          }
+          if (
+            toolFilter.kind &&
+            step.kind &&
+            step.kind.toLowerCase() !== toolFilter.kind.toLowerCase()
+          ) {
+            return false;
+          }
+        }
+        return true;
+      }
+    );
+
+    if (detailLevel === "summary") {
+      if (hasDialogue && turn.assistantResponse) {
+        outputSections.push(`**Assistant**:\n${turn.assistantResponse}`);
+      }
+      outputSections.push("");
+      continue;
+    }
+
+    if (detailLevel === "compact") {
+      if (turnSteps.length > 0) {
+        outputSections.push("**Executions**:");
+        for (const step of turnSteps) {
+          const sName = step.serverName ? `${step.serverName}/` : "";
+          const tName = step.toolName || step.category;
+          const target = step.filePath ? ` \`${step.filePath}\`` : "";
+          const dur =
+            step.toolDurationMs !== undefined
+              ? ` (${step.toolDurationMs}ms)`
+              : "";
+          const err = step.errorMessage ? ` - ERROR: ${step.errorMessage.slice(0, 100)}` : "";
+          outputSections.push(
+            `- [${sName}${tName}]${target} - ${step.status}${dur}${err}`
+          );
+        }
+      }
+      if (hasDialogue && turn.assistantResponse) {
+        const respPreview =
+          turn.assistantResponse.length > 200
+            ? turn.assistantResponse.slice(0, 200) + "..."
+            : turn.assistantResponse;
+        outputSections.push(`**Assistant**: ${respPreview}`);
+      }
+      outputSections.push("");
+      continue;
+    }
+
+    // detailLevel === "full"
+    for (const step of turnSteps) {
+      if (step.thinking && hasThinking) {
+        outputSections.push(`> [!NOTE] Thinking\n> ${step.thinking.replace(/\n/g, "\n> ")}`);
+      }
+
+      if (step.category === "execution") {
+        const sName = step.serverName ? `${step.serverName}/` : "";
+        const tName = step.toolName || "tool";
+        outputSections.push(`#### Tool Call: \`${sName}${tName}\` (${step.status})`);
+        if (step.filePath) {
+          outputSections.push(`**File**: \`${step.filePath}\``);
+        }
+        if (step.toolArgs) {
+          outputSections.push(`**Arguments**:\n\`\`\`json\n${tryFormatPayload(step.toolArgs, maxResultChars)}\n\`\`\``);
+        }
+        if (step.toolResult) {
+          outputSections.push(`**Result**:\n\`\`\`\n${tryFormatPayload(step.toolResult, maxResultChars)}\n\`\`\``);
+        }
+        if (step.errorMessage) {
+          outputSections.push(`**Error**: ${step.errorMessage}`);
+        }
+      }
+    }
+
+    if (hasDialogue && turn.assistantResponse) {
+      outputSections.push(`**Assistant**:\n${turn.assistantResponse}`);
+    }
+    outputSections.push("");
+  }
+
+  const formattedText = outputSections.join("\n").trim();
+
+  // Export to disk if output option specified
+  if (options.output) {
+    const rawPath = options.output;
+    let targetPath = path.resolve(rawPath);
+
+    const isDir =
+      (fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()) ||
+      !path.extname(targetPath);
+
+    if (isDir) {
+      const sanitizedId = (targetSessionId || "query").replace(
+        /[^a-zA-Z0-9_-]/g,
+        "_"
+      );
+      const ext = rawPath.endsWith(".json") ? ".json" : ".md";
+      fs.mkdirSync(targetPath, { recursive: true });
+      targetPath = path.join(
+        targetPath,
+        `transcript_${sanitizedId}_${Date.now()}${ext}`
+      );
+    } else {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    }
+
+    if (targetPath.endsWith(".json")) {
+      const exportData = {
+        sessionId: targetSessionId,
+        includeSubtree: options.includeSubtree,
+        detailLevel,
+        turnCount: slicedTurns.length,
+        turns: slicedTurns.map((t) => ({
+          turnIndex: allTurns.indexOf(t) + 1,
+          localTurnIndex: t.localTurnIndex,
+          sessionId: t.sessionId,
+          role: t.role,
+          userPrompt: t.userPrompt,
+          assistantResponse: t.assistantResponse,
+          steps: loadedStepsMap.get(t.sessionId)?.get(t.localTurnIndex) || [],
+        })),
+      };
+      fs.writeFileSync(
+        targetPath,
+        JSON.stringify(exportData, null, 2),
+        "utf8"
+      );
+    } else {
+      fs.writeFileSync(targetPath, formattedText, "utf8");
+    }
+
+    return {
+      text: `Transcript successfully exported to: ${targetPath} (${formattedText.length} characters)`,
+      truncated: false,
+      charCount: formattedText.length,
+    };
+  }
+
+  return {
+    text: formattedText,
+    raw: slicedTurns,
+    truncated: false,
+    charCount: formattedText.length,
+  };
 }
 
 export async function getSessionDetailsFromDb(

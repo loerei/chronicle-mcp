@@ -15,8 +15,8 @@ describe("EmbeddingClient & Binary Vector Tests", () => {
     const client = new MockEmbeddingClient();
     const result = await client.embed(["hello", "world"]);
     assert.strictEqual(result.length, 2);
-    assert.deepStrictEqual(result[0], [1, 0]);
-    assert.deepStrictEqual(result[1], [1, 0]);
+    assert.strictEqual(result[0].length, EMBEDDING_DIMENSION);
+    assert.strictEqual(result[1].length, EMBEDDING_DIMENSION);
   });
 
   it("TransformersEmbeddingClient returns correct vectors when running", async () => {

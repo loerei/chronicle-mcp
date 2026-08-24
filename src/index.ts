@@ -11,7 +11,14 @@ import os from "node:os";
 import { getStore, getDb, StepCategory, StepSortMode } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
 import { getEmbeddingClient } from "./embeddings.js";
-import { searchHistory, getSessionDetailsFromDb, computeSessionBenchmarks, getToolUsageStats, generateInteractiveContextChartHtml } from "./search.js";
+import {
+  searchHistory,
+  queryTranscript,
+  getSessionDetailsFromDb,
+  computeSessionBenchmarks,
+  getToolUsageStats,
+  generateInteractiveContextChartHtml,
+} from "./search.js";
 import { ProgressReporter, ProgressNotify } from "./progress.js";
 import { handleChronicleGuide } from "./guide.js";
 
@@ -268,101 +275,93 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "query_transcript",
-      description: "Read, query, filter, slice, and export session transcript entries, tool calls, and execution results using categories and sort modes.",
+      description: "Read, query, slice, and progressively disclose conversation transcripts with token-saving detailLevel ('compact', 'full', 'summary'), turn slicing, subagent subtree resolution, and execution filters.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: {
             type: "string",
-            description: "Filter by session ID. If omitted, searches across all indexed sessions.",
+            description: "Session ID to inspect. If omitted, defaults to the most recent workspace session.",
           },
-          stepIndex: {
+          turnIndex: {
             type: "integer",
-            description: "Retrieve a single specific step index within a session.",
+            description: "Specific 1-based turn index to retrieve, or negative index (e.g. -1 for latest turn).",
           },
-          startStep: {
+          startTurn: {
             type: "integer",
-            description: "Start step index (inclusive) for slicing.",
+            description: "Start turn index (inclusive), supports negative indexing (e.g. -3 for last 3 turns).",
           },
-          endStep: {
+          endTurn: {
             type: "integer",
-            description: "End step index (inclusive) for slicing.",
+            description: "End turn index (inclusive), supports negative indexing (e.g. -1 for latest turn).",
           },
-          startConversationStep: {
+          lastTurns: {
             type: "integer",
-            description: "Start 1-based conversation turn index (inclusive).",
+            description: "Retrieve the last N turns.",
           },
-          endConversationStep: {
-            type: "integer",
-            description: "End 1-based conversation turn index (inclusive).",
-          },
-          query: {
+          detailLevel: {
             type: "string",
-            description: "Text query to find in content, thinking, or tool calls.",
+            enum: ["compact", "full", "summary"],
+            description: "Detail level: 'compact' (dialogue + execution summary, saving ~80% tokens), 'full' (complete dialogue, thinking, tool args & results), 'summary' (conversational dialogue only).",
+            default: "compact",
           },
-          toolName: {
-            oneOf: [
-              {
-                type: "string",
-                description: "Filter by executed tool name (e.g. patch_file, view_file)."
-              },
-              {
-                type: "array",
-                items: { type: "string" },
-                description: "Filter by an array of executed tool names (e.g. ['patch_file', 'view_file'])."
-              }
-            ],
-            description: "Filter by executed tool name or array of tool names (e.g. 'patch_file' or ['write_to_file', 'replace_file_content']).",
-          },
-          serverName: {
-            type: "string",
-            description: "Filter by MCP server name (e.g. patchitright, chronicle).",
-          },
-          type: {
-            type: "string",
-            description: "Filter by step type (e.g. PLANNER_RESPONSE, MCP_TOOL, COMMAND).",
-          },
-          status: {
-            type: "string",
-            description: "Filter by step status (e.g. DONE, ERROR).",
-          },
-          scope: {
-            type: "string",
-            enum: ["workspace", "all"],
-            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
-            default: "all",
-          },
-          projectPath: {
-            type: "string",
-            description: "Filter by absolute workspace path.",
-          },
-          categories: {
+          include: {
             type: "array",
             items: {
               type: "string",
-              enum: ["conversation_steps", "tool_calls", "tool_results", "thinking", "system_events"],
+              enum: ["dialogue", "thinking", "executions", "system_events"],
             },
-            description: "List of information categories to extract. Both omitting property and passing empty array [] default to all 5 categories.",
+            description: "Array masks to conditionally include dialogue, thinking, executions, or system_events.",
           },
-          sort: {
+          filePath: {
             type: "string",
-            enum: ["time_old_to_new", "time_new_to_old", "category"],
-            description: "Output sort and grouping mode.",
-            default: "time_old_to_new",
+            description: "Filter execution steps touching a specific file path or basename.",
           },
-          limit: {
-            type: "integer",
-            description: "Max number of steps/entries to return",
-            default: 20,
+          toolFilter: {
+            type: "object",
+            properties: {
+              name: {
+                oneOf: [
+                  { type: "string" },
+                  { type: "array", items: { type: "string" } },
+                ],
+                description: "Filter by tool name or array of tool names.",
+              },
+              server: {
+                type: "string",
+                description: "Filter by MCP server name.",
+              },
+              status: {
+                type: "string",
+                enum: ["DONE", "ERROR", "PENDING"],
+                description: "Filter by execution status.",
+              },
+              kind: {
+                type: "string",
+                enum: ["mcp", "command", "native", "subagent"],
+                description: "Filter by execution kind.",
+              },
+            },
+            description: "Filter execution steps by tool name, server, status, or kind.",
+          },
+          includeSubtree: {
+            type: "boolean",
+            description: "Recursively resolve and aggregate turns across all descendant subagents in chronological order.",
+            default: false,
           },
           includeUndone: {
             type: "boolean",
-            description: "Include undone / rewound steps from superseded conversation branches. Default: false.",
+            description: "Include undone / rewound steps from superseded branches.",
             default: false,
+          },
+          maxResultChars: {
+            type: "integer",
+            description: "Safety truncation limit for individual execution payloads. Default: 2500.",
+            default: 2500,
           },
           output: {
             type: "string",
-            description: "Absolute path to output file (.md or .json) or directory to write results directly.",
+            description: "Path to write output file directly (.md or .json). If a directory is specified, a default timestamped filename will be generated.",
           },
         },
       },
@@ -387,28 +386,60 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "search_history",
-      description: "Perform semantic search across past sessions and turns.",
+      description: "Perform zero-copy turn-level hybrid (FTS5 + Vector BLOB RRF), semantic, or keyword search across development sessions.",
       inputSchema: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "Natural language query or topic.",
+            description: "Search query text, symbol, error code, or natural language question.",
+          },
+          mode: {
+            type: "string",
+            enum: ["hybrid", "semantic", "keyword"],
+            description: "Search mode: 'hybrid' (combines FTS5 BM25 + Vector cosine similarity via RRF k=60), 'semantic' (dense vector cosine similarity), 'keyword' (exact FTS5 symbol matching).",
+            default: "hybrid",
           },
           limit: {
             type: "number",
-            description: "Max number of matching chunks to return",
+            description: "Maximum number of matching turn results to return. Default: 5.",
             default: 5,
+          },
+          scope: {
+            type: "string",
+            enum: ["workspace", "all"],
+            description: "Search scope: 'workspace' limits to active project; 'all' searches globally.",
+            default: "workspace",
           },
           projectPath: {
             type: "string",
             description: "Filter by absolute workspace path.",
           },
-          scope: {
-            type: "string",
-            enum: ["workspace", "all"],
-            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
-            default: "all"
+          filter: {
+            type: "object",
+            properties: {
+              role: {
+                type: "string",
+                description: "Filter by subagent role (e.g. 'research', 'reviewer').",
+              },
+              hasErrors: {
+                type: "boolean",
+                description: "Filter turns containing errors.",
+              },
+              onlySubagents: {
+                type: "boolean",
+                description: "Filter to subagent sessions only.",
+              },
+              onlyUserPrompts: {
+                type: "boolean",
+                description: "Restricts keyword search match strictly to user_prompt column.",
+              },
+              timeRange: {
+                type: "string",
+                description: "Search within a time range ('start:end').",
+              },
+            },
+            description: "Database-level filter predicates.",
           },
         },
         required: ["query"],
@@ -916,219 +947,36 @@ async function handleGetSessionArtifacts(args: any): Promise<any> {
 }
 
 export async function handleQueryTranscript(args: any): Promise<any> {
-  const sessionId = args?.sessionId as string | undefined;
-  const stepIndex = args?.stepIndex as number | undefined;
-  const startStep = args?.startStep as number | undefined;
-  const endStep = args?.endStep as number | undefined;
-  const startConversationStep = args?.startConversationStep as number | undefined;
-  const endConversationStep = args?.endConversationStep as number | undefined;
-  const queryText = args?.query as string | undefined;
-  const toolName = args?.toolName as string | string[] | undefined;
-  const serverName = args?.serverName as string | undefined;
-  const type = args?.type as string | undefined;
-  const status = args?.status as string | undefined;
-  const explicitLimit = args?.limit !== undefined ? (args.limit as number) : undefined;
-  const projectPath = args?.projectPath as string | undefined;
-  const scope = args?.scope as "workspace" | "all" | undefined;
-  let categories = args?.categories as StepCategory[] | undefined;
-  const sortMode: StepSortMode = args?.sort || "time_old_to_new";
-  const outputPath = args?.output as string | undefined;
-  let limit: number | undefined = 20;
-  if (explicitLimit !== undefined) {
-    limit = explicitLimit;
-  } else if (outputPath) {
-    limit = undefined;
-  }
-  const includeUndone = Boolean(args?.includeUndone);
-
-  // Normalize categories if omitted or empty
-  if (!categories || categories.length === 0) {
-    categories = ["conversation_steps", "tool_calls", "tool_results", "thinking", "system_events"];
-  }
-
-  const store = getStore();
-  const queryResult = store.query({
-    sessionId,
-    stepIndex,
-    startStep,
-    endStep,
-    startConversationStep,
-    endConversationStep,
-    stepQuery: queryText,
-    stepType: type,
-    stepStatus: status,
-    projectPath,
-    scope,
-    toolName,
-    serverName,
-    includeSteps: true,
-    includeUndone,
-    categories,
-    sort: sortMode,
+  const result = await queryTranscript({
+    sessionId: args?.sessionId,
+    turnIndex: args?.turnIndex,
+    startTurn: args?.startTurn ?? args?.startConversationStep,
+    endTurn: args?.endTurn ?? args?.endConversationStep,
+    lastTurns: args?.lastTurns,
+    detailLevel: args?.detailLevel,
+    include: args?.include,
+    filePath: args?.filePath,
+    toolFilter:
+      args?.toolFilter ??
+      (args?.toolName || args?.serverName || args?.status || args?.type
+        ? {
+            name: args?.toolName,
+            server: args?.serverName,
+            status: args?.status,
+            kind: args?.type,
+          }
+        : undefined),
+    includeSubtree: args?.includeSubtree,
+    includeUndone: args?.includeUndone,
+    maxResultChars: args?.maxResultChars,
+    output: args?.output,
   });
-
-  const stepsWithSessionId: any[] = [];
-  const convStepIndexMaps = new Map<string, Map<number, number>>();
-
-  for (const s of queryResult.sessions) {
-    if (s.steps) {
-      let convMap = convStepIndexMaps.get(s.id);
-      if (!convMap) {
-        const allConvResult = store.query({
-          sessionId: s.id,
-          includeSteps: true,
-          includeUndone,
-          conversationStepsOnly: true,
-        });
-        const sortedConvSteps = [...allConvResult.steps].sort((a, b) => a.stepIndex - b.stepIndex);
-        convMap = new Map<number, number>();
-        sortedConvSteps.forEach((step, idx) => {
-          convMap!.set(step.stepIndex, idx + 1);
-        });
-        convStepIndexMaps.set(s.id, convMap);
-      }
-
-      for (const step of s.steps) {
-        let toolResult: any = (step as any).tool_result;
-        if (categories.includes("tool_results") && !toolResult && (step.toolCalls || (step as any).tool_calls)) {
-          const nextStep = s.steps.find((ns: any) => ns.stepIndex === step.stepIndex + 1);
-          if (nextStep && (nextStep.type === "MCP_TOOL" || nextStep.type === "COMMAND" || nextStep.source === "SYSTEM")) {
-            toolResult = {
-              step_index: nextStep.stepIndex,
-              type: nextStep.type,
-              source: nextStep.source,
-              status: nextStep.status,
-              content: nextStep.content ?? null,
-            };
-          }
-        }
-
-        const stepObj: any = {
-          session_id: s.id,
-          step_index: step.stepIndex,
-          type: step.type,
-          source: step.source,
-          status: step.status,
-          created_at: step.createdAt ?? null,
-          is_undone: Boolean(step.isUndone || (step as any).is_undone),
-          conversation_step_index: convMap.get(step.stepIndex) ?? null,
-        };
-
-        if (categories.includes("conversation_steps") || (categories.includes("system_events") && !categories.includes("tool_results"))) {
-          stepObj.content = step.content ?? null;
-        }
-        if (categories.includes("thinking")) {
-          stepObj.thinking = step.thinking ?? null;
-        }
-        if (categories.includes("tool_calls")) {
-          stepObj.tool_calls = step.toolCalls ?? null;
-        }
-        if (categories.includes("tool_results") && toolResult !== undefined) {
-          stepObj.tool_result = toolResult;
-        }
-
-        if (step.type === "INVOKE_SUBAGENT" || step.toolCalls?.includes("invoke_subagent")) {
-          let subagentIds: string[] = [];
-          if (step.toolCalls) {
-            try {
-              const parsedCalls = JSON.parse(step.toolCalls);
-              const callsArray = Array.isArray(parsedCalls) ? parsedCalls : [parsedCalls];
-              for (const call of callsArray) {
-                if (call.name === "invoke_subagent" || call.name?.endsWith("invoke_subagent")) {
-                  const callArgs = call.args || call.arguments;
-                  if (callArgs?.Subagents && Array.isArray(callArgs.Subagents)) {
-                    for (const sub of callArgs.Subagents) {
-                      if (sub.conversationId) subagentIds.push(sub.conversationId);
-                    }
-                  }
-                }
-              }
-            } catch {
-              // ignore JSON parse error
-            }
-          }
-          if (subagentIds.length === 0 && s.childSessionIds?.length) {
-            subagentIds = s.childSessionIds;
-          }
-          if (subagentIds.length > 0) {
-            stepObj.subagent_session_ids = subagentIds;
-          }
-        }
-
-        stepsWithSessionId.push(stepObj);
-      }
-    }
-  }
-
-  // Sort logic
-  if (sortMode === "time_new_to_old") {
-    stepsWithSessionId.sort((a, b) => (b.created_at ?? 0) - (a.created_at ?? 0));
-  } else if (sortMode === "time_old_to_new") {
-    stepsWithSessionId.sort((a, b) => (a.created_at ?? 0) - (b.created_at ?? 0));
-  }
-
-  const rows = (limit !== undefined && Number.isFinite(limit)) ? stepsWithSessionId.slice(0, limit) : stepsWithSessionId;
-
-  let finalPayload: any = rows;
-
-  // Group by category if sort === "category"
-  if (sortMode === "category") {
-    const grouped: Record<string, any[]> = {
-      conversation_steps: [],
-      tool_calls: [],
-      tool_results: [],
-      thinking: [],
-      system_events: [],
-    };
-
-    for (const step of rows) {
-      if (categories.includes("conversation_steps") && (step.type === "USER_INPUT" || (step.type === "PLANNER_RESPONSE" && step.content))) {
-        grouped.conversation_steps.push(step);
-      }
-      if (categories.includes("tool_calls") && step.tool_calls) {
-        grouped.tool_calls.push(step);
-      }
-      if (categories.includes("tool_results") && (step.type === "MCP_TOOL" || step.type === "COMMAND" || step.tool_result)) {
-        grouped.tool_results.push(step);
-      }
-      if (categories.includes("thinking") && step.thinking) {
-        grouped.thinking.push(step);
-      }
-      if (categories.includes("system_events") && (step.type === "CHECKPOINT" || step.status === "ERROR" || step.source === "SYSTEM")) {
-        grouped.system_events.push(step);
-      }
-    }
-    finalPayload = grouped;
-  }
-
-  // Handle Output file export if specified
-  if (outputPath) {
-    let outputText = "";
-    if (outputPath.endsWith(".json")) {
-      outputText = JSON.stringify(finalPayload, null, 2);
-    } else {
-      // Format as readable markdown transcript documentation
-      let md = `# Session Transcript: ${sessionId || "Query Result"}\n\n`;
-      if (Array.isArray(finalPayload)) {
-        for (const step of finalPayload) {
-          md += formatStepToMarkdown(step, { includeTimestamps: true, includeCallResults: true });
-        }
-      } else {
-        outputText = `# Transcript Query Export\n\n\`\`\`json\n${JSON.stringify(finalPayload, null, 2)}\n\`\`\`\n`;
-        md = outputText;
-      }
-
-      outputText = md;
-    }
-
-    return handleOutputWrite(outputText, outputPath, `transcript_${sessionId || "query"}.md`);
-  }
 
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify(finalPayload, null, 2),
+        text: result.text,
       },
     ],
   };
@@ -1147,14 +995,20 @@ async function handleSearchSteps(args: any): Promise<any> {
 
 async function handleSearchHistory(args: any): Promise<any> {
   const query = args?.query as string;
+  const mode = args?.mode as "hybrid" | "semantic" | "keyword" | undefined;
   const limit = (args?.limit as number) || 5;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as ScopeType | undefined;
+  const filter = args?.filter;
 
-  console.error(`[Chronicle MCP] Generating embedding for query: "${query}"`);
-  const [queryVector] = await getEmbeddingClient().embed([query]);
-
-  const hits = await searchHistory(queryVector, limit, { projectPath, scope });
+  const hits = await searchHistory({
+    query,
+    mode,
+    limit,
+    projectPath,
+    scope,
+    filter,
+  });
 
   return {
     content: [

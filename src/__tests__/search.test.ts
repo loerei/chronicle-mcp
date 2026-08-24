@@ -1,13 +1,22 @@
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 import { setStore, getStore, SqliteHistoryStore } from "../db.js";
-import { SessionData } from "../adapters/types.js";
+import { SessionData, TurnData, StepData } from "../adapters/types.js";
 import { dotProduct, searchHistory, getSessionDetailsFromDb } from "../search.js";
+import { EMBEDDING_DIMENSION } from "../embeddings.js";
 
 describe("Chronicle Search Engine Tests", () => {
+  let store: SqliteHistoryStore;
+
   beforeEach(() => {
-    // Setup clean in-memory database store for each test
-    setStore(new SqliteHistoryStore(":memory:"));
+    store = new SqliteHistoryStore(":memory:");
+    setStore(store);
+  });
+
+  afterEach(() => {
+    try {
+      store.close();
+    } catch {}
   });
 
   it("should compute dot products correctly", () => {
@@ -17,284 +26,222 @@ describe("Chronicle Search Engine Tests", () => {
   });
 
   it("should insert and retrieve session details correctly", async () => {
-    const store = getStore();
     const session: SessionData = {
       id: "session-1",
       adapter: "antigravity",
       title: "Test Title",
       projectPath: "d:/projects/test",
-      createdAt: 1700000000000,
       firstPrompt: "hello",
-      secondPrompt: "world",
-      chunks: [
-        { stepIndex: 0, text: "User: hello\nAssistant: world" }
-      ]
+      createdAt: 1700000000000,
+      lastActiveAt: 1700000001000,
     };
-    store.save(session, {
-      summary: [1, 0],
-      chunks: new Map([[0, [1, 0]]])
-    });
+    const turns: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "hello",
+        assistantResponse: "world",
+        turnText: "hello world",
+        turnVector: new Float32Array(EMBEDDING_DIMENSION),
+        inputTokens: 5,
+        outputTokens: 5,
+        thinkingTokens: 0,
+        toolCount: 0,
+        errorCount: 0,
+        durationMs: 10,
+        isUndone: false,
+        createdAt: 1700000000000,
+      },
+    ];
+    store.saveSession(session, turns, []);
 
-    const details = await getSessionDetailsFromDb("session-1");
-    assert.ok(details);
-    assert.strictEqual(details.title, "Test Title");
-    assert.strictEqual(details.chunks.length, 1);
-    assert.strictEqual(details.chunks[0].chunk_text, "User: hello\nAssistant: world");
+    const retrieved = store.getSession("session-1");
+    assert.ok(retrieved);
+    assert.strictEqual(retrieved.title, "Test Title");
+    const retrievedTurns = store.getTurns("session-1");
+    assert.strictEqual(retrievedTurns.length, 1);
+    assert.strictEqual(retrievedTurns[0].userPrompt, "hello");
   });
 
-  it("should rank sessions and chunks hierarchically in searchHistory", async () => {
-    const store = getStore();
-    
-    // Insert Session A (matches closely to query [1, 0])
+  it("should rank sessions by vector cosine similarity in searchTurnsVector", async () => {
+    const vecA = new Float32Array(EMBEDDING_DIMENSION);
+    vecA[0] = 0.95;
+    vecA[1] = 0.05;
+    const vecB = new Float32Array(EMBEDDING_DIMENSION);
+    vecB[0] = 0.1;
+    vecB[1] = 0.9;
+
     const sessionA: SessionData = {
       id: "session-a",
       adapter: "antigravity",
       title: "Session A",
       projectPath: "d:/projects/a",
+      firstPrompt: "Close Match Chunk",
       createdAt: 1700000000000,
-      firstPrompt: "query matches",
-      secondPrompt: "",
-      chunks: [
-        { stepIndex: 0, text: "Close Match Chunk" },
-        { stepIndex: 1, text: "Medium Match Chunk" }
-      ]
+      lastActiveAt: 1700000001000,
     };
-    store.save(sessionA, {
-      summary: [0.9, 0.1],
-      chunks: new Map([
-        [0, [0.95, 0.05]],
-        [1, [0.7, 0.3]]
-      ])
-    });
+    const turnsA: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "Close Match Chunk",
+        assistantResponse: "Response A",
+        turnText: "Close Match Chunk Response A",
+        turnVector: vecA,
+        inputTokens: 5,
+        outputTokens: 5,
+        thinkingTokens: 0,
+        toolCount: 0,
+        errorCount: 0,
+        durationMs: 10,
+        isUndone: false,
+        createdAt: 1700000000000,
+      },
+    ];
 
-    // Insert Session B (poor match to query [1, 0])
     const sessionB: SessionData = {
       id: "session-b",
       adapter: "cursor",
       title: "Session B",
       projectPath: "d:/projects/b",
+      firstPrompt: "Irrelevant Chunk",
       createdAt: 1700000000000,
-      firstPrompt: "query differs",
-      secondPrompt: "",
-      chunks: [
-        { stepIndex: 0, text: "Irrelevant Chunk" }
-      ]
+      lastActiveAt: 1700000001000,
     };
-    store.save(sessionB, {
-      summary: [0.1, 0.9],
-      chunks: new Map([
-        [0, [0, 1]]
-      ])
-    });
-
-    // Insert 5 dummy sessions to push Session B out of top 5
-    for (let i = 1; i <= 5; i++) {
-      const dummy: SessionData = {
-        id: `session-dummy-${i}`,
-        adapter: "antigravity",
-        title: `Dummy ${i}`,
-        projectPath: "",
+    const turnsB: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "Irrelevant Chunk",
+        assistantResponse: "Response B",
+        turnText: "Irrelevant Chunk Response B",
+        turnVector: vecB,
+        inputTokens: 5,
+        outputTokens: 5,
+        thinkingTokens: 0,
+        toolCount: 0,
+        errorCount: 0,
+        durationMs: 10,
+        isUndone: false,
         createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: []
-      };
-      store.save(dummy, {
-        summary: [0.3, 0.7],
-        chunks: new Map()
-      });
-    }
+      },
+    ];
 
-    // Execute search with query vector [1, 0]
-    const hits = await searchHistory([1, 0], 3);
-    
-    assert.strictEqual(hits.length, 2); // Only chunks of Session A should be returned
-    assert.strictEqual(hits[0].chunkText, "Close Match Chunk");
-    assert.ok(Math.abs(hits[0].similarity - 0.95) < 0.01);
-    assert.strictEqual(hits[1].chunkText, "Medium Match Chunk");
-    assert.ok(Math.abs(hits[1].similarity - 0.7) < 0.01);
-  });
+    store.saveSession(sessionA, turnsA, []);
+    store.saveSession(sessionB, turnsB, []);
 
-  it("should ignore duplicate chunks with the same session_id and step_index", () => {
-    const store = getStore();
-    
-    // Insert Session
-    const session: SessionData = {
-      id: "session-dup",
-      adapter: "antigravity",
-      title: "Dup Test",
-      projectPath: "",
-      createdAt: 1700000000000,
-      firstPrompt: "",
-      secondPrompt: "",
-      chunks: [
-        { stepIndex: 1, text: "First chunk" }
-      ]
-    };
-    store.save(session, {
-      summary: [1, 0],
-      chunks: new Map([[1, [1, 0]]])
-    });
+    const queryVec = new Float32Array(EMBEDDING_DIMENSION);
+    queryVec[0] = 1.0;
 
-    // Save session again but with chunk stepIndex 1 having different text
-    const session2: SessionData = {
-      ...session,
-      chunks: [
-        { stepIndex: 1, text: "First chunk" },
-        { stepIndex: 1, text: "Duplicate chunk" }
-      ]
-    };
-    store.save(session2, {
-      summary: [1, 0],
-      chunks: new Map([[1, [1, 0]]])
-    });
-
-    // Verify only the first chunk exists
-    const res = store.query({ sessionId: "session-dup" });
-    assert.strictEqual(res.chunks.length, 1);
-    assert.strictEqual(res.chunks[0].text, "First chunk");
-  });
-
-  it("should insert, query, and slice session steps correctly", async () => {
-    const store = getStore();
-    const session: SessionData = {
-      id: "session-steps-test",
-      adapter: "antigravity",
-      title: "Steps Test Title",
-      projectPath: "d:/projects/test",
-      createdAt: 1700000000000,
-      firstPrompt: "hello",
-      secondPrompt: "world",
-      chunks: [],
-      steps: [
-        { stepIndex: 0, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "User prompt", createdAt: 1700000000000 },
-        { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Assistant text", thinking: "Thinking...", toolCalls: JSON.stringify([{ name: "test_tool" }]), createdAt: 1700000001000 },
-        { stepIndex: 2, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "Tool result", createdAt: 1700000002000 }
-      ]
-    };
-    store.save(session, {
-      summary: [1, 0],
-      chunks: new Map()
-    });
-
-    // Get session details with includeToolCalls
-    const detailsWithCalls = await getSessionDetailsFromDb("session-steps-test", { includeToolCalls: true });
-    assert.ok(detailsWithCalls);
-    assert.strictEqual(detailsWithCalls.steps.length, 3);
-    assert.strictEqual(detailsWithCalls.steps[1].type, "PLANNER_RESPONSE");
-    assert.strictEqual(detailsWithCalls.steps[1].thinking, "Thinking...");
-    assert.strictEqual(JSON.parse(detailsWithCalls.steps[1].tool_calls)[0].name, "test_tool");
-
-    // Get session details with slicing
-    const detailsSliced = await getSessionDetailsFromDb("session-steps-test", { includeToolCalls: true, startStep: 1, endStep: 2 });
-    assert.strictEqual(detailsSliced.steps.length, 2);
-    assert.strictEqual(detailsSliced.steps[0].step_index, 1);
-    assert.strictEqual(detailsSliced.steps[1].step_index, 2);
+    const hits = store.searchTurnsVector(queryVec, 2);
+    assert.strictEqual(hits.length, 2);
+    assert.strictEqual(hits[0].sessionId, "session-a");
+    assert.ok(hits[0].similarity > 0.9);
   });
 
   it("should filter searchHistory by projectPath", async () => {
-    const store = getStore();
-
-    // Insert Session C (matches closely to query [1, 0] but has different project path)
     const sessionC: SessionData = {
       id: "session-c",
       adapter: "antigravity",
       title: "Session C",
       projectPath: "d:/projects/c",
+      firstPrompt: "Match in project C",
       createdAt: 1700000000000,
-      firstPrompt: "query matches",
-      secondPrompt: "",
-      chunks: [
-        { stepIndex: 0, text: "Close Match Chunk C" }
-      ]
+      lastActiveAt: 1700000001000,
     };
-    store.save(sessionC, {
-      summary: [0.9, 0.1],
-      chunks: new Map([[0, [0.95, 0.05]]])
-    });
+    const turnsC: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "Match in project C",
+        assistantResponse: "Response C",
+        turnText: "Match in project C Response C",
+        turnVector: new Float32Array(EMBEDDING_DIMENSION),
+        inputTokens: 5,
+        outputTokens: 5,
+        thinkingTokens: 0,
+        toolCount: 0,
+        errorCount: 0,
+        durationMs: 10,
+        isUndone: false,
+        createdAt: 1700000000000,
+      },
+    ];
+    store.saveSession(sessionC, turnsC, []);
 
-    // Search with projectPath constraint
-    const hitsC = await searchHistory([1, 0], 3, { projectPath: "d:/projects/c" });
+    const hitsC = await searchHistory({
+      query: "Match",
+      mode: "keyword",
+      projectPath: "d:/projects/c",
+    });
     assert.strictEqual(hitsC.length, 1);
     assert.strictEqual(hitsC[0].sessionId, "session-c");
-    assert.strictEqual(hitsC[0].chunkText, "Close Match Chunk C");
 
-    // Search with non-matching projectPath constraint
-    const hitsNone = await searchHistory([1, 0], 3, { projectPath: "d:/projects/nonexistent" });
+    const hitsNone = await searchHistory({
+      query: "Match",
+      mode: "keyword",
+      projectPath: "d:/projects/nonexistent",
+    });
     assert.strictEqual(hitsNone.length, 0);
   });
 
-  it("should query session steps using LIKE and filters correctly", () => {
-    const store = getStore();
-    
-    // Insert session first to satisfy FOREIGN KEY constraint
+  it("should insert, query, and slice session steps correctly", async () => {
     const session: SessionData = {
       id: "session-steps-test",
       adapter: "antigravity",
       title: "Steps Test Title",
       projectPath: "d:/projects/test",
-      createdAt: 1700000000000,
       firstPrompt: "hello",
-      secondPrompt: "world",
-      chunks: [],
-      steps: [
-        { stepIndex: 5, type: "COMMAND", source: "MODEL", status: "ERROR", content: "npm run test failed", createdAt: 1700000003000 }
-      ]
-    };
-    store.save(session, {
-      summary: [1, 0],
-      chunks: new Map()
-    });
-
-    // Test query for specific content
-    const res = store.query({
-      sessionId: "session-steps-test",
-      includeSteps: true,
-      stepQuery: "failed",
-      stepStatus: "ERROR"
-    });
-    
-    assert.strictEqual(res.steps.length, 1);
-    assert.strictEqual(res.steps[0].stepIndex, 5);
-    assert.strictEqual(res.steps[0].status, "ERROR");
-  });
-
-  it("should populate conversation_step_index correctly in getSessionDetailsFromDb", async () => {
-    const store = getStore();
-    const session: SessionData = {
-      id: "session-conv-idx-test",
-      adapter: "antigravity",
-      title: "Steps Test Title",
-      projectPath: "d:/projects/test",
       createdAt: 1700000000000,
-      firstPrompt: "hello",
-      secondPrompt: "world",
-      chunks: [],
-      steps: [
-        { stepIndex: 1, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Prompt 1", createdAt: 1700000000000 },
-        { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "DONE", content: "Command", createdAt: 1700000001000 },
-        { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "", thinking: "Thinking only", createdAt: 1700000002000 },
-        { stepIndex: 4, type: "USER_INPUT", source: "USER_EXPLICIT", status: "DONE", content: "Prompt 2", createdAt: 1700000003000 },
-        { stepIndex: 5, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "Response 2", createdAt: 1700000004000 }
-      ]
+      lastActiveAt: 1700000002000,
     };
-    store.save(session, {
-      summary: [1, 0],
-      chunks: new Map()
-    });
+    const turns: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "User prompt",
+        assistantResponse: "Assistant text",
+        turnText: "User prompt Assistant text",
+        turnVector: new Float32Array(EMBEDDING_DIMENSION),
+        inputTokens: 5,
+        outputTokens: 5,
+        thinkingTokens: 0,
+        toolCount: 1,
+        errorCount: 0,
+        durationMs: 20,
+        isUndone: false,
+        createdAt: 1700000000000,
+      },
+    ];
+    const steps: StepData[] = [
+      {
+        stepIndex: 1,
+        turnIndex: 1,
+        stepOrder: 1,
+        category: "execution",
+        kind: "mcp",
+        status: "DONE",
+        thinking: "Thinking...",
+        toolName: "test_tool",
+        createdAt: 1700000001000,
+        isUndone: false,
+      },
+      {
+        stepIndex: 2,
+        turnIndex: 1,
+        stepOrder: 2,
+        category: "execution",
+        kind: "mcp",
+        status: "DONE",
+        content: "Tool result",
+        createdAt: 1700000002000,
+        isUndone: false,
+      },
+    ];
+    store.saveSession(session, turns, steps);
 
-    const details = await getSessionDetailsFromDb("session-conv-idx-test", { includeToolCalls: true });
-    assert.ok(details);
-    assert.strictEqual(details.steps.length, 5);
-    assert.strictEqual(details.steps[0].conversation_step_index, 1); // USER_INPUT
-    assert.strictEqual(details.steps[1].conversation_step_index, null); // COMMAND (not a conv step)
-    assert.strictEqual(details.steps[2].conversation_step_index, null); // PLANNER_RESPONSE (thinking only)
-    assert.strictEqual(details.steps[3].conversation_step_index, 2); // USER_INPUT
-    assert.strictEqual(details.steps[4].conversation_step_index, 3); // PLANNER_RESPONSE
+    const stepMap = store.getStepsForTurns("session-steps-test", [1]);
+    assert.strictEqual(stepMap.get(1)?.length, 2);
+    assert.strictEqual(stepMap.get(1)![0].thinking, "Thinking...");
+    assert.strictEqual(stepMap.get(1)![0].toolName, "test_tool");
   });
 
   it("should return valid chronicle_guide documentation structure", () => {
-    // Import handleChronicleGuide logic check
     const guideText = "chronicle-mcp (v1.2.0)";
     assert.ok(guideText.includes("chronicle-mcp"));
   });

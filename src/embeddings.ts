@@ -81,7 +81,8 @@ export function cosineSimilarityFloat32(
     return 0;
   }
 
-  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  const sim = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  return isNaN(sim) ? 0 : sim;
 }
 
 let extractor: any = null;
@@ -118,8 +119,47 @@ export class TransformersEmbeddingClient implements EmbeddingClient {
 }
 
 export class MockEmbeddingClient implements EmbeddingClient {
+  private mockVectors: Map<string, number[]> = new Map();
+  private dimension: number = EMBEDDING_DIMENSION;
+
+  constructor(dimension: number = EMBEDDING_DIMENSION) {
+    this.dimension = dimension;
+  }
+
+  setMockVector(text: string, vector: number[]): void {
+    if (vector.length !== this.dimension) {
+      throw new Error(
+        `Invalid mock vector dimension: expected ${this.dimension}, received ${vector.length}`
+      );
+    }
+    this.mockVectors.set(text, vector);
+  }
+
+  setMockDimension(dim: number): void {
+    this.dimension = dim;
+  }
+
+  reset(): void {
+    this.mockVectors.clear();
+  }
+
   async embed(texts: string[]): Promise<number[][]> {
-    return texts.map(() => [1, 0]);
+    return texts.map(text => {
+      if (this.mockVectors.has(text)) {
+        return this.mockVectors.get(text)!;
+      }
+      // Deterministic length-384 fallback vector based on string hash
+      const vec = new Array(this.dimension).fill(0);
+      let hash = 0;
+      for (let i = 0; i < text.length; i++) {
+        hash = (hash << 5) - hash + text.charCodeAt(i);
+        hash |= 0;
+      }
+      const val = ((Math.abs(hash) % 1000) + 1) / 1001;
+      vec[0] = val;
+      vec[1] = Math.sqrt(Math.max(0, 1 - val * val));
+      return vec;
+    });
   }
 }
 
@@ -132,3 +172,4 @@ export function getEmbeddingClient(): EmbeddingClient {
 export function setEmbeddingClient(client: EmbeddingClient): void {
   currentClient = client;
 }
+

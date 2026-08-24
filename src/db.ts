@@ -138,6 +138,14 @@ export interface SearchResult {
   similarity: number;
 }
 
+export interface SearchHistoryFilter {
+  role?: string;
+  hasErrors?: boolean;
+  onlySubagents?: boolean;
+  onlyUserPrompts?: boolean;
+  timeRange?: string; // "start:end"
+}
+
 export interface HistoryStore {
   saveSession(
     session: SessionData,
@@ -148,6 +156,12 @@ export interface HistoryStore {
   listSessions(options?: ListSessionsOptions): SessionData[];
   getTurns(sessionId: string, options?: GetTurnsOptions): TurnData[];
   getSteps(sessionId: string, options?: GetStepsOptions): StepData[];
+  getStepsForTurns(
+    sessionId: string,
+    turnIndices: number[],
+    options?: GetStepsOptions
+  ): Map<number, StepData[]>;
+  getSubtreeSessionIds(sessionId: string): string[];
   getSessionRelationship(
     sessionId: string,
     maxDepth?: number,
@@ -157,12 +171,20 @@ export interface HistoryStore {
   searchTurnsVector(
     queryVector: Float32Array | Buffer | number[],
     limit: number,
-    options?: { projectPath?: string; scope?: "workspace" | "all" }
+    options?: {
+      projectPath?: string;
+      scope?: "workspace" | "all";
+      filter?: SearchHistoryFilter;
+    }
   ): VectorSearchResult[];
   searchTurnsFTS(
     queryText: string,
     limit: number,
-    options?: { projectPath?: string; scope?: "workspace" | "all" }
+    options?: {
+      projectPath?: string;
+      scope?: "workspace" | "all";
+      filter?: SearchHistoryFilter;
+    }
   ): FTSSearchResult[];
   getActiveProjectPath(): string | undefined;
   close(): void;
@@ -213,6 +235,32 @@ function normalizeQueryVector(
   const padded = new Float32Array(EMBEDDING_DIMENSION);
   padded.set(floatVec);
   return padded;
+}
+
+/**
+ * Sanitizes and formats a raw text string into a safe SQLite FTS5 MATCH expression.
+ * Escapes internal quotes, strips empty tokens, and supports column-group isolation.
+ */
+export function sanitizeFts5Query(queryText: string, onlyUserPrompts = false): string | null {
+  if (!queryText || queryText.trim().length === 0) {
+    return null;
+  }
+  const tokens = queryText
+    .replace(/[^\p{L}\p{N}_\-./:\\]+/gu, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
+
+  if (tokens.length === 0) {
+    return null;
+  }
+
+  const quotedTokens = tokens.map((token) => `"${token.replace(/"/g, '""')}"`);
+
+  if (onlyUserPrompts) {
+    return `user_prompt : ( ${quotedTokens.join(" ")} )`;
+  }
+  return quotedTokens.join(" ");
 }
 
 export function matchToolCall(
@@ -735,6 +783,44 @@ export class InMemoryHistoryStore implements HistoryStore {
     return steps;
   }
 
+  getStepsForTurns(
+    sessionId: string,
+    turnIndices: number[],
+    options: GetStepsOptions = {}
+  ): Map<number, StepData[]> {
+    const result = new Map<number, StepData[]>();
+    if (!turnIndices || turnIndices.length === 0) {
+      return result;
+    }
+    const turnIndexSet = new Set(turnIndices);
+    for (const tIdx of turnIndexSet) {
+      result.set(tIdx, []);
+    }
+    const allSteps = this.getSteps(sessionId, options);
+    for (const step of allSteps) {
+      if (step.turnIndex !== undefined && turnIndexSet.has(step.turnIndex)) {
+        result.get(step.turnIndex)!.push(step);
+      }
+    }
+    return result;
+  }
+
+  getSubtreeSessionIds(sessionId: string): string[] {
+    const visited = new Set<string>();
+    const gather = (id: string, depth: number) => {
+      if (depth > 10 || visited.has(id)) return;
+      visited.add(id);
+      const children = Array.from(this.sessionsMap.values()).filter(
+        (s) => s.parentId === id
+      );
+      for (const child of children) {
+        gather(child.id, depth + 1);
+      }
+    };
+    gather(sessionId, 0);
+    return Array.from(visited);
+  }
+
   getSessionRelationship(
     sessionId: string,
     maxDepth = 10,
@@ -858,7 +944,11 @@ export class InMemoryHistoryStore implements HistoryStore {
   searchTurnsVector(
     queryVector: Float32Array | Buffer | number[],
     limit: number,
-    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+    options: {
+      projectPath?: string;
+      scope?: "workspace" | "all";
+      filter?: SearchHistoryFilter;
+    } = {}
   ): VectorSearchResult[] {
     const floatVec = normalizeQueryVector(queryVector);
 
@@ -882,14 +972,42 @@ export class InMemoryHistoryStore implements HistoryStore {
         }
       }
 
+      if (options.filter?.role !== undefined) {
+        if (
+          !session.role ||
+          !session.role.toLowerCase().includes(options.filter.role.toLowerCase())
+        ) {
+          continue;
+        }
+      }
+
+      if (options.filter?.onlySubagents === true && !session.parentId) {
+        continue;
+      }
+
       for (const turn of turns) {
         if (turn.isUndone) continue;
         if (!turn.turnVector) continue;
+
+        if (options.filter?.hasErrors === true && (turn.errorCount ?? 0) <= 0) {
+          continue;
+        }
+
+        if (options.filter?.timeRange !== undefined) {
+          const range = parseTimeRange(options.filter.timeRange);
+          if (range) {
+            const turnTime = turn.createdAt ?? session.createdAt;
+            if (range.start !== null && turnTime < range.start) continue;
+            if (range.end !== null && turnTime > range.end) continue;
+          }
+        }
+
         const tVec =
           turn.turnVector instanceof Float32Array
             ? turn.turnVector
             : Float32Array.from(turn.turnVector as number[]);
         const similarity = cosineSimilarityFloat32(floatVec, tVec);
+        const safeSimilarity = isNaN(similarity) ? 0 : similarity;
 
         results.push({
           sessionId: sid,
@@ -897,8 +1015,8 @@ export class InMemoryHistoryStore implements HistoryStore {
           title: session.title,
           role: session.role,
           projectPath: session.projectPath,
-          similarity,
-          userPrompt: turn.userPrompt,
+          similarity: safeSimilarity,
+          userPrompt: (turn.userPrompt || "").slice(0, 500),
           assistantSnippet: (turn.assistantResponse || "").slice(0, 200),
           createdAt: turn.createdAt ?? session.createdAt,
         });
@@ -912,9 +1030,17 @@ export class InMemoryHistoryStore implements HistoryStore {
   searchTurnsFTS(
     queryText: string,
     limit: number,
-    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+    options: {
+      projectPath?: string;
+      scope?: "workspace" | "all";
+      filter?: SearchHistoryFilter;
+    } = {}
   ): FTSSearchResult[] {
     const query = queryText.toLowerCase();
+    if (!query || query.trim().length === 0) {
+      return [];
+    }
+
     let resolvedProjectPath = options.projectPath;
     if (resolvedProjectPath === undefined && options.scope === "workspace") {
       resolvedProjectPath = this.getActiveProjectPath();
@@ -935,13 +1061,46 @@ export class InMemoryHistoryStore implements HistoryStore {
         }
       }
 
+      if (options.filter?.role !== undefined) {
+        if (
+          !session.role ||
+          !session.role.toLowerCase().includes(options.filter.role.toLowerCase())
+        ) {
+          continue;
+        }
+      }
+
+      if (options.filter?.onlySubagents === true && !session.parentId) {
+        continue;
+      }
+
       for (const turn of turns) {
         if (turn.isUndone) continue;
-        const promptMatch = turn.userPrompt?.toLowerCase().includes(query);
-        const respMatch = turn.assistantResponse?.toLowerCase().includes(query);
-        const textMatch = turn.turnText?.toLowerCase().includes(query);
 
-        if (promptMatch || respMatch || textMatch) {
+        if (options.filter?.hasErrors === true && (turn.errorCount ?? 0) <= 0) {
+          continue;
+        }
+
+        if (options.filter?.timeRange !== undefined) {
+          const range = parseTimeRange(options.filter.timeRange);
+          if (range) {
+            const turnTime = turn.createdAt ?? session.createdAt;
+            if (range.start !== null && turnTime < range.start) continue;
+            if (range.end !== null && turnTime > range.end) continue;
+          }
+        }
+
+        let isMatch = false;
+        if (options.filter?.onlyUserPrompts === true) {
+          isMatch = (turn.userPrompt || "").toLowerCase().includes(query);
+        } else {
+          const promptMatch = (turn.userPrompt || "").toLowerCase().includes(query);
+          const respMatch = (turn.assistantResponse || "").toLowerCase().includes(query);
+          const textMatch = (turn.turnText || "").toLowerCase().includes(query);
+          isMatch = promptMatch || respMatch || textMatch;
+        }
+
+        if (isMatch) {
           results.push({
             sessionId: sid,
             turnIndex: turn.turnIndex,
@@ -949,7 +1108,7 @@ export class InMemoryHistoryStore implements HistoryStore {
             role: session.role,
             projectPath: session.projectPath,
             rank: -1,
-            userPrompt: turn.userPrompt,
+            userPrompt: (turn.userPrompt || "").slice(0, 500),
             assistantSnippet: (turn.assistantResponse || "").slice(0, 200),
             createdAt: turn.createdAt ?? session.createdAt,
           });
@@ -1510,6 +1669,105 @@ export class SqliteHistoryStore implements HistoryStore {
     }));
   }
 
+  getStepsForTurns(
+    sessionId: string,
+    turnIndices: number[],
+    options: GetStepsOptions = {}
+  ): Map<number, StepData[]> {
+    const result = new Map<number, StepData[]>();
+    if (!turnIndices || turnIndices.length === 0) {
+      return result;
+    }
+    for (const tIdx of turnIndices) {
+      result.set(tIdx, []);
+    }
+
+    const placeholders = turnIndices.map(() => "?").join(",");
+    let sql = `SELECT * FROM transcript_steps WHERE session_id = ? AND turn_index IN (${placeholders})`;
+    const params: any[] = [sessionId, ...turnIndices];
+
+    if (!options.includeUndone) {
+      sql += ` AND is_undone = 0`;
+    }
+    if (options.category !== undefined) {
+      sql += ` AND category = ?`;
+      params.push(options.category);
+    }
+    if (options.kind !== undefined) {
+      sql += ` AND kind = ?`;
+      params.push(options.kind);
+    }
+    if (options.status !== undefined) {
+      sql += ` AND status = ?`;
+      params.push(options.status);
+    }
+    if (options.filePath !== undefined) {
+      sql += ` AND LOWER(file_path) LIKE ?`;
+      params.push(`%${options.filePath.toLowerCase()}%`);
+    }
+    if (options.toolName !== undefined) {
+      if (Array.isArray(options.toolName)) {
+        const tPlaceholders = options.toolName.map(() => "?").join(",");
+        sql += ` AND tool_name IN (${tPlaceholders})`;
+        params.push(...options.toolName);
+      } else {
+        sql += ` AND tool_name = ?`;
+        params.push(options.toolName);
+      }
+    }
+    if (options.serverName !== undefined) {
+      sql += ` AND server_name = ?`;
+      params.push(options.serverName);
+    }
+
+    sql += ` ORDER BY turn_index ASC, step_order ASC`;
+
+    const rows = this.db.prepare(sql).all(...params) as any[];
+    for (const r of rows) {
+      const step: StepData = {
+        stepIndex: r.step_index,
+        turnIndex: r.turn_index,
+        stepOrder: r.step_order,
+        category: r.category,
+        kind: r.kind ?? undefined,
+        status: r.status,
+        content: r.content ?? undefined,
+        thinking: r.thinking ?? undefined,
+        toolName: r.tool_name ?? undefined,
+        serverName: r.server_name ?? undefined,
+        filePath: r.file_path ?? undefined,
+        exitCode: r.exit_code ?? undefined,
+        errorMessage: r.error_message ?? undefined,
+        toolArgs: r.tool_args ?? undefined,
+        toolResult: r.tool_result ?? undefined,
+        toolDurationMs: r.tool_duration_ms ?? undefined,
+        subagentSessionId: r.subagent_session_id ?? undefined,
+        createdAt: r.created_at,
+        isUndone: r.is_undone === 1,
+      };
+      if (result.has(r.turn_index)) {
+        result.get(r.turn_index)!.push(step);
+      }
+    }
+    return result;
+  }
+
+  getSubtreeSessionIds(sessionId: string): string[] {
+    const sql = `
+      WITH RECURSIVE subtree_cte(id, depth) AS (
+        SELECT id, 0 FROM sessions WHERE id = ?
+        UNION ALL
+        SELECT s.id, st.depth + 1
+        FROM sessions s
+        JOIN subtree_cte st ON s.parent_id = st.id
+        WHERE st.depth < 10
+      )
+      SELECT id FROM sessions WHERE id IN (SELECT id FROM subtree_cte);
+    `;
+    const rows = this.db.prepare(sql).all(sessionId) as { id: string }[];
+    return rows.map((r) => r.id);
+  }
+
   getSessionRelationship(
     sessionId: string,
     maxDepth = 10,
@@ -1674,7 +1932,11 @@ export class SqliteHistoryStore implements HistoryStore {
   searchTurnsVector(
     queryVector: Float32Array | Buffer | number[],
     limit: number,
-    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+    options: {
+      projectPath?: string;
+      scope?: "workspace" | "all";
+      filter?: SearchHistoryFilter;
+    } = {}
   ): VectorSearchResult[] {
     const floatVec = normalizeQueryVector(queryVector);
 
@@ -1684,7 +1946,8 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     let sql = `
-      SELECT t.session_id, t.turn_index, t.user_prompt, t.assistant_response,
+      SELECT t.session_id, t.turn_index, SUBSTR(t.user_prompt, 1, 500) AS user_prompt,
+             SUBSTR(t.assistant_response, 1, 200) AS assistant_snippet,
              t.turn_vector, t.created_at, s.title, s.role, s.project_path
       FROM transcript_turns t
       JOIN sessions s ON t.session_id = s.id
@@ -1697,6 +1960,33 @@ export class SqliteHistoryStore implements HistoryStore {
       params.push(`%${resolvedProjectPath.toLowerCase()}%`);
     }
 
+    if (options.filter?.role !== undefined) {
+      sql += " AND LOWER(s.role) LIKE ?";
+      params.push(`%${options.filter.role.toLowerCase()}%`);
+    }
+
+    if (options.filter?.hasErrors === true) {
+      sql += " AND t.error_count > 0";
+    }
+
+    if (options.filter?.onlySubagents === true) {
+      sql += " AND s.parent_id IS NOT NULL";
+    }
+
+    if (options.filter?.timeRange !== undefined) {
+      const range = parseTimeRange(options.filter.timeRange);
+      if (range) {
+        if (range.start !== null) {
+          sql += " AND t.created_at >= ?";
+          params.push(range.start);
+        }
+        if (range.end !== null) {
+          sql += " AND t.created_at <= ?";
+          params.push(range.end);
+        }
+      }
+    }
+
     const rows = this.db.prepare(sql).all(...params) as any[];
     const results: VectorSearchResult[] = [];
 
@@ -1704,6 +1994,7 @@ export class SqliteHistoryStore implements HistoryStore {
       if (!row.turn_vector) continue;
       const turnVec = blobToVector(row.turn_vector);
       const similarity = cosineSimilarityFloat32(floatVec, turnVec);
+      const safeSimilarity = isNaN(similarity) ? 0 : similarity;
 
       results.push({
         sessionId: row.session_id,
@@ -1711,9 +2002,9 @@ export class SqliteHistoryStore implements HistoryStore {
         title: row.title,
         role: row.role ?? undefined,
         projectPath: row.project_path,
-        similarity,
+        similarity: safeSimilarity,
         userPrompt: row.user_prompt,
-        assistantSnippet: (row.assistant_response || "").slice(0, 200),
+        assistantSnippet: row.assistant_snippet ?? "",
         createdAt: row.created_at,
       });
     }
@@ -1725,15 +2016,25 @@ export class SqliteHistoryStore implements HistoryStore {
   searchTurnsFTS(
     queryText: string,
     limit: number,
-    options: { projectPath?: string; scope?: "workspace" | "all" } = {}
+    options: {
+      projectPath?: string;
+      scope?: "workspace" | "all";
+      filter?: SearchHistoryFilter;
+    } = {}
   ): FTSSearchResult[] {
+    const onlyUserPrompts = options.filter?.onlyUserPrompts === true;
+    const ftsExpression = sanitizeFts5Query(queryText, onlyUserPrompts);
+    if (!ftsExpression) {
+      return [];
+    }
+
     let resolvedProjectPath = options.projectPath;
     if (resolvedProjectPath === undefined && options.scope === "workspace") {
       resolvedProjectPath = this.getActiveProjectPath();
     }
 
     let sql = `
-      SELECT f.rowid, f.user_prompt, f.assistant_response, f.turn_text,
+      SELECT f.rowid, f.user_prompt, SUBSTR(f.assistant_response, 1, 200) AS assistant_snippet,
              bm25(transcript_turns_fts) as rank,
              t.session_id, t.turn_index, t.created_at,
              s.title, s.role, s.project_path
@@ -1742,28 +2043,60 @@ export class SqliteHistoryStore implements HistoryStore {
       JOIN sessions s ON t.session_id = s.id
       WHERE transcript_turns_fts MATCH ? AND t.is_undone = 0
     `;
-    const params: any[] = [queryText];
+    const params: any[] = [ftsExpression];
 
     if (resolvedProjectPath !== undefined) {
       sql += " AND LOWER(s.project_path) LIKE ?";
       params.push(`%${resolvedProjectPath.toLowerCase()}%`);
     }
 
+    if (options.filter?.role !== undefined) {
+      sql += " AND LOWER(s.role) LIKE ?";
+      params.push(`%${options.filter.role.toLowerCase()}%`);
+    }
+
+    if (options.filter?.hasErrors === true) {
+      sql += " AND t.error_count > 0";
+    }
+
+    if (options.filter?.onlySubagents === true) {
+      sql += " AND s.parent_id IS NOT NULL";
+    }
+
+    if (options.filter?.timeRange !== undefined) {
+      const range = parseTimeRange(options.filter.timeRange);
+      if (range) {
+        if (range.start !== null) {
+          sql += " AND t.created_at >= ?";
+          params.push(range.start);
+        }
+        if (range.end !== null) {
+          sql += " AND t.created_at <= ?";
+          params.push(range.end);
+        }
+      }
+    }
+
     sql += " ORDER BY rank LIMIT ?";
     params.push(limit);
 
-    const rows = this.db.prepare(sql).all(...params) as any[];
-    return rows.map((r) => ({
-      sessionId: r.session_id,
-      turnIndex: r.turn_index,
-      title: r.title,
-      role: r.role ?? undefined,
-      projectPath: r.project_path,
-      rank: r.rank,
-      userPrompt: r.user_prompt,
-      assistantSnippet: (r.assistant_response || "").slice(0, 200),
-      createdAt: r.created_at,
-    }));
+    try {
+      const rows = this.db.prepare(sql).all(...params) as any[];
+      return rows.map((r) => ({
+        sessionId: r.session_id,
+        turnIndex: r.turn_index,
+        title: r.title,
+        role: r.role ?? undefined,
+        projectPath: r.project_path,
+        rank: r.rank,
+        userPrompt: r.user_prompt,
+        assistantSnippet: r.assistant_snippet ?? "",
+        createdAt: r.created_at,
+      }));
+    } catch (e: any) {
+      console.error("[Chronicle DB] FTS query execution fallback:", e?.message || String(e));
+      return [];
+    }
   }
 
   getActiveProjectPath(): string | undefined {
@@ -1776,7 +2109,9 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   close(): void {
-    // DatabaseSync instances don't require manual close unless needed
+    try {
+      this.db.close();
+    } catch {}
   }
 
   // ============================================================
