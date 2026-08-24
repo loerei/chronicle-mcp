@@ -1,332 +1,621 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { SessionParser } from "../adapters/SessionParser.js";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { DatabaseSync } from "node:sqlite";
+import { SessionParser, cleanUserRequest, countTokens } from "../adapters/SessionParser.js";
+import { AntigravityAdapter, discoverBrainArtifacts } from "../adapters/Antigravity.js";
+import { CursorAdapter } from "../adapters/Cursor.js";
 
-describe("SessionParser Tests", () => {
-  describe("parseAntigravity", () => {
-    it("should parse valid Antigravity log content", () => {
-      const sessionId = "session-1";
+describe("SessionParser Tests (2-Layer Architecture)", () => {
+  describe("Prompt Sanitization & cleanUserRequest", () => {
+    it("should unwrap <USER_REQUEST> tags while preserving inner prompt and stripping context wrappers", () => {
+      const input = `<USER_REQUEST session_id="abc-123">
+Fix the generic function: function parse<T>(input: List<T>): Map<K, V> {
+  if (a < b && c > d) return new Map();
+  return <div className="test" />;
+}
+</USER_REQUEST>
+<ADDITIONAL_METADATA id="meta-1">
+Workspace mapping: d:\\Projects\\my-project
+Environment: windows
+</ADDITIONAL_METADATA>
+<SYSTEM_PROMPT>
+Follow these core rules...
+</SYSTEM_PROMPT>
+<user_instructions>
+Always write clean code
+</user_instructions>`;
+
+      const cleaned = cleanUserRequest(input);
+      assert.ok(cleaned.includes("function parse<T>(input: List<T>): Map<K, V>"));
+      assert.ok(cleaned.includes("if (a < b && c > d)"));
+      assert.ok(cleaned.includes('<div className="test" />'));
+      assert.strictEqual(cleaned.includes("<USER_REQUEST>"), false);
+      assert.strictEqual(cleaned.includes("</USER_REQUEST>"), false);
+      assert.strictEqual(cleaned.includes("ADDITIONAL_METADATA"), false);
+      assert.strictEqual(cleaned.includes("SYSTEM_PROMPT"), false);
+      assert.strictEqual(cleaned.includes("user_instructions"), false);
+    });
+
+    it("should handle empty or falsy inputs gracefully", () => {
+      assert.strictEqual(cleanUserRequest(""), "");
+      assert.strictEqual(cleanUserRequest(null as any), "");
+      assert.strictEqual(cleanUserRequest(undefined as any), "");
+    });
+  });
+
+  describe("BPE Token Precomputation", () => {
+    it("should compute exact BPE token counts for text, code, and thinking blocks", () => {
+      const prompt = "Please configure PostgreSQL with pgvector extension.";
+      const response = "To install pgvector on PostgreSQL:\n```sql\nCREATE EXTENSION IF NOT EXISTS vector;\n```";
+      const thinking = "The user wants to setup pgvector. I will provide the standard SQL command.";
+
+      const promptTokens = countTokens(prompt);
+      const responseTokens = countTokens(response);
+      const thinkingTokens = countTokens(thinking);
+
+      assert.ok(promptTokens > 5);
+      assert.ok(responseTokens > 10);
+      assert.ok(thinkingTokens > 5);
+      assert.strictEqual(countTokens(""), 0);
+      assert.strictEqual(countTokens(null), 0);
+      assert.strictEqual(countTokens(undefined), 0);
+    });
+
+    it("should safely handle malformed unicode and lone surrogates without throwing", () => {
+      const loneSurrogate = "Hello \uD800 World";
+      const tokens = countTokens(loneSurrogate);
+      assert.ok(tokens > 0);
+    });
+  });
+
+  describe("parseAntigravity Turn Segmentation & Paired Tool Execution", () => {
+    it("should parse 2-layer turns, separate agent vs execution steps, and compute turn metrics", () => {
+      const sessionId = "session-paired-1";
       const jsonl = [
         JSON.stringify({
           type: "USER_INPUT",
           step_index: 0,
           source: "USER_EXPLICIT",
           status: "DONE",
-          content: String.raw`<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\Projects\my-project</ADDITIONAL_METADATA>`,
-          created_at: "2026-06-14T12:00:00.000Z"
+          content: "<USER_REQUEST>Initialize database schema</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\\Projects\\demo-app</ADDITIONAL_METADATA>",
+          created_at: "2026-08-20T10:00:00.000Z",
         }),
         JSON.stringify({
           type: "PLANNER_RESPONSE",
           step_index: 1,
           source: "MODEL",
           status: "DONE",
-          content: "I have initialized the project.",
-          created_at: "2026-06-14T12:00:05.000Z"
-        })
+          content: "I will check the directory and create schema.sql.",
+          thinking: "Checking existing files first.",
+          tool_calls: [
+            {
+              name: "patchitright_write_file",
+              arguments: {
+                target_file: "d:\\Projects\\demo-app\\schema.sql",
+                code_content: "CREATE TABLE users (id INT);",
+              },
+            },
+          ],
+          created_at: "2026-08-20T10:00:02.000Z",
+        }),
+        JSON.stringify({
+          type: "MCP_TOOL",
+          step_index: 2,
+          source: "SYSTEM",
+          status: "DONE",
+          content: JSON.stringify({ success: true, target_file: "d:\\Projects\\demo-app\\schema.sql" }),
+          created_at: "2026-08-20T10:00:05.000Z",
+        }),
       ].join("\n");
 
       const session = SessionParser.parseAntigravity(sessionId, jsonl);
       assert.ok(session);
       assert.strictEqual(session.id, sessionId);
       assert.strictEqual(session.adapter, "antigravity");
-      assert.strictEqual(session.title, "Setup the project");
-      assert.strictEqual(session.projectPath, "d:/Projects/my-project");
-      assert.strictEqual(session.firstPrompt, "Setup the project");
-      assert.strictEqual(session.chunks.length, 1);
-      assert.strictEqual(
-        session.chunks[0].text,
-        "User: Setup the project\nAssistant: I have initialized the project."
-      );
-      assert.ok(session.steps);
-      assert.strictEqual(session.steps.length, 2);
-      assert.strictEqual(session.steps[0].content, String.raw`<USER_REQUEST>Setup the project</USER_REQUEST><ADDITIONAL_METADATA>Workspace mapping: d:\Projects\my-project</ADDITIONAL_METADATA>`);
+      assert.strictEqual(session.projectPath, "d:/Projects/demo-app");
+      assert.strictEqual(session.firstPrompt, "Initialize database schema");
+      assert.strictEqual(session.totalTurns, 1);
+      assert.strictEqual(session.turns?.length, 1);
+
+      const turn = session.turns![0];
+      assert.strictEqual(turn.turnIndex, 1);
+      assert.strictEqual(turn.userPrompt, "Initialize database schema");
+      assert.strictEqual(turn.assistantResponse, "I will check the directory and create schema.sql.");
+      assert.strictEqual(turn.turnText, "Initialize database schema I will check the directory and create schema.sql.");
+      assert.ok(turn.inputTokens! > 0);
+      assert.ok(turn.outputTokens! > 0);
+      assert.ok(turn.thinkingTokens! > 0);
+      assert.strictEqual(turn.toolCount, 1);
+      assert.strictEqual(turn.errorCount, 0);
+      assert.strictEqual(turn.durationMs, 5000); // 10:00:00 to 10:00:05
+
+      // Steps within turn: 1 user, 1 agent dialogue, 1 execution
+      assert.strictEqual(turn.steps?.length, 3);
+      assert.strictEqual(turn.steps![0].category, "user");
+      assert.strictEqual(turn.steps![0].stepOrder, 1);
+      assert.strictEqual(turn.steps![1].category, "agent");
+      assert.strictEqual(turn.steps![1].stepOrder, 2);
+      assert.strictEqual(turn.steps![1].content, "I will check the directory and create schema.sql.");
+      assert.strictEqual(turn.steps![1].thinking, "Checking existing files first.");
+
+      assert.strictEqual(turn.steps![2].category, "execution");
+      assert.strictEqual(turn.steps![2].stepOrder, 3);
+      assert.strictEqual(turn.steps![2].toolName, "write_file");
+      assert.strictEqual(turn.steps![2].serverName, "patchitright");
+      assert.strictEqual(turn.steps![2].kind, "mcp");
+      assert.strictEqual(turn.steps![2].filePath, "d:/Projects/demo-app/schema.sql");
+      assert.strictEqual(turn.steps![2].status, "DONE");
+      assert.strictEqual(turn.steps![2].toolDurationMs, 3000); // 10:00:02 to 10:00:05
+
+      // Files touched
+      assert.deepStrictEqual(session.filesTouched, ["d:/Projects/demo-app/schema.sql"]);
     });
 
-    it("should extract projectPath from tool calls if not present in user input", () => {
-      const sessionId = "session-tool-path";
+    it("should handle pure tool invocations without emitting phantom agent steps", () => {
+      const sessionId = "session-pure-tools";
       const jsonl = [
         JSON.stringify({
           type: "USER_INPUT",
           step_index: 0,
-          content: "Run build",
-          created_at: "2026-06-14T12:00:00.000Z"
+          content: "Run test suite",
+          created_at: "2026-08-20T10:00:00.000Z",
         }),
         JSON.stringify({
           type: "PLANNER_RESPONSE",
           step_index: 1,
-          content: "Running build...",
-          tool_calls: [{
-            name: "run_command",
-            arguments: {
-              CommandLine: "npm run build",
-              Cwd: String.raw`d:\Projects\my-cool-project`
-            }
-          }]
-        })
-      ].join("\n");
-
-      const session = SessionParser.parseAntigravity(sessionId, jsonl);
-      assert.ok(session);
-      assert.strictEqual(session.projectPath, "d:/Projects/my-cool-project");
-    });
-
-    it("should combine sequential PLANNER_RESPONSE steps and multiple turns into chunks", () => {
-      const sessionId = "session-2";
-      const jsonl = [
-        JSON.stringify({
-          type: "USER_INPUT",
-          step_index: 0,
-          content: "Turn 1 request",
-          created_at: "2026-06-14T12:00:00.000Z"
+          content: "", // no dialogue
+          tool_calls: [
+            {
+              name: "run_command",
+              arguments: {
+                CommandLine: "npm test",
+                Cwd: "d:\\Projects\\demo-app",
+              },
+            },
+          ],
+          created_at: "2026-08-20T10:00:01.000Z",
         }),
         JSON.stringify({
-          type: "PLANNER_RESPONSE",
-          step_index: 1,
-          content: "Turn 1 reply part 1"
-        }),
-        JSON.stringify({
-          type: "PLANNER_RESPONSE",
+          type: "COMMAND",
           step_index: 2,
-          content: "Turn 1 reply part 2"
+          status: "DONE",
+          content: "10 tests passed",
+          exit_code: 0,
+          created_at: "2026-08-20T10:00:04.000Z",
         }),
-        JSON.stringify({
-          type: "USER_INPUT",
-          step_index: 3,
-          content: "Turn 2 request"
-        }),
-        JSON.stringify({
-          type: "PLANNER_RESPONSE",
-          step_index: 4,
-          content: "Turn 2 reply"
-        })
       ].join("\n");
 
       const session = SessionParser.parseAntigravity(sessionId, jsonl);
       assert.ok(session);
-      assert.strictEqual(session.chunks.length, 2);
-      assert.strictEqual(
-        session.chunks[0].text,
-        "User: Turn 1 request\nAssistant: Turn 1 reply part 1\nTurn 1 reply part 2"
-      );
-      assert.strictEqual(
-        session.chunks[1].text,
-        "User: Turn 2 request\nAssistant: Turn 2 reply"
-      );
-      assert.strictEqual(session.firstPrompt, "Turn 1 request");
-      assert.strictEqual(session.secondPrompt, "Turn 2 request");
+      const turn = session.turns![0];
+      // Expect 1 user step and 1 execution step (NO phantom agent step)
+      assert.strictEqual(turn.steps?.length, 2);
+      assert.strictEqual(turn.steps![0].category, "user");
+      assert.strictEqual(turn.steps![1].category, "execution");
+      assert.strictEqual(turn.steps![1].kind, "command");
+      assert.strictEqual(turn.steps![1].toolName, "run_command");
+      assert.strictEqual(turn.steps![1].status, "DONE");
+      assert.strictEqual(turn.steps![1].exitCode, 0);
     });
 
-    it("should clean user request XML tags and leftover html tags", () => {
-      const sessionId = "session-3";
-      const jsonl = JSON.stringify({
-        type: "USER_INPUT",
-        step_index: 0,
-        content: "<USER_REQUEST>Do <b>bold</b> action</USER_REQUEST><ADDITIONAL_METADATA>ignore</ADDITIONAL_METADATA>",
-        created_at: "2026-06-14T12:00:00.000Z"
-      });
+    it("should synthesize Turn 1 for headless/pre-turn steps and advance to Turn 2 upon explicit user input", () => {
+      const sessionId = "session-headless";
+      const jsonl = [
+        // Autonomous pre-turn steps
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 0,
+          content: "Autonomous background start",
+          created_at: "2026-08-20T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "MCP_TOOL",
+          step_index: 1,
+          status: "DONE",
+          content: "ready",
+          created_at: "2026-08-20T10:00:01.000Z",
+        }),
+        // Subsequent user prompt
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 2,
+          content: "User prompt arriving later",
+          created_at: "2026-08-20T10:00:10.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 3,
+          content: "User response",
+          created_at: "2026-08-20T10:00:12.000Z",
+        }),
+      ].join("\n");
 
       const session = SessionParser.parseAntigravity(sessionId, jsonl);
       assert.ok(session);
-      assert.strictEqual(session.firstPrompt, "Do bold action");
+      assert.strictEqual(session.turns?.length, 2);
+
+      // Turn 1 is synthetic
+      assert.strictEqual(session.turns![0].turnIndex, 1);
+      assert.strictEqual(session.turns![0].userPrompt, "");
+      assert.strictEqual(session.turns![0].assistantResponse, "Autonomous background start");
+
+      // Turn 2 is explicit user input
+      assert.strictEqual(session.turns![1].turnIndex, 2);
+      assert.strictEqual(session.turns![1].userPrompt, "User prompt arriving later");
+      assert.strictEqual(session.turns![1].assistantResponse, "User response");
     });
 
-    it("should extract subagent conversation IDs from steps of type INVOKE_SUBAGENT", () => {
-      const sessionId = "session-4";
+    it("should handle parallel tool calls, orphaned calls (PENDING), and unsolicited executions", () => {
+      const sessionId = "session-parallel-tools";
       const jsonl = [
         JSON.stringify({
           type: "USER_INPUT",
           step_index: 0,
-          content: "Let's call some subagents",
-          created_at: "2026-06-14T12:00:00.000Z"
+          content: "Run diagnostics",
+          created_at: "2026-08-20T10:00:00.000Z",
         }),
         JSON.stringify({
-          type: "INVOKE_SUBAGENT",
+          type: "PLANNER_RESPONSE",
           step_index: 1,
-          content: `Running subagent... details: { "conversationId": "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d" } and maybe another { "conversationId": "f9e8d7c6-b5a4-3f2e-1d0c-9b8a7f6e5d4c" }`,
-          created_at: "2026-06-14T12:00:05.000Z"
-        })
+          content: "Running 2 tools in parallel",
+          tool_calls: [
+            { name: "read_file", arguments: { target_file: "d:\\Projects\\demo\\a.ts" } },
+            { name: "read_file", arguments: { target_file: "d:\\Projects\\demo\\b.ts" } },
+            { name: "read_file", arguments: { target_file: "d:\\Projects\\demo\\c.ts" } }, // unexecuted orphan
+          ],
+          created_at: "2026-08-20T10:00:01.000Z",
+        }),
+        // Output for call 1
+        JSON.stringify({
+          type: "MCP_TOOL",
+          step_index: 2,
+          status: "DONE",
+          content: "content of a.ts",
+          created_at: "2026-08-20T10:00:02.000Z",
+        }),
+        // Output for call 2
+        JSON.stringify({
+          type: "MCP_TOOL",
+          step_index: 3,
+          status: "ERROR",
+          error_message: "File not found: b.ts",
+          created_at: "2026-08-20T10:00:03.000Z",
+        }),
+        // Unsolicited execution event
+        JSON.stringify({
+          type: "COMMAND",
+          step_index: 4,
+          status: "DONE",
+          content: "system telemetry",
+          created_at: "2026-08-20T10:00:04.000Z",
+        }),
       ].join("\n");
 
       const session = SessionParser.parseAntigravity(sessionId, jsonl);
       assert.ok(session);
-      assert.deepStrictEqual(session.subagentIds, [
-        "a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d",
-        "f9e8d7c6-b5a4-3f2e-1d0c-9b8a7f6e5d4c"
-      ]);
+      const turn = session.turns![0];
+      assert.strictEqual(turn.toolCount, 4); // 2 executed + 1 unsolicited + 1 pending
+      assert.strictEqual(turn.errorCount, 1);
+
+      const execSteps = turn.steps?.filter(s => s.category === "execution");
+      assert.strictEqual(execSteps?.length, 4);
+      assert.strictEqual(execSteps![0].status, "DONE");
+      assert.strictEqual(execSteps![0].filePath, "d:/Projects/demo/a.ts");
+      assert.strictEqual(execSteps![1].status, "ERROR");
+      assert.strictEqual(execSteps![1].errorMessage, "File not found: b.ts");
+      assert.strictEqual(execSteps![2].category, "execution");
+      assert.strictEqual(execSteps![2].status, "DONE");
+      assert.strictEqual(execSteps![3].status, "PENDING");
+      assert.strictEqual(execSteps![3].filePath, "d:/Projects/demo/c.ts");
     });
 
-    it("should detect step index rewinds, mark superseded steps as isUndone, and preserve active surviving timeline", () => {
-      const sessionId = "session-rewind-test";
+    it("should detect step index rewinds, mark superseded turns/steps as isUndone, and exclude them from active totals", () => {
+      const sessionId = "session-rewind-2layer";
       const jsonl = [
         // Turn 1
         JSON.stringify({
           type: "USER_INPUT",
           step_index: 0,
-          content: "First question",
-          created_at: "2026-08-18T00:00:00.000Z"
+          content: "Turn 1 prompt",
+          created_at: "2026-08-20T10:00:00.000Z",
         }),
         JSON.stringify({
           type: "PLANNER_RESPONSE",
           step_index: 1,
-          content: "First answer",
-          created_at: "2026-08-18T00:00:05.000Z"
+          content: "Turn 1 reply",
+          created_at: "2026-08-20T10:00:01.000Z",
         }),
-        // Turn 2 (Old branch - later undone)
+        // Turn 2 (to be undone)
         JSON.stringify({
           type: "USER_INPUT",
           step_index: 2,
-          content: "Undone second question",
-          created_at: "2026-08-18T00:01:00.000Z"
+          content: "Turn 2 undone prompt",
+          created_at: "2026-08-20T10:00:05.000Z",
         }),
         JSON.stringify({
           type: "PLANNER_RESPONSE",
           step_index: 3,
-          content: "Undone second answer",
-          created_at: "2026-08-18T00:01:05.000Z"
+          content: "Turn 2 undone reply",
+          created_at: "2026-08-20T10:00:06.000Z",
         }),
-        // Rollback / Rewind back to step 2 with a new prompt
+        // Rewind back to step_index: 2 with a new prompt
         JSON.stringify({
           type: "USER_INPUT",
           step_index: 2,
-          content: "Surviving second question",
-          created_at: "2026-08-18T00:02:00.000Z"
+          content: "Turn 2 surviving prompt",
+          created_at: "2026-08-20T10:00:10.000Z",
         }),
         JSON.stringify({
           type: "PLANNER_RESPONSE",
           step_index: 3,
-          content: "Surviving second answer",
-          created_at: "2026-08-18T00:02:05.000Z"
-        })
+          content: "Turn 2 surviving reply",
+          created_at: "2026-08-20T10:00:11.000Z",
+        }),
       ].join("\n");
 
       const session = SessionParser.parseAntigravity(sessionId, jsonl);
       assert.ok(session);
-      assert.strictEqual(session.steps?.length, 6);
-      
-      // Check undone steps
-      const undoneSteps = session.steps?.filter(s => s.isUndone);
-      assert.strictEqual(undoneSteps?.length, 2);
-      assert.strictEqual(undoneSteps?.[0].content, "Undone second question");
-      assert.strictEqual(undoneSteps?.[1].content, "Undone second answer");
+      assert.strictEqual(session.turns?.length, 3); // 1 active Turn 1, 1 undone Turn 2, 1 active Turn 3
+      assert.strictEqual(session.totalTurns, 2); // only active turns
 
-      // Check active steps
-      const activeSteps = session.steps?.filter(s => !s.isUndone);
-      assert.strictEqual(activeSteps?.length, 4);
-      assert.strictEqual(activeSteps?.[2].content, "Surviving second question");
-      assert.strictEqual(activeSteps?.[3].content, "Surviving second answer");
+      const undoneTurn = session.turns!.find(t => t.userPrompt === "Turn 2 undone prompt");
+      assert.ok(undoneTurn);
+      assert.strictEqual(undoneTurn.isUndone, true);
 
-      // Check session metadata reflects active timeline
-      assert.strictEqual(session.firstPrompt, "First question");
-      assert.strictEqual(session.secondPrompt, "Surviving second question");
-      assert.strictEqual(session.chunks.length, 2);
-      assert.strictEqual(
-        session.chunks[1].text,
-        "User: Surviving second question\nAssistant: Surviving second answer"
-      );
+      const survivingTurn = session.turns!.find(t => t.userPrompt === "Turn 2 surviving prompt");
+      assert.ok(survivingTurn);
+      assert.strictEqual(survivingTurn.isUndone, false);
+    });
+
+    it("should extract subagent topology, ignoring send_message to parent", () => {
+      const sessionId = "session-subagent-parent";
+      const jsonl = [
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "Coordinate with subagents",
+          created_at: "2026-08-20T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "Messaging parent and child",
+          tool_calls: [
+            {
+              name: "send_message",
+              arguments: { Recipient: "parent", Message: "Done" },
+            },
+            {
+              name: "send_message",
+              arguments: { Recipient: "child-subagent-uuid-1", Message: "Analyze" },
+            },
+          ],
+          created_at: "2026-08-20T10:00:01.000Z",
+        }),
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      assert.deepStrictEqual(session.subagentIds, ["child-subagent-uuid-1"]);
+    });
+
+    it("should extract and deduplicate filesTouched across string and string[] arguments, stripping file:/// and excluding Cwd", () => {
+      const sessionId = "session-files-touched";
+      const jsonl = [
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "Generate images and modify code",
+          created_at: "2026-08-20T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "Running tools",
+          tool_calls: [
+            {
+              name: "generate_image",
+              arguments: {
+                ImagePaths: ["file:///d:/Projects/app/img1.png", "d:\\Projects\\app\\img2.png", ""],
+                Prompt: "logo",
+              },
+            },
+            {
+              name: "patch_file",
+              arguments: {
+                target_file: "d:\\Projects\\app\\src\\main.ts",
+                Cwd: "d:\\Projects\\app", // Cwd must be excluded from filesTouched
+              },
+            },
+          ],
+          created_at: "2026-08-20T10:00:01.000Z",
+        }),
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      assert.ok(session.filesTouched?.includes("d:/Projects/app/img1.png"));
+      assert.ok(session.filesTouched?.includes("d:/Projects/app/img2.png"));
+      assert.ok(session.filesTouched?.includes("d:/Projects/app/src/main.ts"));
+      assert.strictEqual(session.filesTouched?.includes("d:/Projects/app"), false); // Cwd excluded
     });
   });
 
-  describe("parseCursorComposer", () => {
-    it("should parse valid Cursor composer state", () => {
+  describe("AntigravityAdapter & discoverBrainArtifacts", () => {
+    it("should discover shallow markdown artifacts ignoring hidden files and subdirectories", () => {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "chronicle-artifacts-test-"));
+      try {
+        fs.writeFileSync(path.join(tempDir, "implementation_plan.md"), "# Plan");
+        fs.writeFileSync(path.join(tempDir, "walkthrough.md"), "# Walkthrough");
+        fs.writeFileSync(path.join(tempDir, "notes.txt"), "text file");
+        fs.writeFileSync(path.join(tempDir, ".hidden.md"), "hidden");
+        fs.mkdirSync(path.join(tempDir, "subdir.md")); // directory named .md
+
+        const artifacts = discoverBrainArtifacts(tempDir);
+        assert.deepStrictEqual(artifacts, ["implementation_plan.md", "walkthrough.md"]);
+
+        // Missing directory returns empty array safely
+        const nonExistent = discoverBrainArtifacts(path.join(tempDir, "non_existent_dir"));
+        assert.deepStrictEqual(nonExistent, []);
+      } finally {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it("should link ancestor hierarchy and prevent infinite loops with cycle detection", async () => {
+      const tempBrain = fs.mkdtempSync(path.join(os.tmpdir(), "chronicle-brain-cycle-"));
+      try {
+        const sidA = "sess-a";
+        const sidB = "sess-b";
+
+        const dirA = path.join(tempBrain, sidA, ".system_generated", "logs");
+        const dirB = path.join(tempBrain, sidB, ".system_generated", "logs");
+        fs.mkdirSync(dirA, { recursive: true });
+        fs.mkdirSync(dirB, { recursive: true });
+
+        // Session A calls Session B
+        const jsonlA = [
+          JSON.stringify({ type: "USER_INPUT", step_index: 0, content: "Start A" }),
+          JSON.stringify({
+            type: "PLANNER_RESPONSE",
+            step_index: 1,
+            content: "Call B",
+            tool_calls: [{ name: "send_message", arguments: { Recipient: sidB } }],
+          }),
+        ].join("\n");
+
+        // Session B calls Session A (Cycle simulation)
+        const jsonlB = [
+          JSON.stringify({ type: "USER_INPUT", step_index: 0, content: "Start B" }),
+          JSON.stringify({
+            type: "PLANNER_RESPONSE",
+            step_index: 1,
+            content: "Call A",
+            tool_calls: [{ name: "send_message", arguments: { Recipient: sidA } }],
+          }),
+        ].join("\n");
+
+        fs.writeFileSync(path.join(dirA, "transcript.jsonl"), jsonlA);
+        fs.writeFileSync(path.join(dirB, "transcript.jsonl"), jsonlB);
+
+        const adapter = new AntigravityAdapter(tempBrain);
+        const sessions = await adapter.discoverSessions();
+
+        assert.strictEqual(sessions.length, 2);
+        // Both sessions should resolve rootId and depth without hanging/stack overflow
+        for (const s of sessions) {
+          assert.ok(s.rootId);
+          assert.ok(typeof s.depth === "number");
+        }
+      } finally {
+        fs.rmSync(tempBrain, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("CursorAdapter & parseCursorComposer", () => {
+    it("should parse Cursor composer bubbles into 2-layer SessionData and TurnData", () => {
       const composerId = "composer-1";
-      const state = {
-        createdAt: 1700000000000,
-        name: "My Composer Title",
-        workspacePath: String.raw`d:\Projects\another-project`,
+      const composerState = {
+        name: "Feature Implementation",
+        workspacePath: "d:\\Projects\\cursor-app",
+        createdAt: 1000,
         conversation: [
           {
-            type: "user",
-            text: "Hello, can you help?"
+            type: 1, // user
+            text: "Create api router",
+            createdAt: 1000,
           },
           {
-            type: "ai",
-            text: "Yes, sure!"
-          }
-        ]
+            type: 2, // ai
+            text: "I will create router.ts",
+            thinking: "Designing express router",
+            createdAt: 1005,
+            toolFormerData: {
+              name: "write_file",
+              params: JSON.stringify({ target_file: "d:\\Projects\\cursor-app\\router.ts" }),
+              status: "completed",
+              result: "file written",
+            },
+          },
+        ],
       };
 
-      const session = SessionParser.parseCursorComposer(composerId, state);
+      const session = SessionParser.parseCursorComposer(composerId, composerState);
       assert.ok(session);
       assert.strictEqual(session.id, composerId);
       assert.strictEqual(session.adapter, "cursor");
-      assert.strictEqual(session.title, "My Composer Title");
-      assert.strictEqual(session.projectPath, "d:/Projects/another-project");
-      assert.strictEqual(session.firstPrompt, "Hello, can you help?");
-      assert.strictEqual(session.chunks.length, 1);
-      assert.strictEqual(
-        session.chunks[0].text,
-        "User: Hello, can you help?\nAssistant: Yes, sure!"
-      );
+      assert.strictEqual(session.title, "Feature Implementation");
+      assert.strictEqual(session.projectPath, "d:/Projects/cursor-app");
+      assert.strictEqual(session.turns?.length, 1);
+
+      const turn = session.turns![0];
+      assert.strictEqual(turn.turnIndex, 1);
+      assert.strictEqual(turn.userPrompt, "Create api router");
+      assert.strictEqual(turn.assistantResponse, "I will create router.ts");
+      assert.strictEqual(turn.turnText, "Create api router I will create router.ts");
+      assert.ok(turn.inputTokens! > 0);
+      assert.ok(turn.outputTokens! > 0);
+      assert.strictEqual(turn.toolCount, 1);
+
+      // Steps
+      assert.strictEqual(turn.steps?.length, 3); // 1 user, 1 agent, 1 execution
+      assert.strictEqual(turn.steps![0].category, "user");
+      assert.strictEqual(turn.steps![1].category, "agent");
+      assert.strictEqual(turn.steps![2].category, "execution");
+      assert.strictEqual(turn.steps![2].toolName, "write_file");
+      assert.strictEqual(turn.steps![2].status, "DONE");
     });
 
-    it("should use firstPrompt fallback for title if composer name is missing", () => {
-      const composerId = "composer-2";
-      const state = {
-        conversation: [
-          {
-            sender: "user",
-            text: "A very long prompt that goes on and on to test the character limit truncation feature of the title fallback."
-          }
-        ]
-      };
+    it("should query Cursor SQLite databases in readOnly mode with injected DB and prepared statement reuse", async () => {
+      const tempDbPath = path.join(os.tmpdir(), `cursor-test-${Date.now()}.vscdb`);
+      const db = new DatabaseSync(tempDbPath);
 
-      const session = SessionParser.parseCursorComposer(composerId, state);
-      assert.ok(session);
-      assert.strictEqual(session.title, "A very long prompt that goes on and on to test the...");
-    });
+      try {
+        db.exec(`
+          CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);
+          CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+        `);
 
-    it("should parse new bubble-based Cursor composer format with thinking and tool executions", () => {
-      const composerId = "composer-new";
-      const state = {
-        createdAt: 1700000000000,
-        workspacePath: "d:/Projects/another-project",
-        conversation: [
-          {
-            type: 1, // User
-            text: "What tools do you have?",
-            createdAt: 1700000001000
-          },
-          {
-            type: 2, // AI
-            text: "Here is what I found:",
-            thinking: { text: "Thinking about tools...", signature: "" },
-            createdAt: 1700000002000,
-            toolFormerData: {
-              name: "list_dir",
-              params: '{"DirectoryPath":"d:/Projects/another-project"}',
-              status: "completed",
-              result: '{"files":[]}'
-            }
-          }
-        ]
-      };
+        const composerData = {
+          createdAt: 2000,
+          fullConversationHeadersOnly: [{ bubbleId: "b1" }, { bubbleId: "b2" }],
+        };
 
-      const session = SessionParser.parseCursorComposer(composerId, state);
-      assert.ok(session);
-      assert.strictEqual(session.id, composerId);
-      assert.strictEqual(session.firstPrompt, "What tools do you have?");
-      assert.strictEqual(session.steps?.length, 3); // USER_INPUT, PLANNER_RESPONSE, MCP_TOOL
+        const bubble1 = { type: 1, text: "Refactor db.ts", createdAt: 2000 };
+        const bubble2 = { type: 2, text: "Refactored db.ts successfully", createdAt: 2005 };
 
-      // USER_INPUT
-      assert.strictEqual(session.steps[0].type, "USER_INPUT");
-      assert.strictEqual(session.steps[0].content, "What tools do you have?");
-      assert.strictEqual(session.steps[0].createdAt, 1700000001000);
+        db.prepare("INSERT INTO cursorDiskKV VALUES (?, ?)").run("composerData:comp-100", JSON.stringify(composerData));
+        db.prepare("INSERT INTO cursorDiskKV VALUES (?, ?)").run("bubbleId:comp-100:b1", JSON.stringify(bubble1));
+        db.prepare("INSERT INTO cursorDiskKV VALUES (?, ?)").run("bubbleId:comp-100:b2", JSON.stringify(bubble2));
 
-      // PLANNER_RESPONSE
-      assert.strictEqual(session.steps[1].type, "PLANNER_RESPONSE");
-      assert.strictEqual(session.steps[1].content, "Here is what I found:");
-      assert.strictEqual(session.steps[1].thinking, "Thinking about tools...");
-      assert.strictEqual(session.steps[1].createdAt, 1700000002000);
-      assert.ok(session.steps[1].toolCalls);
-      const call = JSON.parse(session.steps[1].toolCalls);
-      assert.strictEqual(call[0].name, "list_dir");
-      assert.strictEqual(call[0].args.DirectoryPath, "d:/Projects/another-project");
+        // Test with injected database connection (connection should remain open after discoverSessions)
+        const adapterWithDb = new CursorAdapter(db);
+        const sessionsWithDb = await adapterWithDb.discoverSessions();
+        assert.strictEqual(sessionsWithDb.length, 1);
+        assert.strictEqual(sessionsWithDb[0].id, "comp-100");
+        assert.strictEqual(sessionsWithDb[0].firstPrompt, "Refactor db.ts");
 
-      // MCP_TOOL (separate result step)
-      assert.strictEqual(session.steps[2].type, "MCP_TOOL");
-      assert.strictEqual(session.steps[2].status, "DONE");
-      assert.strictEqual(session.steps[2].content, '{"files":[]}');
-      assert.strictEqual(session.steps[2].createdAt, 1700000002000);
+        // Verify injected db is still usable and open
+        const rowCheck = db.prepare("SELECT count(*) as count FROM cursorDiskKV").get() as any;
+        assert.strictEqual(rowCheck.count, 3);
+
+        // Test with injected dbPath (connection opened in readOnly mode and closed cleanly)
+        const adapterWithPath = new CursorAdapter(tempDbPath);
+        const sessionsWithPath = await adapterWithPath.discoverSessions();
+        assert.strictEqual(sessionsWithPath.length, 1);
+        assert.strictEqual(sessionsWithPath[0].id, "comp-100");
+      } finally {
+        try {
+          db.close();
+        } catch {}
+        try {
+          fs.unlinkSync(tempDbPath);
+        } catch {}
+      }
     });
   });
 });

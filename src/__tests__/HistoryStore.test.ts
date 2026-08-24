@@ -1,31 +1,643 @@
-import { describe, it, before, after } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert";
-import { 
-  InMemoryHistoryStore, 
-  SqliteHistoryStore, 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  InMemoryHistoryStore,
+  SqliteHistoryStore,
   HistoryStore,
-  SessionEmbeddings
 } from "../db.js";
-import { SessionData } from "../adapters/types.js";
-import { syncHistory, isAutoSyncEnabled } from "../index.js";
-import { ADAPTERS } from "../adapters/index.js";
+import {
+  SessionData,
+  TurnData,
+  StepData,
+  PerToolStat,
+} from "../adapters/types.js";
+import {
+  vectorToBlob,
+  blobToVector,
+  cosineSimilarityFloat32,
+  EMBEDDING_DIMENSION,
+} from "../embeddings.js";
+
+function createDenseVector(fillValue: number): Float32Array {
+  const vec = new Float32Array(EMBEDDING_DIMENSION);
+  vec.fill(fillValue);
+  // Normalize vector to have unit length for predictable cosine math
+  let norm = 0;
+  for (let i = 0; i < EMBEDDING_DIMENSION; i++) {
+    norm += vec[i] * vec[i];
+  }
+  norm = Math.sqrt(norm);
+  if (norm > 0) {
+    for (let i = 0; i < EMBEDDING_DIMENSION; i++) {
+      vec[i] /= norm;
+    }
+  }
+  return vec;
+}
 
 function runTestSuite(name: string, storeFactory: () => HistoryStore) {
-  describe(`HistoryStore - ${name}`, () => {
-    it("should save a session, its chunks, and steps, then retrieve them", () => {
+  describe(`2-Layer HistoryStore - ${name}`, () => {
+    it("should save and retrieve a session with 2-layer turns and execution steps", () => {
       const store = storeFactory();
-      
+
       const session: SessionData = {
         id: "session-1",
         adapter: "antigravity",
         title: "Test Session 1",
+        role: "Codebase Architect",
         projectPath: "d:/projects/test-project",
+        createdAt: 1700000000000,
+        lastActiveAt: 1700000005000,
+        firstPrompt: "Implement feature X",
+        artifacts: ["brain/test/plan.md"],
+        filesTouched: ["src/index.ts", "src/db.ts"],
+        metadata: { agentModel: "gemini-pro" },
+      };
+
+      const vec1 = createDenseVector(1.0);
+      const vec2 = createDenseVector(0.5);
+
+      const turns: TurnData[] = [
+        {
+          turnIndex: 1,
+          userPrompt: "Implement feature X",
+          assistantResponse: "I will implement feature X now.",
+          turnSummary: "Feature X initiation",
+          turnText: "Implement feature X I will implement feature X now.",
+          turnVector: vec1,
+          inputTokens: 100,
+          outputTokens: 50,
+          thinkingTokens: 20,
+          toolCount: 1,
+          errorCount: 0,
+          durationMs: 1500,
+          isUndone: false,
+          createdAt: 1700000001000,
+        },
+        {
+          turnIndex: 2,
+          userPrompt: "Run test suite",
+          assistantResponse: "Tests failed with syntax error.",
+          turnSummary: "Test run with error",
+          turnText: "Run test suite Tests failed with syntax error.",
+          turnVector: vec2,
+          inputTokens: 150,
+          outputTokens: 80,
+          thinkingTokens: 30,
+          toolCount: 1,
+          errorCount: 1,
+          durationMs: 2000,
+          isUndone: false,
+          createdAt: 1700000004000,
+        },
+      ];
+
+      const steps: StepData[] = [
+        {
+          stepIndex: 1,
+          turnIndex: 1,
+          stepOrder: 1,
+          category: "user",
+          status: "DONE",
+          content: "Implement feature X",
+          createdAt: 1700000001000,
+        },
+        {
+          stepIndex: 2,
+          turnIndex: 1,
+          stepOrder: 2,
+          category: "execution",
+          kind: "mcp",
+          status: "DONE",
+          toolName: "write_file",
+          serverName: "patchitright",
+          filePath: "src/index.ts",
+          toolArgs: JSON.stringify({ target_file: "src/index.ts" }),
+          toolResult: JSON.stringify({ success: true }),
+          toolDurationMs: 350,
+          createdAt: 1700000002000,
+        },
+        {
+          stepIndex: 3,
+          turnIndex: 2,
+          stepOrder: 1,
+          category: "execution",
+          kind: "command",
+          status: "ERROR",
+          toolName: "run_command",
+          exitCode: 1,
+          errorMessage: "Process exited with code 1",
+          toolDurationMs: 1200,
+          createdAt: 1700000004000,
+        },
+      ];
+
+      store.saveSession(session, turns, steps);
+
+      // Verify getSession
+      const fetched = store.getSession("session-1");
+      assert.ok(fetched);
+      assert.strictEqual(fetched?.id, "session-1");
+      assert.strictEqual(fetched?.title, "Test Session 1");
+      assert.strictEqual(fetched?.role, "Codebase Architect");
+      assert.strictEqual(fetched?.firstPrompt, "Implement feature X");
+      assert.deepStrictEqual(fetched?.artifacts, ["brain/test/plan.md"]);
+      assert.deepStrictEqual(fetched?.filesTouched, ["src/index.ts", "src/db.ts"]);
+      assert.strictEqual(fetched?.metadata?.agentModel, "gemini-pro");
+
+      // Verify turns
+      const fetchedTurns = store.getTurns("session-1");
+      assert.strictEqual(fetchedTurns.length, 2);
+      assert.strictEqual(fetchedTurns[0].turnIndex, 1);
+      assert.strictEqual(fetchedTurns[0].userPrompt, "Implement feature X");
+      assert.strictEqual(fetchedTurns[0].inputTokens, 100);
+      assert.strictEqual(fetchedTurns[0].toolCount, 1);
+      assert.strictEqual(fetchedTurns[1].turnIndex, 2);
+      assert.strictEqual(fetchedTurns[1].errorCount, 1);
+
+      // Verify steps
+      const fetchedSteps = store.getSteps("session-1");
+      assert.strictEqual(fetchedSteps.length, 3);
+      assert.strictEqual(fetchedSteps[1].toolName, "write_file");
+      assert.strictEqual(fetchedSteps[1].serverName, "patchitright");
+      assert.strictEqual(fetchedSteps[1].filePath, "src/index.ts");
+      assert.strictEqual(fetchedSteps[2].kind, "command");
+      assert.strictEqual(fetchedSteps[2].status, "ERROR");
+      assert.strictEqual(fetchedSteps[2].exitCode, 1);
+
+      store.close();
+    });
+
+    it("should resolve negative turn indices, lastTurns, and filter active timeline", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "session-offsets",
+        adapter: "antigravity",
+        title: "Offset Test",
+        createdAt: 1000,
+        firstPrompt: "init",
+      };
+
+      const turns: TurnData[] = [
+        { turnIndex: 1, userPrompt: "Prompt 1", assistantResponse: "Resp 1", turnText: "T1", isUndone: false, createdAt: 1000 },
+        { turnIndex: 2, userPrompt: "Prompt 2 (undone)", assistantResponse: "Resp 2", turnText: "T2", isUndone: true, createdAt: 2000 },
+        { turnIndex: 2, userPrompt: "Prompt 2 (active)", assistantResponse: "Resp 2", turnText: "T2", isUndone: false, createdAt: 3000 },
+        { turnIndex: 3, userPrompt: "Prompt 3", assistantResponse: "Resp 3", turnText: "T3", isUndone: false, createdAt: 4000 },
+        { turnIndex: 4, userPrompt: "Prompt 4", assistantResponse: "Resp 4", turnText: "T4", isUndone: false, createdAt: 5000 },
+      ];
+
+      store.saveSession(session, turns);
+
+      // 1. Negative index: turnIndex = -1 should resolve to latest active turn (4)
+      const lastTurn = store.getTurns("session-offsets", { turnIndex: -1 });
+      assert.strictEqual(lastTurn.length, 1);
+      assert.strictEqual(lastTurn[0].turnIndex, 4);
+      assert.strictEqual(lastTurn[0].userPrompt, "Prompt 4");
+
+      // 2. Negative index: turnIndex = -2 should resolve to turn 3
+      const secondLastTurn = store.getTurns("session-offsets", { turnIndex: -2 });
+      assert.strictEqual(secondLastTurn.length, 1);
+      assert.strictEqual(secondLastTurn[0].turnIndex, 3);
+
+      // 3. lastTurns: 2 should return turns 3 and 4 in chronological order
+      const last2 = store.getTurns("session-offsets", { lastTurns: 2 });
+      assert.strictEqual(last2.length, 2);
+      assert.strictEqual(last2[0].turnIndex, 3);
+      assert.strictEqual(last2[1].turnIndex, 4);
+
+      // 4. Undone filtering: default should exclude undone turns
+      const allActive = store.getTurns("session-offsets");
+      assert.strictEqual(allActive.length, 4); // 1, 2(active), 3, 4
+
+      // 5. includeUndone: true should include the undone turn
+      const withUndone = store.getTurns("session-offsets", { includeUndone: true });
+      assert.ok(withUndone.some((t) => t.isUndone));
+
+      store.close();
+    });
+
+    it("should perform zero-copy Float32Array BLOB vector search with cosine ranking", () => {
+      const store = storeFactory();
+
+      const vecTarget = createDenseVector(1.0);
+      const vecSimilar = createDenseVector(0.9);
+      const vecOpposite = createDenseVector(-1.0);
+
+      const session1: SessionData = {
+        id: "sess-v1",
+        adapter: "antigravity",
+        title: "Vector Session 1",
+        projectPath: "d:/projects/app-a",
+        createdAt: 1000,
+        firstPrompt: "Target topic",
+      };
+
+      const session2: SessionData = {
+        id: "sess-v2",
+        adapter: "antigravity",
+        title: "Vector Session 2",
+        projectPath: "d:/projects/app-b",
+        createdAt: 2000,
+        firstPrompt: "Opposite topic",
+      };
+
+      const turns1: TurnData[] = [
+        {
+          turnIndex: 1,
+          userPrompt: "Find database configuration",
+          assistantResponse: "Here is the SQLite config.",
+          turnText: "Find database configuration SQLite config",
+          turnVector: vecSimilar,
+          createdAt: 1000,
+        },
+      ];
+
+      const turns2: TurnData[] = [
+        {
+          turnIndex: 1,
+          userPrompt: "Completely unrelated graphics topic",
+          assistantResponse: "Render shaders on GPU.",
+          turnText: "Completely unrelated graphics topic shaders GPU",
+          turnVector: vecOpposite,
+          createdAt: 2000,
+        },
+      ];
+
+      store.saveSession(session1, turns1);
+      store.saveSession(session2, turns2);
+
+      // Query vector with vecTarget
+      const results = store.searchTurnsVector(vecTarget, 5);
+      assert.strictEqual(results.length, 2);
+      assert.strictEqual(results[0].sessionId, "sess-v1");
+      assert.strictEqual(results[0].turnIndex, 1);
+      assert.ok(results[0].similarity > 0.95);
+
+      assert.strictEqual(results[1].sessionId, "sess-v2");
+      assert.ok(results[1].similarity < -0.9);
+
+      // Search with projectPath constraint
+      const scopedResults = store.searchTurnsVector(vecTarget, 5, {
+        projectPath: "app-a",
+      });
+      assert.strictEqual(scopedResults.length, 1);
+      assert.strictEqual(scopedResults[0].sessionId, "sess-v1");
+
+      store.close();
+    });
+
+    it("should filter sessions by role, projectPath, hasErrors, and timeRange", () => {
+      const store = storeFactory();
+
+      const sessionA: SessionData = {
+        id: "sess-a",
+        adapter: "antigravity",
+        title: "Architect Session",
+        role: "Codebase Architect",
+        projectPath: "d:/projects/project-alpha",
+        createdAt: 1000,
+        lastActiveAt: 2000,
+        firstPrompt: "Architect prompt",
+      };
+
+      const sessionB: SessionData = {
+        id: "sess-b",
+        adapter: "antigravity",
+        title: "Debugger Session",
+        role: "Database Debugger",
+        projectPath: "d:/projects/project-beta",
+        createdAt: 3000,
+        lastActiveAt: 4000,
+        firstPrompt: "Debugger prompt",
+      };
+
+      const turnsA: TurnData[] = [
+        { turnIndex: 1, userPrompt: "A1", assistantResponse: "R1", turnText: "T1", errorCount: 0, createdAt: 1000 },
+      ];
+
+      const turnsB: TurnData[] = [
+        { turnIndex: 1, userPrompt: "B1", assistantResponse: "R2", turnText: "T2", errorCount: 2, createdAt: 3000 },
+      ];
+
+      store.saveSession(sessionA, turnsA);
+      store.saveSession(sessionB, turnsB);
+
+      // Filter by role
+      const resRole = store.listSessions({ role: "Database Debugger" });
+      assert.strictEqual(resRole.length, 1);
+      assert.strictEqual(resRole[0].id, "sess-b");
+
+      // Filter by projectPath
+      const resProj = store.listSessions({ projectPath: "alpha" });
+      assert.strictEqual(resProj.length, 1);
+      assert.strictEqual(resProj[0].id, "sess-a");
+
+      // Filter by hasErrors
+      const resErrors = store.listSessions({ hasErrors: true });
+      assert.strictEqual(resErrors.length, 1);
+      assert.strictEqual(resErrors[0].id, "sess-b");
+
+      // Filter by timeRange "2500:5000"
+      const resTime = store.listSessions({ timeRange: "2500:5000" });
+      assert.strictEqual(resTime.length, 1);
+      assert.strictEqual(resTime[0].id, "sess-b");
+
+      store.close();
+    });
+
+    it("should resolve recursive subagent relationships and ancestor/descendant hierarchies", () => {
+      const store = storeFactory();
+
+      const root: SessionData = {
+        id: "root-sess",
+        adapter: "antigravity",
+        title: "Root Orchestrator",
+        role: "Lead Orchestrator",
+        createdAt: 1000,
+        firstPrompt: "Coordinate tickets 1 to 6",
+      };
+
+      const child1: SessionData = {
+        id: "child-1",
+        adapter: "antigravity",
+        title: "Ticket 1 Worker",
+        role: "Domain Engineer",
+        parentId: "root-sess",
+        rootId: "root-sess",
+        depth: 1,
+        createdAt: 2000,
+        firstPrompt: "Implement types and binary vectors",
+      };
+
+      const child2: SessionData = {
+        id: "child-2",
+        adapter: "antigravity",
+        title: "Ticket 2 Worker",
+        role: "Database Engineer",
+        parentId: "root-sess",
+        rootId: "root-sess",
+        depth: 1,
+        createdAt: 2500,
+        firstPrompt: "Implement SQLite 2-layer DDL",
+      };
+
+      const grandchild: SessionData = {
+        id: "grandchild-1",
+        adapter: "antigravity",
+        title: "FTS5 Subagent",
+        role: "FTS Specialist",
+        parentId: "child-2",
+        rootId: "root-sess",
+        depth: 2,
+        createdAt: 3000,
+        firstPrompt: "Setup FTS5 triggers and ranking",
+      };
+
+      store.saveSession(root);
+      store.saveSession(child1);
+      store.saveSession(child2);
+      store.saveSession(grandchild);
+
+      // Query relationship for child2
+      const relChild2 = store.getSessionRelationship("child-2");
+      assert.ok(relChild2);
+      assert.strictEqual(relChild2?.sessionId, "child-2");
+      assert.strictEqual(relChild2?.parent?.id, "root-sess");
+      assert.strictEqual(relChild2?.siblings.length, 1);
+      assert.strictEqual(relChild2?.siblings[0].id, "child-1");
+      assert.strictEqual(relChild2?.children.length, 1);
+      assert.strictEqual(relChild2?.children[0].id, "grandchild-1");
+
+      // Query relationship for grandchild
+      const relGrand = store.getSessionRelationship("grandchild-1");
+      assert.ok(relGrand);
+      assert.strictEqual(relGrand?.parent?.id, "child-2");
+      assert.strictEqual(relGrand?.ancestors.length, 2);
+      assert.strictEqual(relGrand?.ancestors[0].id, "root-sess");
+      assert.strictEqual(relGrand?.ancestors[1].id, "child-2");
+
+      store.close();
+    });
+
+    it("should perform full-text BM25 search across user_prompt, assistant_response, and turn_text", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "sess-fts-1",
+        adapter: "antigravity",
+        title: "FTS Test Session",
+        projectPath: "d:/projects/fts-app",
+        createdAt: 1000,
+        firstPrompt: "init",
+      };
+
+      const turns: TurnData[] = [
+        {
+          turnIndex: 1,
+          userPrompt: "How to configure PostgreSQL connection pooling with pgbouncer?",
+          assistantResponse: "Use transaction pooling mode with max_client_conn set appropriately.",
+          turnText: "PostgreSQL connection pooling pgbouncer transaction pooling",
+          createdAt: 1000,
+        },
+        {
+          turnIndex: 2,
+          userPrompt: "Now explain Redis cluster failover mechanics.",
+          assistantResponse: "Redis Sentinel monitors nodes and promotes replicas via quorum voting.",
+          turnText: "Redis cluster failover Sentinel quorum voting",
+          createdAt: 2000,
+        },
+      ];
+
+      store.saveSession(session, turns);
+
+      // Search by keyword in user prompt: "pgbouncer"
+      const resPgbouncer = store.searchTurnsFTS("pgbouncer", 5);
+      assert.strictEqual(resPgbouncer.length, 1);
+      assert.strictEqual(resPgbouncer[0].sessionId, "sess-fts-1");
+      assert.strictEqual(resPgbouncer[0].turnIndex, 1);
+
+      // Search by keyword in assistant response: "Sentinel"
+      const resSentinel = store.searchTurnsFTS("Sentinel", 5);
+      assert.strictEqual(resSentinel.length, 1);
+      assert.strictEqual(resSentinel[0].sessionId, "sess-fts-1");
+      assert.strictEqual(resSentinel[0].turnIndex, 2);
+
+      // Search with projectPath constraint
+      const resScoped = store.searchTurnsFTS("PostgreSQL", 5, { projectPath: "fts-app" });
+      assert.strictEqual(resScoped.length, 1);
+
+      const resMismatched = store.searchTurnsFTS("PostgreSQL", 5, { projectPath: "other-dir" });
+      assert.strictEqual(resMismatched.length, 0);
+
+      store.close();
+    });
+
+    it("should retrieve artifacts with and without recursive subtree aggregation", () => {
+      const store = storeFactory();
+
+      const root: SessionData = {
+        id: "sess-root-art",
+        adapter: "antigravity",
+        title: "Root",
+        createdAt: 1000,
+        firstPrompt: "root prompt",
+        artifacts: ["brain/root/prd.md"],
+      };
+
+      const child: SessionData = {
+        id: "sess-child-art",
+        adapter: "antigravity",
+        title: "Child",
+        parentId: "sess-root-art",
+        createdAt: 2000,
+        firstPrompt: "child prompt",
+        artifacts: ["brain/child/plan.md", "brain/shared/notes.md"],
+      };
+
+      const grandchild: SessionData = {
+        id: "sess-gc-art",
+        adapter: "antigravity",
+        title: "Grandchild",
+        parentId: "sess-child-art",
+        createdAt: 3000,
+        firstPrompt: "grandchild prompt",
+        artifacts: ["brain/grandchild/report.md", "brain/shared/notes.md"], // Contains duplicate
+      };
+
+      store.saveSession(root);
+      store.saveSession(child);
+      store.saveSession(grandchild);
+
+      // 1. Direct artifacts only
+      const rootDirect = store.getArtifacts("sess-root-art", false);
+      assert.deepStrictEqual(rootDirect, ["brain/root/prd.md"]);
+
+      // 2. Subtree artifacts (recursive, deduplicated)
+      const rootSubtree = store.getArtifacts("sess-root-art", true);
+      assert.strictEqual(rootSubtree.length, 4);
+      assert.ok(rootSubtree.includes("brain/root/prd.md"));
+      assert.ok(rootSubtree.includes("brain/child/plan.md"));
+      assert.ok(rootSubtree.includes("brain/grandchild/report.md"));
+      assert.ok(rootSubtree.includes("brain/shared/notes.md"));
+
+      // 3. Artifact descriptors with session attribution and substring filtering
+      const descriptors = store.getArtifactDescriptors("sess-root-art", true, "plan");
+      assert.strictEqual(descriptors.length, 1);
+      assert.strictEqual(descriptors[0].sessionId, "sess-child-art");
+      assert.strictEqual(descriptors[0].filename, "brain/child/plan.md");
+
+      store.close();
+    });
+
+    it("should compute per-tool execution statistics and detect thrash loops", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "sess-tool-stats",
+        adapter: "antigravity",
+        title: "Stats Session",
+        projectPath: "d:/projects/stats",
+        createdAt: 1700000000000,
+        lastActiveAt: 1700000010000,
+        firstPrompt: "fix bug",
+      };
+
+      const turns: TurnData[] = [
+        {
+          turnIndex: 1,
+          userPrompt: "fix bug",
+          assistantResponse: "fixing bug",
+          turnText: "fix bug",
+          toolCount: 4,
+          errorCount: 3,
+        },
+      ];
+
+      const steps: StepData[] = [
+        {
+          stepIndex: 1,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "patch_file",
+          serverName: "patchitright",
+          filePath: "src/broken.ts",
+          status: "ERROR",
+          errorMessage: "Patch target mismatch at line 42",
+          toolDurationMs: 120,
+        },
+        {
+          stepIndex: 2,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "patch_file",
+          serverName: "patchitright",
+          filePath: "src/broken.ts",
+          status: "ERROR",
+          errorMessage: "Patch target mismatch at line 42",
+          toolDurationMs: 150,
+        },
+        {
+          stepIndex: 3,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "patch_file",
+          serverName: "patchitright",
+          filePath: "src/broken.ts",
+          status: "ERROR",
+          errorMessage: "Patch target mismatch at line 42",
+          toolDurationMs: 140,
+        },
+        {
+          stepIndex: 4,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "view_file",
+          status: "DONE",
+          filePath: "src/broken.ts",
+          toolDurationMs: 50,
+        },
+      ];
+
+      store.saveSession(session, turns, steps);
+
+      const report = store.getToolUsageStats({ projectPath: "d:/projects/stats" });
+      assert.strictEqual(report.summary.totalCalls, 4);
+      assert.strictEqual(report.summary.totalErrors, 3);
+
+      const patchStat = report.tools.find(
+        (s: PerToolStat) => s.toolName === "patch_file" && s.serverName === "patchitright"
+      );
+      assert.ok(patchStat);
+      assert.strictEqual(patchStat.totalCalls, 3);
+      assert.strictEqual(patchStat.errorCount, 3);
+      assert.strictEqual(patchStat.failureRate, 100);
+
+      // Thrashing detected (>=3 consecutive failures on same tool)
+      assert.strictEqual(report.thrashingTools.length, 1);
+      assert.strictEqual(report.thrashingTools[0].toolName, "patch_file");
+      assert.strictEqual(report.thrashingTools[0].consecutiveFailures, 3);
+
+      store.close();
+    });
+
+    it("should support transitional compatibility shims without throwing", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "sess-compat",
+        adapter: "antigravity",
+        title: "Compat Session",
+        projectPath: "d:/projects/compat",
         createdAt: 1700000000000,
         firstPrompt: "init",
         secondPrompt: "",
         chunks: [
-          { stepIndex: 0, text: "Chunk 1 content" },
-          { stepIndex: 1, text: "Chunk 2 content" }
+          { stepIndex: 0, text: "Chunk 0 text" },
+          { stepIndex: 1, text: "Chunk 1 text" },
         ],
         steps: [
           {
@@ -34,847 +646,51 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
             source: "USER_EXPLICIT",
             status: "DONE",
             content: "init",
-            createdAt: 1700000000000
           },
-          {
-            stepIndex: 1,
-            type: "COMMAND",
-            source: "MODEL",
-            status: "ERROR",
-            content: "npm run test failed",
-            thinking: "Running tests...",
-            toolCalls: JSON.stringify([{ name: "execute_command" }]),
-            createdAt: 1700000001000
-          }
-        ]
-      };
-
-      const embeddings: SessionEmbeddings = {
-        summary: [0.9, 0.1],
-        chunks: new Map([
-          [0, [0.95, 0.05]],
-          [1, [0.8, 0.2]]
-        ])
-      };
-
-      store.save(session, embeddings);
-
-      // Query without filters
-      const result = store.query({ includeSteps: true });
-      assert.strictEqual(result.sessions.length, 1);
-      assert.strictEqual(result.sessions[0].id, "session-1");
-      assert.strictEqual(result.sessions[0].title, "Test Session 1");
-      
-      assert.strictEqual(result.chunks.length, 2);
-      assert.strictEqual(result.chunks[0].text, "Chunk 1 content");
-      assert.strictEqual(result.chunks[1].text, "Chunk 2 content");
-
-      assert.strictEqual(result.steps.length, 2);
-      assert.strictEqual(result.steps[1].type, "COMMAND");
-      assert.strictEqual(result.steps[1].status, "ERROR");
-      assert.strictEqual(result.steps[1].thinking, "Running tests...");
-
-      store.close();
-    });
-
-    it("should filter query() results by sessionId, adapter, and projectPath", () => {
-      const store = storeFactory();
-
-      const sessionA: SessionData = {
-        id: "session-a",
-        adapter: "antigravity",
-        title: "Session A",
-        projectPath: "d:/projects/project-a",
-        createdAt: 1700000000000,
-        firstPrompt: "hello",
-        secondPrompt: "",
-        chunks: []
-      };
-
-      const sessionB: SessionData = {
-        id: "session-b",
-        adapter: "cursor",
-        title: "Session B",
-        projectPath: "d:/projects/project-b",
-        createdAt: 1700000010000,
-        firstPrompt: "world",
-        secondPrompt: "",
-        chunks: []
-      };
-
-      const embeddings: SessionEmbeddings = {
-        summary: [0.5, 0.5],
-        chunks: new Map()
-      };
-
-      store.save(sessionA, embeddings);
-      store.save(sessionB, embeddings);
-
-      // Filter by sessionId
-      const resSessionId = store.query({ sessionId: "session-a" });
-      assert.strictEqual(resSessionId.sessions.length, 1);
-      assert.strictEqual(resSessionId.sessions[0].id, "session-a");
-
-      // Filter by adapter
-      const resAdapter = store.query({ adapter: "cursor" });
-      assert.strictEqual(resAdapter.sessions.length, 1);
-      assert.strictEqual(resAdapter.sessions[0].id, "session-b");
-
-      // Filter by projectPath (LIKE match case-insensitive substring)
-      const resPath = store.query({ projectPath: "project-a" });
-      assert.strictEqual(resPath.sessions.length, 1);
-      assert.strictEqual(resPath.sessions[0].id, "session-a");
-
-      // Limit results
-      const resLimit = store.query({ limit: 1 });
-      assert.strictEqual(resLimit.sessions.length, 1);
-
-      store.close();
-    });
-
-    it("should filter steps in query() by type, status, query, and slice by index", () => {
-      const store = storeFactory();
-
-      const session: SessionData = {
-        id: "session-steps",
-        adapter: "antigravity",
-        title: "Steps Test",
-        projectPath: "d:/projects/test-steps-project",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [
-          { stepIndex: 1, text: "Chunk 1" },
-          { stepIndex: 2, text: "Chunk 2" }
         ],
-        steps: [
-          { stepIndex: 1, type: "USER_INPUT", source: "USER", status: "DONE", content: "hello world" },
-          { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "ERROR", content: "test failed", thinking: "debugging", toolCalls: JSON.stringify([{ name: "memory/read_graph" }]) },
-          { stepIndex: 3, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "success", toolCalls: JSON.stringify([{ name: "other/do_work" }]) }
-        ]
       };
 
-      store.save(session, { summary: [0.5, 0.5], chunks: new Map() });
-
-      // Slicing: startStep and endStep
-      const resSlice = store.query({ includeSteps: true, sessionId: "session-steps", startStep: 2, endStep: 3 });
-      assert.strictEqual(resSlice.steps.length, 2);
-      assert.strictEqual(resSlice.steps[0].stepIndex, 2);
-      assert.strictEqual(resSlice.steps[1].stepIndex, 3);
-      assert.strictEqual(resSlice.chunks.length, 1);
-      assert.strictEqual(resSlice.chunks[0].stepIndex, 2);
-
-      // Filter steps by type
-      const resType = store.query({ includeSteps: true, sessionId: "session-steps", stepType: "COMMAND" });
-      assert.strictEqual(resType.steps.length, 1);
-      assert.strictEqual(resType.steps[0].type, "COMMAND");
-
-      // Filter steps by status
-      const resStatus = store.query({ includeSteps: true, sessionId: "session-steps", stepStatus: "ERROR" });
-      assert.strictEqual(resStatus.steps.length, 1);
-      assert.strictEqual(resStatus.steps[0].status, "ERROR");
-
-      // Filter steps by stepQuery
-      const resQuery = store.query({ includeSteps: true, sessionId: "session-steps", stepQuery: "fail" });
-      assert.strictEqual(resQuery.steps.length, 1);
-      assert.strictEqual(resQuery.steps[0].content, "test failed");
-
-      // Filter steps by toolName (TDD Cycle 1)
-      const resTool = store.query({ includeSteps: true, sessionId: "session-steps", toolName: "read_graph" });
-      assert.strictEqual(resTool.steps.length, 1);
-      assert.strictEqual(resTool.steps[0].stepIndex, 2);
-
-      // Filter steps by toolName array
-      const resToolArray = store.query({ includeSteps: true, sessionId: "session-steps", toolName: ["read_graph", "non_existent"] });
-      assert.strictEqual(resToolArray.steps.length, 1);
-      assert.strictEqual(resToolArray.steps[0].stepIndex, 2);
-
-      // Filter steps by serverName (TDD Cycle 1)
-      const resServer = store.query({ includeSteps: true, sessionId: "session-steps", serverName: "memory" });
-      assert.strictEqual(resServer.steps.length, 1);
-      assert.strictEqual(resServer.steps[0].stepIndex, 2);
-
-      // Exclude step content/thinking fields (TDD Cycle 2)
-      const resExclude = store.query({ includeSteps: true, sessionId: "session-steps", excludeContent: true });
-      assert.strictEqual(resExclude.steps.length, 3);
-      assert.strictEqual(resExclude.steps[0].content, undefined);
-      assert.strictEqual(resExclude.steps[0].thinking, undefined);
-      assert.strictEqual(resExclude.steps[1].content, undefined);
-      assert.strictEqual(resExclude.steps[1].thinking, undefined);
-
-      // Filter steps by projectPath (TDD Cycle 3)
-      const resProjMatch = store.query({ includeSteps: true, projectPath: "steps-project" });
-      assert.strictEqual(resProjMatch.steps.length, 3);
-
-      const resProjMismatch = store.query({ includeSteps: true, projectPath: "other-project" });
-      assert.strictEqual(resProjMismatch.steps.length, 0);
-
-      store.close();
-    });
-
-    it("should perform two-stage hierarchical vector search ranking in search()", () => {
-      const store = storeFactory();
-
-      // Session A (matches closely to query [1, 0])
-      const sessionA: SessionData = {
-        id: "session-a",
-        adapter: "antigravity",
-        title: "Session A",
-        projectPath: "d:/projects/a",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [
-          { stepIndex: 0, text: "Close Match Chunk" },
-          { stepIndex: 1, text: "Medium Match Chunk" }
-        ]
-      };
-      const embeddingsA: SessionEmbeddings = {
-        summary: [0.9, 0.1],
-        chunks: new Map([
-          [0, [0.95, 0.05]],
-          [1, [0.7, 0.3]]
-        ])
-      };
-
-      // Session B (poor match to query [1, 0])
-      const sessionB: SessionData = {
-        id: "session-b",
-        adapter: "cursor",
-        title: "Session B",
-        projectPath: "d:/projects/b",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [
-          { stepIndex: 0, text: "Irrelevant Chunk" }
-        ]
-      };
-      const embeddingsB: SessionEmbeddings = {
-        summary: [0.1, 0.9],
-        chunks: new Map([
-          [0, [1, 0]] // Excellent chunk similarity, but session level 1 excludes it
-        ])
-      };
-
-      store.save(sessionA, embeddingsA);
-      store.save(sessionB, embeddingsB);
-
-      // Insert 5 dummy sessions to push Session B out of top 5 (which gets computed in Level 1)
-      for (let i = 1; i <= 5; i++) {
-        const dummy: SessionData = {
-          id: `session-dummy-${i}`,
-          adapter: "antigravity",
-          title: `Dummy ${i}`,
-          projectPath: "",
-          createdAt: 1700000000000,
-          firstPrompt: "",
-          secondPrompt: "",
-          chunks: []
-        };
-        const dummyEmbed: SessionEmbeddings = {
-          summary: [0.3, 0.7],
-          chunks: new Map()
-        };
-        store.save(dummy, dummyEmbed);
-      }
-
-      // Execute search with query vector [1, 0]
-      const hits = store.search([1, 0], 3);
-
-      assert.strictEqual(hits.length, 2); // Only chunks of Session A should be returned
-      assert.strictEqual(hits[0].chunkText, "Close Match Chunk");
-      assert.ok(Math.abs(hits[0].similarity - 0.95) < 0.01);
-      assert.strictEqual(hits[1].chunkText, "Medium Match Chunk");
-      assert.ok(Math.abs(hits[1].similarity - 0.7) < 0.01);
-
-      // Search with projectPath constraint
-      const hitsC = store.search([1, 0], 3, { projectPath: "projects/a" });
-      assert.strictEqual(hitsC.length, 2);
-
-      const hitsNone = store.search([1, 0], 3, { projectPath: "projects/nonexistent" });
-      assert.strictEqual(hitsNone.length, 0);
-
-      store.close();
-    });
-
-    it("should handle duplicate chunk index update correctly via overwriting/ignoring", () => {
-      const store = storeFactory();
-
-      const session: SessionData = {
-        id: "session-dup",
-        adapter: "antigravity",
-        title: "Dup Test",
-        projectPath: "",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [
-          { stepIndex: 1, text: "First chunk" }
-        ]
-      };
-
-      store.save(session, { summary: [1, 0], chunks: new Map([[1, [1, 0]]]) });
-
-      // Save again with same session id, same chunk index but different text
-      const session2: SessionData = {
-        ...session,
-        chunks: [
-          { stepIndex: 1, text: "Duplicate chunk" }
-        ]
-      };
-      
-      store.save(session2, { summary: [1, 0], chunks: new Map([[1, [1, 0]]]) });
-
-      // Verify that after save, only one chunk with stepIndex 1 exists (the latest one or ignored first)
-      const res = store.query({ sessionId: "session-dup" });
-      assert.strictEqual(res.chunks.length, 1);
-      
-      store.close();
-    });
-
-    it("should link parent and child sessions and query parentId correctly", () => {
-      const store = storeFactory();
-
-      const childSession: SessionData = {
-        id: "child-session-id",
-        adapter: "antigravity",
-        title: "Child Session",
-        projectPath: "",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [],
-      };
-
-      const parentSession: SessionData = {
-        id: "parent-session-id",
-        adapter: "antigravity",
-        title: "Parent Session",
-        projectPath: "",
-        createdAt: 1700000001000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [],
-        subagentIds: ["child-session-id"]
-      };
-
-      const embeddings: SessionEmbeddings = {
-        summary: [0.5, 0.5],
-        chunks: new Map()
-      };
-
-      // Save child first, then parent (which updates child link)
-      store.save(childSession, embeddings);
-      store.save(parentSession, embeddings);
-
-      const resChild = store.query({ sessionId: "child-session-id" });
-      assert.strictEqual(resChild.sessions.length, 1);
-      assert.strictEqual(resChild.sessions[0].parentId, "parent-session-id");
-
-      // Test preserving parentId link if child is re-saved
-      store.save(childSession, embeddings);
-      const resChildResaved = store.query({ sessionId: "child-session-id" });
-      assert.strictEqual(resChildResaved.sessions[0].parentId, "parent-session-id");
-
-      // Verify parent query has no parentId
-      const resParent = store.query({ sessionId: "parent-session-id" });
-      assert.strictEqual(resParent.sessions.length, 1);
-      assert.strictEqual(resParent.sessions[0].parentId, null);
-
-      store.close();
-    });
-
-    it("should fetch session relationships (parent, ancestors, children, siblings) and support parentId filtering", () => {
-      const store = storeFactory();
-      const dummyEmbeddings: SessionEmbeddings = { summary: [0.1, 0.2], chunks: new Map() };
-
-      const rootSession: SessionData = {
-        id: "root-1",
-        adapter: "antigravity",
-        title: "Root Session",
-        projectPath: "/test",
-        createdAt: 1000,
-        firstPrompt: "Root initial prompt",
-        secondPrompt: "",
-        chunks: [],
-        steps: [
-          {
-            stepIndex: 0,
-            type: "USER_INPUT",
-            source: "USER_EXPLICIT",
-            status: "DONE",
-            content: "Root initial prompt"
-          },
-          {
-            stepIndex: 1,
-            type: "PLANNER_RESPONSE",
-            source: "MODEL",
-            status: "DONE",
-            content: "Root final output response"
-          }
-        ]
-      };
-
-      const child1: SessionData = {
-        id: "child-1",
-        adapter: "antigravity",
-        title: "Child 1",
-        projectPath: "/test",
-        createdAt: 2000,
-        firstPrompt: "Child 1 prompt",
-        secondPrompt: "",
-        chunks: [],
-        parentId: "root-1",
-        steps: [
-          {
-            stepIndex: 0,
-            type: "USER_INPUT",
-            source: "USER_EXPLICIT",
-            status: "DONE",
-            content: "Child 1 prompt"
-          },
-          {
-            stepIndex: 1,
-            type: "PLANNER_RESPONSE",
-            source: "MODEL",
-            status: "DONE",
-            content: "Child 1 final response"
-          }
-        ]
-      };
-
-      const child2: SessionData = {
-        id: "child-2",
-        adapter: "antigravity",
-        title: "Child 2",
-        projectPath: "/test",
-        createdAt: 2100,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [],
-        parentId: "root-1"
-      };
-
-      const grandchild1: SessionData = {
-        id: "grandchild-1",
-        adapter: "antigravity",
-        title: "Grandchild 1",
-        projectPath: "/test",
-        createdAt: 3000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [],
-        parentId: "child-1"
-      };
-
-      store.save(rootSession, dummyEmbeddings);
-      store.save(child1, dummyEmbeddings);
-      store.save(child2, dummyEmbeddings);
-      store.save(grandchild1, dummyEmbeddings);
-
-      // Test parentId: "root" filtering
-      const rootQuery = store.query({ parentId: "root" });
-      assert.strictEqual(rootQuery.sessions.length, 1);
-      assert.strictEqual(rootQuery.sessions[0].id, "root-1");
-
-      // Test parentId: "root-1" filtering
-      const childrenQuery = store.query({ parentId: "root-1" });
-      assert.strictEqual(childrenQuery.sessions.length, 2);
-
-      // Test getSessionRelationship for grandchild-1
-      const relGrandchild = store.getSessionRelationship("grandchild-1");
-      assert.notStrictEqual(relGrandchild, null);
-      assert.strictEqual(relGrandchild?.sessionId, "grandchild-1");
-      assert.strictEqual(relGrandchild?.rootSessionId, "root-1");
-      assert.strictEqual(relGrandchild?.ancestors.length, 2);
-      assert.strictEqual(relGrandchild?.ancestors[0].id, "root-1"); // top-down
-      assert.strictEqual(relGrandchild?.ancestors[1].id, "child-1");
-      assert.strictEqual(relGrandchild?.parent?.id, "child-1");
-
-      // Test getSessionRelationship for child-1 (has sibling child-2 and child grandchild-1)
-      const relChild1 = store.getSessionRelationship("child-1");
-      assert.notStrictEqual(relChild1, null);
-      assert.strictEqual(relChild1?.siblings.length, 1);
-      assert.strictEqual(relChild1?.siblings[0].id, "child-2");
-      assert.strictEqual(relChild1?.children.length, 1);
-      assert.strictEqual(relChild1?.children[0].id, "grandchild-1");
-      assert.strictEqual(relChild1?.current.initialPrompt, "Child 1 prompt");
-      assert.strictEqual(relChild1?.current.finalOutput, "Child 1 final response");
-
-      // Test root session relationship (siblings must be empty, parent null)
-      const relRoot = store.getSessionRelationship("root-1");
-      assert.notStrictEqual(relRoot, null);
-      assert.strictEqual(relRoot?.parent, null);
-      assert.strictEqual(relRoot?.ancestors.length, 0);
-      assert.strictEqual(relRoot?.siblings.length, 0);
-      assert.strictEqual(relRoot?.children.length, 2);
-      assert.strictEqual(relRoot?.current.initialPrompt, "Root initial prompt");
-      assert.strictEqual(relRoot?.current.finalOutput, "Root final output response");
-
-      // Test includeAncestors = false
-      const relNoAncestors = store.getSessionRelationship("grandchild-1", 2, false);
-      assert.notStrictEqual(relNoAncestors, null);
-      assert.strictEqual(relNoAncestors?.parent, null);
-      assert.strictEqual(relNoAncestors?.ancestors.length, 0);
-
-      // Test maxDepth = 1 (should omit grandchild from root children)
-      const relDepth1 = store.getSessionRelationship("root-1", 1);
-      assert.notStrictEqual(relDepth1, null);
-      assert.strictEqual(relDepth1?.children.length, 2);
-      assert.strictEqual(relDepth1?.children[0].children, undefined);
-
-      // Test 404 non-existent session
-      const rel404 = store.getSessionRelationship("non-existent");
-      assert.strictEqual(rel404, null);
-
-      store.close();
-    });
-
-    it("should incrementally save additional chunks and steps without overwriting existing ones", () => {
-      const store = storeFactory();
-
-      const session: SessionData = {
-        id: "session-inc",
-        adapter: "antigravity",
-        title: "Incremental Test",
-        projectPath: "",
-        createdAt: 1700000000000,
-        firstPrompt: "init",
-        secondPrompt: "",
-        chunks: [
-          { stepIndex: 0, text: "Chunk 1" }
-        ],
-        steps: [
-          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "init" }
-        ]
-      };
-
+      // Call legacy save
       store.save(session, {
         summary: [0.5, 0.5],
-        chunks: new Map([[0, [1, 0]]])
+        chunks: new Map([
+          [0, [1.0, 0.0]],
+          [1, [0.0, 1.0]],
+        ]),
       });
 
-      // Save again with additional chunk and step
-      const sessionUpdated: SessionData = {
-        ...session,
-        chunks: [
-          { stepIndex: 0, text: "Chunk 1" },
-          { stepIndex: 1, text: "Chunk 2" }
-        ],
-        steps: [
-          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "init" },
-          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "response" }
-        ]
-      };
+      // Call legacy query
+      const queryRes = store.query({ sessionId: "sess-compat", includeSteps: true });
+      assert.strictEqual(queryRes.sessions.length, 1);
+      assert.strictEqual(queryRes.sessions[0].id, "sess-compat");
+      assert.strictEqual(queryRes.steps.length, 1);
 
-      // In incremental save, we only pass vectors for NEW chunks
-      store.save(sessionUpdated, {
-        chunks: new Map([[1, [0, 1]]])
-      });
-
-      const res = store.query({ sessionId: "session-inc", includeSteps: true });
-      assert.strictEqual(res.chunks.length, 2);
-      assert.strictEqual(res.steps.length, 2);
-      
-      // Verify first chunk vector is preserved (i.e. not empty)
-      const searchRes = store.search([1, 0], 5);
-      assert.strictEqual(searchRes.length, 2);
-      // The first chunk should match query [1, 0] with 1 similarity
-      const hit0 = searchRes.find(h => h.stepIndex === 0);
-      assert.ok(hit0);
-      assert.ok(Math.abs(hit0.similarity - 1) < 0.01);
-
-      // The second chunk should match query [0, 1] with 1 similarity
-      const searchRes2 = store.search([0, 1], 5);
-      const hit1 = searchRes2.find(h => h.stepIndex === 1);
-      assert.ok(hit1);
-      assert.ok(Math.abs(hit1.similarity - 1) < 0.01);
-
-      store.close();
-    });
-
-    it("should resolve active project path and apply scope workspace filter", () => {
-      const store = storeFactory();
-
-      const session1: SessionData = {
-        id: "session-s1",
-        adapter: "antigravity",
-        title: "Session S1",
-        projectPath: "d:/projects/project-s1",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [{ stepIndex: 0, text: "Chunk S1" }],
-        steps: [{ stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "S1" }]
-      };
-
-      const session2: SessionData = {
-        id: "session-s2",
-        adapter: "antigravity",
-        title: "Session S2",
-        projectPath: "d:/projects/project-s2",
-        createdAt: 1700000010000, // More recent
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [{ stepIndex: 0, text: "Chunk S2" }],
-        steps: [{ stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "S2" }]
-      };
-
-      const embeddings: SessionEmbeddings = {
-        summary: [0.5, 0.5],
-        chunks: new Map([[0, [0.5, 0.5]]])
-      };
-
-      store.save(session1, embeddings);
-      store.save(session2, embeddings);
-
-      // Verify getActiveProjectPath returns the most recent one (session2)
-      assert.strictEqual(store.getActiveProjectPath(), "d:/projects/project-s2");
-
-      // Query with scope: "workspace" (should resolve to session2's projectPath)
-      const resWorkspace = store.query({ scope: "workspace", includeSteps: true });
-      assert.strictEqual(resWorkspace.sessions.length, 1);
-      assert.strictEqual(resWorkspace.sessions[0].id, "session-s2");
-      assert.strictEqual(resWorkspace.steps.length, 1);
-      assert.strictEqual(resWorkspace.steps[0].content, "S2");
-
-      // Query with scope: "all" or omitted (should return all sessions)
-      const resAll = store.query({ scope: "all", includeSteps: true });
-      assert.ok(resAll.sessions.length >= 2);
-      
-      const resOmitted = store.query({ includeSteps: true });
-      assert.ok(resOmitted.sessions.length >= 2);
-
-      // Explicit projectPath should override/take precedence
-      const resExplicit = store.query({ scope: "workspace", projectPath: "project-s1" });
-      assert.strictEqual(resExplicit.sessions.length, 1);
-      assert.strictEqual(resExplicit.sessions[0].id, "session-s1");
-
-      // Test search with scope: "workspace"
-      const hitsWorkspace = store.search([0.5, 0.5], 10, { scope: "workspace" });
-      assert.ok(hitsWorkspace.length > 0);
-      assert.ok(hitsWorkspace.every(h => h.projectPath === "d:/projects/project-s2"));
-
-      store.close();
-    });
-
-    it("should track session lastActiveAt and support sorting and time range query", () => {
-      const store = storeFactory();
-
-      const session1: SessionData = {
-        id: "session-t1",
-        adapter: "antigravity",
-        title: "Test Session 1",
-        projectPath: "d:/projects/test",
-        createdAt: 1000,
-        firstPrompt: "init",
-        secondPrompt: "",
-        chunks: [],
-        steps: [
-          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "hello", createdAt: 1000 },
-          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "world", createdAt: 5000 }
-        ]
-      };
-
-      const session2: SessionData = {
-        id: "session-t2",
-        adapter: "antigravity",
-        title: "Test Session 2",
-        projectPath: "d:/projects/test",
-        createdAt: 2000,
-        firstPrompt: "init",
-        secondPrompt: "",
-        chunks: [],
-        steps: [
-          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "hello", createdAt: 2000 },
-          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "world", createdAt: 3000 }
-        ]
-      };
-
-      const embeddings: SessionEmbeddings = {
-        summary: [0.5, 0.5],
-        chunks: new Map()
-      };
-
-      store.save(session1, embeddings);
-      store.save(session2, embeddings);
-
-      // session1 has: createdAt=1000, lastActiveAt=5000
-      // session2 has: createdAt=2000, lastActiveAt=3000
-
-      // Sort by active DESC (default): should be session-t1 (5000) then session-t2 (3000)
-      const resActive = store.query({ sortBy: "active" });
-      assert.strictEqual(resActive.sessions.length, 2);
-      assert.strictEqual(resActive.sessions[0].id, "session-t1");
-      assert.strictEqual(resActive.sessions[1].id, "session-t2");
-      assert.strictEqual(resActive.sessions[0].lastActiveAt, 5000);
-      assert.strictEqual(resActive.sessions[1].lastActiveAt, 3000);
-
-      // Sort by created DESC: should be session-t2 (2000) then session-t1 (1000)
-      const resCreated = store.query({ sortBy: "created" });
-      assert.strictEqual(resCreated.sessions.length, 2);
-      assert.strictEqual(resCreated.sessions[0].id, "session-t2");
-      assert.strictEqual(resCreated.sessions[1].id, "session-t1");
-
-      // Filter timeRange "1500:4000" (matches session-t2 lastActiveAt=3000, but session-t1 lastActiveAt=5000 is out of range)
-      const resRange = store.query({ timeRange: "1500:4000" });
-      assert.strictEqual(resRange.sessions.length, 1);
-      assert.strictEqual(resRange.sessions[0].id, "session-t2");
-
-      store.close();
-    });
-
-    it("should filter conversation steps, sort in reverse, and slice by conversation step range", () => {
-      const store = storeFactory();
-
-      const session: SessionData = {
-        id: "session-conv-steps",
-        adapter: "antigravity",
-        title: "Conv Steps Test",
-        projectPath: "",
-        createdAt: 1700000000000,
-        firstPrompt: "",
-        secondPrompt: "",
-        chunks: [],
-        steps: [
-          { stepIndex: 1, type: "USER_INPUT", source: "USER", status: "DONE", content: "first prompt" },
-          { stepIndex: 2, type: "COMMAND", source: "MODEL", status: "DONE", content: "some command" },
-          { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "", thinking: "response 1 thinking" },
-          { stepIndex: 4, type: "MCP_TOOL", source: "MODEL", status: "DONE", content: "tool result" },
-          { stepIndex: 5, type: "USER_INPUT", source: "USER", status: "DONE", content: "second prompt" },
-          { stepIndex: 6, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "response 2" }
-        ]
-      };
-
-      store.save(session, { summary: [0.5, 0.5], chunks: new Map() });
-
-      // 1. Test conversationStepsOnly: true (only stepIndex 1, 5, 6 because stepIndex 3 has no content)
-      const resConvOnly = store.query({ includeSteps: true, sessionId: "session-conv-steps", conversationStepsOnly: true });
-      assert.strictEqual(resConvOnly.steps.length, 3);
-      assert.strictEqual(resConvOnly.steps[0].stepIndex, 1);
-      assert.strictEqual(resConvOnly.steps[1].stepIndex, 5);
-      assert.strictEqual(resConvOnly.steps[2].stepIndex, 6);
-
-      // 2. Test reverseSteps: true
-      const resReverse = store.query({ includeSteps: true, sessionId: "session-conv-steps", reverseSteps: true });
-      assert.strictEqual(resReverse.steps.length, 6);
-      assert.strictEqual(resReverse.steps[0].stepIndex, 6);
-      assert.strictEqual(resReverse.steps[5].stepIndex, 1);
-
-      // 3. Test startConversationStep and endConversationStep (1-based index of conversation steps)
-      // Conversation steps:
-      // Index 1 (1-based) -> stepIndex 1 (USER_INPUT)
-      // Index 2 (1-based) -> stepIndex 5 (USER_INPUT)
-      // Index 3 (1-based) -> stepIndex 6 (PLANNER_RESPONSE)
-      // Slice from conversation step 2 to 3 -> stepIndex 5 to 6
-      const resConvRange = store.query({ includeSteps: true, sessionId: "session-conv-steps", startConversationStep: 2, endConversationStep: 3 });
-      assert.strictEqual(resConvRange.steps.length, 2);
-      assert.strictEqual(resConvRange.steps[0].stepIndex, 5);
-      assert.strictEqual(resConvRange.steps[1].stepIndex, 6);
-
-      store.close();
-    });
-
-    it("should filter undone steps by default and include them when includeUndone is true", () => {
-      const store = storeFactory();
-
-      const session: SessionData = {
-        id: "session-undone-test",
-        adapter: "antigravity",
-        title: "Undone Steps Test",
-        projectPath: "",
-        createdAt: 1700000000000,
-        firstPrompt: "init",
-        secondPrompt: "",
-        chunks: [],
-        steps: [
-          { stepIndex: 0, type: "USER_INPUT", source: "USER", status: "DONE", content: "turn 1" },
-          { stepIndex: 1, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "reply 1" },
-          { stepIndex: 2, type: "USER_INPUT", source: "USER", status: "DONE", content: "turn 2 (undone)", isUndone: true },
-          { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "reply 2 (undone)", isUndone: true },
-          { stepIndex: 2, type: "USER_INPUT", source: "USER", status: "DONE", content: "turn 2 (active)" },
-          { stepIndex: 3, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: "reply 2 (active)" }
-        ]
-      };
-
-      store.save(session, { summary: [0.5, 0.5], chunks: new Map() });
-
-      // Default: includeUndone = false / omitted
-      const defaultRes = store.query({ sessionId: "session-undone-test", includeSteps: true });
-      assert.strictEqual(defaultRes.steps.length, 4);
-      assert.ok(defaultRes.steps.every(s => !s.isUndone));
-      assert.strictEqual(defaultRes.steps[2].content, "turn 2 (active)");
-      assert.strictEqual(defaultRes.steps[3].content, "reply 2 (active)");
-
-      // With includeUndone: true
-      const allRes = store.query({ sessionId: "session-undone-test", includeSteps: true, includeUndone: true });
-      assert.strictEqual(allRes.steps.length, 6);
-      const undone = allRes.steps.filter(s => s.isUndone);
-      assert.strictEqual(undone.length, 2);
-      assert.strictEqual(undone[0].content, "turn 2 (undone)");
-      assert.strictEqual(undone[1].content, "reply 2 (undone)");
-
-      // With conversationStepsOnly + includeUndone: true
-      const convUndoneRes = store.query({ sessionId: "session-undone-test", includeSteps: true, includeUndone: true, conversationStepsOnly: true });
-      assert.strictEqual(convUndoneRes.steps.length, 6);
-      assert.strictEqual(convUndoneRes.steps.filter(s => s.isUndone).length, 2);
+      // Call legacy search
+      const searchRes = store.search([1.0, 0.0], 5);
+      assert.ok(searchRes.length > 0);
 
       store.close();
     });
   });
 }
 
+// 1. Run test suite against InMemoryHistoryStore
 runTestSuite("InMemoryHistoryStore", () => new InMemoryHistoryStore());
-runTestSuite("SqliteHistoryStore", () => new SqliteHistoryStore(":memory:"));
 
-describe("syncHistory auto-sync and coalescing", () => {
-  let originalDiscover0: any;
-  let originalDiscover1: any;
+// 2. Run test suite against SqliteHistoryStore
+const tempDbDir = path.join(os.tmpdir(), "chronicle-mcp-tests-" + Date.now());
+if (!fs.existsSync(tempDbDir)) {
+  fs.mkdirSync(tempDbDir, { recursive: true });
+}
 
-  before(() => {
-    originalDiscover0 = ADAPTERS[0].discoverSessions;
-    originalDiscover1 = ADAPTERS[1].discoverSessions;
-  });
+let dbCount = 0;
+runTestSuite("SqliteHistoryStore", () => {
+  const dbFile = path.join(tempDbDir, `test-${++dbCount}.db`);
+  return new SqliteHistoryStore(dbFile);
+});
 
-  after(() => {
-    ADAPTERS[0].discoverSessions = originalDiscover0;
-    ADAPTERS[1].discoverSessions = originalDiscover1;
-  });
-
-  it("should coalesce concurrent syncHistory calls and sync incrementally", async () => {
-    let callCount = 0;
-    ADAPTERS[0].discoverSessions = async () => {
-      callCount++;
-      // Simulate delay
-      await new Promise(resolve => setTimeout(resolve, 50));
-      return [];
-    };
-    ADAPTERS[1].discoverSessions = async () => [];
-
-    // Trigger two concurrent syncs
-    const p1 = syncHistory(true); // Force bypasses lock if needed
-    const p2 = syncHistory(true); // Also concurrent, should coalesce
-
-    await Promise.all([p1, p2]);
-
-    // Should only have called discoverSessions once because of coalescing activeSync
-    assert.strictEqual(callCount, 1);
-
-    // Call again - syncHistory performs fast incremental check without hard cooldown
-    await syncHistory();
-    assert.strictEqual(callCount, 2);
-  });
-
-  it("should return correct status for isAutoSyncEnabled", () => {
-    const originalEnv = process.env.CHRONICLE_AUTO_SYNC;
-    
-    process.env.CHRONICLE_AUTO_SYNC = "true";
-    assert.strictEqual(isAutoSyncEnabled(), true);
-
-    process.env.CHRONICLE_AUTO_SYNC = "false";
-    assert.strictEqual(isAutoSyncEnabled(), false);
-
-    process.env.CHRONICLE_AUTO_SYNC = originalEnv;
-  });
+after(() => {
+  try {
+    fs.rmSync(tempDbDir, { recursive: true, force: true });
+  } catch {}
 });

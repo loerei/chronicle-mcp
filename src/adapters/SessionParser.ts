@@ -1,4 +1,39 @@
-import { SessionData, ChunkData, StepData } from "./types.js";
+import { getEncoding, type Tiktoken } from "js-tiktoken";
+import { SessionData, TurnData, StepData, ChunkData } from "./types.js";
+
+// Top-level pre-compiled regular expressions for prompt sanitization
+const RE_ADDITIONAL_METADATA = /<ADDITIONAL_METADATA\b[^>]*>[\s\S]*?<\/ADDITIONAL_METADATA>/gi;
+const RE_SYSTEM_PROMPT = /<SYSTEM_PROMPT\b[^>]*>[\s\S]*?<\/SYSTEM_PROMPT>/gi;
+const RE_USER_INSTRUCTIONS = /<user_instructions\b[^>]*>[\s\S]*?<\/user_instructions>/gi;
+const RE_USER_REQUEST_TAGS = /<\/?USER_REQUEST\b[^>]*>/gi;
+
+let cachedTokenizer: Tiktoken | null = null;
+
+function getTokenizer(): Tiktoken {
+  cachedTokenizer ??= getEncoding("cl100k_base");
+  return cachedTokenizer;
+}
+
+export function countTokens(text: string | null | undefined): number {
+  if (!text) return 0;
+  const str = String(text);
+  const clean = typeof (str as any).toWellFormed === "function" ? (str as any).toWellFormed() : str;
+  try {
+    return getTokenizer().encode(clean).length;
+  } catch {
+    return Math.ceil(clean.length / 4);
+  }
+}
+
+export function cleanUserRequest(text: string): string {
+  if (!text) return "";
+  let cleaned = text;
+  cleaned = cleaned.replace(RE_ADDITIONAL_METADATA, "");
+  cleaned = cleaned.replace(RE_SYSTEM_PROMPT, "");
+  cleaned = cleaned.replace(RE_USER_INSTRUCTIONS, "");
+  cleaned = cleaned.replace(RE_USER_REQUEST_TAGS, "");
+  return cleaned.trim();
+}
 
 function jsonParse(str: string): any {
   try {
@@ -8,63 +43,119 @@ function jsonParse(str: string): any {
   }
 }
 
-function cleanUserRequest(text: string): string {
-  // Removes <USER_REQUEST>, <ADDITIONAL_METADATA> and similar tags
-  let cleaned = text;
-  cleaned = cleaned.replace(/<USER_REQUEST>[\s\S]*?<\/USER_REQUEST>/g, (match) => {
-    return match.replace(/<\/?USER_REQUEST>/g, "");
-  });
-  let startIdx;
-  while ((startIdx = cleaned.indexOf("<ADDITIONAL_METADATA>")) !== -1) {
-    const endIdx = cleaned.indexOf("</ADDITIONAL_METADATA>", startIdx);
-    if (endIdx === -1) {
-      break;
-    }
-    cleaned = cleaned.substring(0, startIdx) + cleaned.substring(endIdx + "</ADDITIONAL_METADATA>".length);
+export function normalizePayload(val: any): string | undefined {
+  if (val === undefined || val === null) {
+    return undefined;
   }
-  let tagStart;
-  while ((tagStart = cleaned.indexOf("<")) !== -1) {
-    const tagEnd = cleaned.indexOf(">", tagStart);
-    if (tagEnd === -1) {
-      break;
-    }
-    cleaned = cleaned.substring(0, tagStart) + cleaned.substring(tagEnd + 1);
+  if (typeof val === "string") {
+    return val;
   }
-  return cleaned.trim();
+  try {
+    return JSON.stringify(val);
+  } catch {
+    return String(val);
+  }
 }
 
-function getPathStringsFromCall(call: any): string[] {
+const FILE_ARG_KEYS = [
+  "target_file",
+  "TargetFile",
+  "AbsolutePath",
+  "filePath",
+  "file_path",
+  "NotebookPath",
+  "ImagePaths",
+  "image_paths",
+  "target_path",
+  "TargetPath",
+];
+
+const DIR_ARG_KEYS = [
+  "Cwd",
+  "cwd",
+  "DirectoryPath",
+  "directoryPath",
+  "SearchPath",
+  "search_path",
+];
+
+function sanitizePath(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  let p = raw.trim();
+  if (!p) return null;
+  if (p.startsWith("file:///")) {
+    p = p.slice(8);
+  } else if (p.startsWith("file://")) {
+    p = p.slice(7);
+  }
+  return p.replaceAll("\\", "/");
+}
+
+export function extractFilePathsFromCall(call: any): string[] {
   if (!call) return [];
   const args = call.args || call.arguments || {};
   const paths: string[] = [];
 
-  const addPath = (val: any) => {
-    if (typeof val === "string") paths.push(val);
+  const checkValue = (val: any) => {
+    if (typeof val === "string") {
+      const sanitized = sanitizePath(val);
+      if (sanitized) paths.push(sanitized);
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === "string") {
+          const sanitized = sanitizePath(item);
+          if (sanitized) paths.push(sanitized);
+        }
+      }
+    }
   };
 
-  addPath(args.Cwd);
-  addPath(args.cwd);
-  addPath(args.DirectoryPath);
-  addPath(args.directoryPath);
+  for (const key of FILE_ARG_KEYS) {
+    if (args[key] !== undefined) {
+      checkValue(args[key]);
+    }
+  }
 
   if (args.Arguments && typeof args.Arguments === "object") {
     const nested = args.Arguments;
-    addPath(nested.Cwd);
-    addPath(nested.cwd);
-    addPath(nested.DirectoryPath);
-    addPath(nested.directoryPath);
-    addPath(nested.target_file);
-    addPath(nested.TargetFile);
-    addPath(nested.AbsolutePath);
-    addPath(nested.SearchPath);
+    for (const key of FILE_ARG_KEYS) {
+      if (nested[key] !== undefined) {
+        checkValue(nested[key]);
+      }
+    }
   }
 
-  addPath(args.target_file);
-  addPath(args.TargetFile);
-  addPath(args.AbsolutePath);
-  addPath(args.SearchPath);
-
   return paths;
+}
+
+export function extractDirectoryPathsFromCall(call: any): string[] {
+  if (!call) return [];
+  const args = call.args || call.arguments || {};
+  const dirs: string[] = [];
+
+  const checkValue = (val: any) => {
+    if (typeof val === "string") {
+      const sanitized = sanitizePath(val);
+      if (sanitized) dirs.push(sanitized);
+    }
+  };
+
+  for (const key of DIR_ARG_KEYS) {
+    if (args[key] !== undefined) {
+      checkValue(args[key]);
+    }
+  }
+
+  if (args.Arguments && typeof args.Arguments === "object") {
+    const nested = args.Arguments;
+    for (const key of DIR_ARG_KEYS) {
+      if (nested[key] !== undefined) {
+        checkValue(nested[key]);
+      }
+    }
+  }
+
+  return dirs;
 }
 
 function parseUsersPath(parts: string[]): string | null {
@@ -97,155 +188,101 @@ function parseProjectFromPath(normalized: string): string | null {
 
 function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
   for (const call of toolCalls) {
-    const pathsToCheck = getPathStringsFromCall(call);
-    for (const p of pathsToCheck) {
-      if (!p) continue;
-      const normalized = p.replaceAll("\\", "/");
-      const proj = parseProjectFromPath(normalized);
-      if (proj) {
-        return proj;
-      }
+    const dirs = extractDirectoryPathsFromCall(call);
+    for (const d of dirs) {
+      const proj = parseProjectFromPath(d);
+      if (proj) return proj;
+    }
+    const files = extractFilePathsFromCall(call);
+    for (const f of files) {
+      const proj = parseProjectFromPath(f);
+      if (proj) return proj;
     }
   }
   return null;
 }
 
+export type ParserToolKind = "mcp" | "command" | "native" | "subagent";
+
+interface PendingToolCall {
+  toolName: string;
+  serverName?: string;
+  kind?: ParserToolKind;
+  filePath?: string;
+  toolArgs?: string;
+  stepIndex: number;
+  createdAt?: number;
+  isUndone?: boolean;
+}
+
+function inferToolKind(toolName: string, serverName?: string): ParserToolKind {
+  const lowerTool = (toolName || "").toLowerCase();
+  const lowerServer = (serverName || "").toLowerCase();
+
+  if (lowerServer === "github" || lowerServer === "google-workspace" || lowerServer === "patchitright" || lowerServer === "chronicle" || lowerServer === "jcodemunch" || lowerServer === "jdocmunch" || lowerServer === "sonarqube" || lowerServer === "chrome-devtools-mcp") {
+    return "mcp";
+  }
+  if (lowerTool === "run_command" || lowerTool === "execute_command" || lowerTool === "bash" || lowerTool === "terminal") {
+    return "command";
+  }
+  if (lowerTool === "invoke_subagent" || lowerTool === "send_message" || lowerTool === "spawn_subagent" || lowerTool === "manage_subagents") {
+    return "subagent";
+  }
+  if (lowerServer || lowerTool.startsWith("mcp_")) {
+    return "mcp";
+  }
+  return "native";
+}
+
+const KNOWN_SERVERS = [
+  "github",
+  "google-workspace",
+  "google_workspace",
+  "patchitright",
+  "chronicle",
+  "jcodemunch",
+  "jdocmunch",
+  "sonarqube",
+  "chrome-devtools-mcp",
+  "chrome_devtools_mcp",
+];
+
+function parseToolCallMeta(call: any): { toolName: string; serverName?: string; kind: "mcp" | "command" | "native" | "subagent"; filePath?: string; toolArgs?: string } {
+  let rawName: string = call.name || call.tool_name || call.ToolName || "";
+  let serverName: string | undefined = call.server_name || call.ServerName || undefined;
+  const args = call.args || call.arguments || call.Arguments || {};
+
+  // Handle call_mcp_tool wrapper pattern
+  if (rawName === "call_mcp_tool" && args.ToolName) {
+    rawName = args.ToolName;
+    if (args.ServerName) {
+      serverName = args.ServerName;
+    }
+  } else if (rawName.startsWith("mcp_")) {
+    const parts = rawName.split("_");
+    if (parts.length >= 3) {
+      serverName = parts[1];
+      rawName = parts.slice(2).join("_");
+    }
+  } else {
+    for (const s of KNOWN_SERVERS) {
+      if (rawName.startsWith(s + "_")) {
+        serverName = s.replaceAll("_", "-");
+        rawName = rawName.slice(s.length + 1);
+        break;
+      }
+    }
+  }
+
+  const kind = inferToolKind(rawName, serverName);
+  const filePaths = extractFilePathsFromCall(call);
+  const filePath = filePaths.length > 0 ? filePaths[0] : undefined;
+  const toolArgs = normalizePayload(args);
+
+  return { toolName: rawName, serverName, kind, filePath, toolArgs };
+}
+
 export class SessionParser {
-  private static createStepData(data: any, state: { projectPath: string | null; createdAt: number }): StepData {
-    const stepType = data.type;
-    const stepIndex = data.step_index ?? 0;
-    const stepSource = data.source || "";
-    const stepStatus = data.status || "";
-    const stepCreatedAt = data.created_at ? new Date(data.created_at).getTime() : undefined;
-
-    let stepContent = data.content || undefined;
-    let stepThinking = data.thinking || undefined;
-    let stepToolCalls: string | undefined = undefined;
-
-    if (data.tool_calls) {
-      stepToolCalls = JSON.stringify(data.tool_calls);
-      if (!state.projectPath && Array.isArray(data.tool_calls)) {
-        const extracted = extractProjectPathFromToolCalls(data.tool_calls);
-        if (extracted) {
-          state.projectPath = extracted;
-        }
-      }
-    }
-
-    if (state.createdAt === 0 && data.created_at) {
-      state.createdAt = new Date(data.created_at).getTime();
-    }
-
-    return {
-      stepIndex,
-      type: stepType,
-      source: stepSource,
-      status: stepStatus,
-      content: stepContent,
-      thinking: stepThinking,
-      toolCalls: stepToolCalls,
-      createdAt: stepCreatedAt,
-      isUndone: false,
-    };
-  }
-
-  private static handleUserInput(
-    data: any,
-    state: {
-      firstPrompt: string;
-      secondPrompt: string;
-      projectPath: string | null;
-      currentTurnUserText: string;
-      currentTurnAssistantText: string;
-      currentStepIndex: number;
-    },
-    chunks: ChunkData[]
-  ): void {
-    const text = data.content || "";
-    const stepIndex = data.stepIndex ?? data.step_index ?? 0;
-
-    // Push previous turn if exists
-    if (state.currentTurnUserText) {
-      chunks.push({
-        stepIndex: state.currentStepIndex,
-        text: `User: ${state.currentTurnUserText}\nAssistant: ${state.currentTurnAssistantText}`,
-      });
-    }
-
-    // Extract projectPath from ADDITIONAL_METADATA if present in user input
-    if (text.includes("Workspace mapping") || text.includes("active workspaces")) {
-      const match = text.match(/d:\\Projects\\[a-z0-9_-]+/i) || text.match(/[a-zA-Z]:\\[^\s]+/);
-      if (match) {
-        state.projectPath = match[0].replaceAll("\\", "/");
-      }
-    }
-
-    const cleanedPrompt = cleanUserRequest(text);
-    if (!state.firstPrompt) {
-      state.firstPrompt = cleanedPrompt;
-    } else if (!state.secondPrompt) {
-      state.secondPrompt = cleanedPrompt;
-    }
-
-    state.currentTurnUserText = cleanedPrompt;
-    state.currentTurnAssistantText = "";
-    state.currentStepIndex = stepIndex;
-  }
-
-  private static handlePlannerResponse(assistantText: string, state: { currentTurnAssistantText: string }): void {
-    if (!assistantText) return;
-    if (state.currentTurnAssistantText) {
-      state.currentTurnAssistantText += "\n" + assistantText;
-    } else {
-      state.currentTurnAssistantText = assistantText;
-    }
-  }
-
-  private static handleConversationHistory(historyText: string, localTitleMap: Map<string, string>): void {
-    const linesInHistory = historyText.split("\n");
-    for (const hLine of linesInHistory) {
-      const match = /## Conversation\s+([a-fA-F0-9-]+):\s*(.*)/.exec(hLine);
-      if (match) {
-        localTitleMap.set(match[1].trim(), match[2].trim());
-      }
-    }
-  }
-
-  private static handleInvokeSubagent(content: string, subagentIds: string[]): void {
-    const regex = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/g;
-    let match;
-    while ((match = regex.exec(content)) !== null) {
-      subagentIds.push(match[1]);
-    }
-  }
-
-  private static processStepType(
-    data: any,
-    state: {
-      firstPrompt: string;
-      secondPrompt: string;
-      projectPath: string | null;
-      currentTurnUserText: string;
-      currentTurnAssistantText: string;
-      currentStepIndex: number;
-    },
-    chunks: ChunkData[],
-    localTitleMap: Map<string, string>,
-    subagentIds: string[]
-  ): void {
-    const stepType = data.type;
-
-    if (stepType === "USER_INPUT") {
-      this.handleUserInput(data, state, chunks);
-    } else if (stepType === "PLANNER_RESPONSE") {
-      this.handlePlannerResponse(data.content || "", state);
-    } else if (stepType === "CONVERSATION_HISTORY") {
-      this.handleConversationHistory(data.content || "", localTitleMap);
-    } else if (stepType === "INVOKE_SUBAGENT") {
-      this.handleInvokeSubagent(data.content || "", subagentIds);
-    }
-  }
-
   private static getSessionTitle(sessionId: string, localTitleMap: Map<string, string>, firstPrompt: string): string {
     const existingTitle = localTitleMap.get(sessionId);
     if (existingTitle) return existingTitle;
@@ -258,7 +295,7 @@ export class SessionParser {
   }
 
   private static getComposerTitle(composerId: string, composerState: any, firstPrompt: string): string {
-    const existingTitle = composerState.name || composerState.title;
+    const existingTitle = composerState?.name || composerState?.title;
     if (existingTitle) return existingTitle;
 
     if (firstPrompt) {
@@ -267,50 +304,23 @@ export class SessionParser {
     return `Composer ${composerId.slice(0, 8)}`;
   }
 
-  private static parseComposerTurn(
-    msg: any,
-    i: number,
-    conversation: any[],
-    composerState: any,
-    chunks: ChunkData[],
-    steps: StepData[],
-    state: { firstPrompt: string; secondPrompt: string }
-  ): void {
-    const userText = msg.text || "";
-    
-    if (!state.firstPrompt) {
-      state.firstPrompt = userText;
-    } else if (!state.secondPrompt) {
-      state.secondPrompt = userText;
-    }
+  private static parseSubagentMetadata(call: any, subagentIds: string[], currentSessionId?: string, parentId?: string): void {
+    const args = call.args || call.arguments || call.Arguments || {};
+    const toolName = call.name || call.tool_name || call.ToolName || "";
 
-    const reply = this.findAssistantReply(conversation, i + 1);
-    const assistantText = reply ? reply.text : "";
-    const assistantStepIndex = reply ? reply.index : i + 1;
-
-    chunks.push({
-      stepIndex: i,
-      text: `User: ${userText}\nAssistant: ${assistantText}`,
-    });
-
-    steps.push({
-      stepIndex: i,
-      type: "USER_INPUT",
-      source: "USER_EXPLICIT",
-      status: "DONE",
-      content: userText,
-      createdAt: composerState.createdAt || Date.now(),
-    });
-
-    if (assistantText) {
-      steps.push({
-        stepIndex: assistantStepIndex,
-        type: "PLANNER_RESPONSE",
-        source: "MODEL",
-        status: "DONE",
-        content: assistantText,
-        createdAt: composerState.createdAt || Date.now(),
-      });
+    if (toolName === "invoke_subagent" || toolName === "spawn_subagent") {
+      if (Array.isArray(args.Subagents)) {
+        for (const sub of args.Subagents) {
+          if (sub?.conversationId) subagentIds.push(sub.conversationId);
+        }
+      }
+    } else if (toolName === "send_message") {
+      const recipient = args.Recipient || args.recipient;
+      if (recipient && typeof recipient === "string") {
+        if (recipient.toLowerCase() !== "parent" && recipient !== parentId && recipient !== currentSessionId) {
+          subagentIds.push(recipient);
+        }
+      }
     }
   }
 
@@ -318,229 +328,407 @@ export class SessionParser {
     if (!jsonlContent) return null;
 
     const lines = jsonlContent.split("\n");
-    const state = {
-      firstPrompt: "",
-      secondPrompt: "",
-      projectPath: null as string | null,
-      createdAt: 0,
-      currentTurnUserText: "",
-      currentTurnAssistantText: "",
-      currentStepIndex: 0,
-    };
-
-    const chunks: ChunkData[] = [];
-    const steps: StepData[] = [];
-    const activeStack: StepData[] = [];
-    const localTitleMap = new Map<string, string>();
-    const subagentIds: string[] = [];
+    const rawEvents: any[] = [];
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      try {
-        const data = jsonParse(line);
-        if (!data) continue;
-
-        const stepObj = this.createStepData(data, state);
-
-        // Active timeline stack tracking & rollback detection:
-        while (activeStack.length > 0 && activeStack.at(-1)!.stepIndex >= stepObj.stepIndex) {
-          const popped = activeStack.pop()!;
-          popped.isUndone = true;
-        }
-
-        steps.push(stepObj);
-        activeStack.push(stepObj);
-      } catch {}
+      const data = jsonParse(line);
+      if (data) rawEvents.push(data);
     }
 
-    // Process the surviving active steps for chunks, prompts, subagents, titles
-    for (const activeStep of activeStack) {
-      this.processStepType(activeStep, state, chunks, localTitleMap, subagentIds);
-    }
-
-    if (state.currentTurnUserText) {
-      chunks.push({
-        stepIndex: state.currentStepIndex,
-        text: `User: ${state.currentTurnUserText}\nAssistant: ${state.currentTurnAssistantText}`,
-      });
-    }
-
-    if (steps.length === 0) {
+    if (rawEvents.length === 0) {
       return null;
     }
 
-    const title = this.getSessionTitle(sessionId, localTitleMap, state.firstPrompt);
+    let projectPath: string | null = null;
+    let sessionCreatedAt = 0;
+    const localTitleMap = new Map<string, string>();
+    const subagentIds: string[] = [];
+    const filesTouchedSet = new Set<string>();
 
-    const stepTimestamps = steps.map(s => s.createdAt).filter((t): t is number => t !== undefined);
-    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : state.createdAt;
+    interface InternalTurn {
+      turnIndex: number;
+      userPrompt: string;
+      assistantResponses: string[];
+      thinkingBlocks: string[];
+      steps: StepData[];
+      pendingCalls: PendingToolCall[];
+      isUndone: boolean;
+      createdAt?: number;
+      stepOrderCounter: number;
+    }
+
+    const turns: InternalTurn[] = [];
+    let activeTurn: InternalTurn | null = null;
+    let turnCounter = 0;
+
+    const activeStack: Array<{ stepIndex: number; turnIndex: number; isUndone: boolean }> = [];
+
+    for (const raw of rawEvents) {
+      const stepIndex = raw.step_index ?? raw.stepIndex ?? 0;
+      const stepType = raw.type || "";
+      const stepSource = raw.source || "";
+      const stepStatus = raw.status || "DONE";
+      const rawCreatedAt = raw.created_at ? new Date(raw.created_at).getTime() : undefined;
+
+      if (sessionCreatedAt === 0 && rawCreatedAt) {
+        sessionCreatedAt = rawCreatedAt;
+      }
+
+      // Rollback detection: when step_index decreases, mark popped items as undone
+      while (activeStack.length > 0 && activeStack.at(-1)!.stepIndex >= stepIndex) {
+        const popped = activeStack.pop()!;
+        popped.isUndone = true;
+        for (const t of turns) {
+          if (t.turnIndex === popped.turnIndex) {
+            for (const s of t.steps) {
+              if (s.stepIndex === popped.stepIndex) {
+                s.isUndone = true;
+              }
+            }
+          }
+        }
+      }
+
+      // Handle USER_INPUT: demarcates a new turn
+      if (stepType === "USER_INPUT") {
+        const rawContent = raw.content || "";
+
+        // Extract projectPath from user prompt if present
+        if (rawContent.includes("Workspace mapping") || rawContent.includes("active workspaces")) {
+          const match = rawContent.match(/d:\\Projects\\[a-z0-9_-]+/i) || rawContent.match(/[a-zA-Z]:\\[^\s]+/);
+          if (match) {
+            projectPath = match[0].replaceAll("\\", "/");
+          }
+        }
+
+        const cleanedPrompt = cleanUserRequest(rawContent);
+
+        // Advance turn counter
+        turnCounter += 1;
+        const newTurn: InternalTurn = {
+          turnIndex: turnCounter,
+          userPrompt: cleanedPrompt,
+          assistantResponses: [],
+          thinkingBlocks: [],
+          steps: [],
+          pendingCalls: [],
+          isUndone: false,
+          createdAt: rawCreatedAt || sessionCreatedAt,
+          stepOrderCounter: 1,
+        };
+
+        // Emit user input step
+        newTurn.steps.push({
+          stepIndex,
+          turnIndex: turnCounter,
+          stepOrder: newTurn.stepOrderCounter++,
+          category: "user",
+          status: "DONE",
+          content: cleanedPrompt,
+          createdAt: rawCreatedAt,
+          isUndone: false,
+        });
+
+        turns.push(newTurn);
+        activeTurn = newTurn;
+        activeStack.push({ stepIndex, turnIndex: turnCounter, isUndone: false });
+        continue;
+      }
+
+      // If non-USER_INPUT arrives before any turn is created, synthesize Turn 1
+      if (!activeTurn) {
+        turnCounter = 1;
+        activeTurn = {
+          turnIndex: 1,
+          userPrompt: "",
+          assistantResponses: [],
+          thinkingBlocks: [],
+          steps: [],
+          pendingCalls: [],
+          isUndone: false,
+          createdAt: rawCreatedAt || sessionCreatedAt,
+          stepOrderCounter: 1,
+        };
+        turns.push(activeTurn);
+      }
+
+      // Handle CONVERSATION_HISTORY for session titles
+      if (stepType === "CONVERSATION_HISTORY") {
+        const historyText = raw.content || "";
+        const linesInHistory = historyText.split("\n");
+        for (const hLine of linesInHistory) {
+          const match = /## Conversation\s+([a-fA-F0-9-]+):\s*(.*)/.exec(hLine);
+          if (match) {
+            localTitleMap.set(match[1].trim(), match[2].trim());
+          }
+        }
+      }
+
+      // Handle PLANNER_RESPONSE (agent thoughts / dialogue & tool calls)
+      if (stepType === "PLANNER_RESPONSE") {
+        const content = raw.content || "";
+        const thinking = raw.thinking || undefined;
+        const toolCalls = Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
+
+        if (content) {
+          activeTurn.assistantResponses.push(content);
+        }
+        if (thinking) {
+          activeTurn.thinkingBlocks.push(thinking);
+        }
+
+        // Project path detection from tool calls
+        if (!projectPath && toolCalls.length > 0) {
+          const extracted = extractProjectPathFromToolCalls(toolCalls);
+          if (extracted) projectPath = extracted;
+        }
+
+        // Subagent discovery from tool calls
+        for (const call of toolCalls) {
+          this.parseSubagentMetadata(call, subagentIds, sessionId);
+          const filePaths = extractFilePathsFromCall(call);
+          for (const f of filePaths) filesTouchedSet.add(f);
+        }
+
+        // Emit agent step iff non-empty content or thinking exists
+        if (content.trim() || thinking?.trim()) {
+          activeTurn.steps.push({
+            stepIndex,
+            turnIndex: activeTurn.turnIndex,
+            stepOrder: activeTurn.stepOrderCounter++,
+            category: "agent",
+            status: "DONE",
+            content: content || undefined,
+            thinking: thinking || undefined,
+            createdAt: rawCreatedAt,
+            isUndone: false,
+          });
+        }
+
+        // Enqueue tool calls into pending queue
+        for (const call of toolCalls) {
+          const meta = parseToolCallMeta(call);
+          activeTurn.pendingCalls.push({
+            toolName: meta.toolName,
+            serverName: meta.serverName,
+            kind: meta.kind,
+            filePath: meta.filePath,
+            toolArgs: meta.toolArgs,
+            stepIndex,
+            createdAt: rawCreatedAt,
+            isUndone: false,
+          });
+        }
+
+        activeStack.push({ stepIndex, turnIndex: activeTurn.turnIndex, isUndone: false });
+        continue;
+      }
+
+      // Handle tool execution outputs / error steps (MCP_TOOL, COMMAND, INVOKE_SUBAGENT, etc.)
+      const isExecutionEvent = stepType === "MCP_TOOL" || stepType === "COMMAND" || stepType === "INVOKE_SUBAGENT" || stepType === "TOOL_RESULT" || (stepSource === "SYSTEM" && raw.content);
+
+      if (isExecutionEvent) {
+        let matchedCall: PendingToolCall | undefined = undefined;
+
+        // Try to match a pending tool call from activeTurn.pendingCalls
+        const eventToolName = raw.tool_name || raw.name || undefined;
+        let matchIdx = -1;
+
+        if (eventToolName) {
+          matchIdx = activeTurn.pendingCalls.findIndex(c => c.toolName === eventToolName || eventToolName.endsWith(c.toolName));
+        } else if (stepType === "COMMAND") {
+          matchIdx = activeTurn.pendingCalls.findIndex(c => c.kind === "command" || c.toolName === "run_command" || c.toolName === "execute_command");
+        } else if (stepType === "MCP_TOOL") {
+          matchIdx = activeTurn.pendingCalls.findIndex(c => c.kind === "mcp" || c.kind === "native");
+        } else if (stepType === "INVOKE_SUBAGENT") {
+          matchIdx = activeTurn.pendingCalls.findIndex(c => c.kind === "subagent");
+        }
+
+        if (matchIdx >= 0) {
+          matchedCall = activeTurn.pendingCalls.splice(matchIdx, 1)[0];
+        }
+
+        // Extract execution details
+        const toolResult = normalizePayload(raw.content || raw.result || raw.output || undefined);
+        let exitCode = 0;
+        if (typeof raw.exit_code === "number") {
+          exitCode = raw.exit_code;
+        } else if (stepStatus === "ERROR") {
+          exitCode = 1;
+        }
+
+        let errorMessage: string | undefined = undefined;
+        if (stepStatus === "ERROR") {
+          errorMessage = raw.error || raw.error_message || (exitCode !== 0 ? `Process exited with code ${exitCode}` : undefined);
+        }
+
+        let subagentSessionId: string | undefined = undefined;
+        if (raw.content && typeof raw.content === "string") {
+          const match = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/.exec(raw.content);
+          if (match) {
+            subagentSessionId = match[1];
+            subagentIds.push(match[1]);
+          }
+        }
+
+        const toolName = matchedCall?.toolName || raw.tool_name || (stepType === "COMMAND" ? "run_command" : "mcp_tool");
+        const serverName = matchedCall?.serverName || raw.server_name || undefined;
+        const kind = matchedCall?.kind || inferToolKind(toolName, serverName);
+        const filePath = matchedCall?.filePath || undefined;
+        const toolArgs = matchedCall?.toolArgs || undefined;
+
+        let toolDurationMs: number | undefined = undefined;
+        if (matchedCall?.createdAt && rawCreatedAt && rawCreatedAt >= matchedCall.createdAt) {
+          toolDurationMs = rawCreatedAt - matchedCall.createdAt;
+        }
+
+        activeTurn.steps.push({
+          stepIndex,
+          turnIndex: activeTurn.turnIndex,
+          stepOrder: activeTurn.stepOrderCounter++,
+          category: "execution",
+          kind,
+          status: stepStatus === "ERROR" || exitCode !== 0 ? "ERROR" : "DONE",
+          toolName,
+          serverName,
+          filePath,
+          exitCode,
+          errorMessage,
+          toolArgs,
+          toolResult,
+          toolDurationMs,
+          subagentSessionId,
+          createdAt: rawCreatedAt,
+          isUndone: false,
+        });
+
+        activeStack.push({ stepIndex, turnIndex: activeTurn.turnIndex, isUndone: false });
+        continue;
+      }
+
+      // Generic fallback for other system/custom steps
+      activeTurn.steps.push({
+        stepIndex,
+        turnIndex: activeTurn.turnIndex,
+        stepOrder: activeTurn.stepOrderCounter++,
+        category: "system",
+        status: stepStatus,
+        content: normalizePayload(raw.content),
+        createdAt: rawCreatedAt,
+        isUndone: false,
+      });
+      activeStack.push({ stepIndex, turnIndex: activeTurn.turnIndex, isUndone: false });
+    }
+
+    // Flush any remaining pending tool calls as PENDING execution steps
+    for (const t of turns) {
+      while (t.pendingCalls.length > 0) {
+        const pending = t.pendingCalls.shift()!;
+        t.steps.push({
+          stepIndex: pending.stepIndex,
+          turnIndex: t.turnIndex,
+          stepOrder: t.stepOrderCounter++,
+          category: "execution",
+          kind: pending.kind,
+          status: "PENDING",
+          toolName: pending.toolName,
+          serverName: pending.serverName,
+          filePath: pending.filePath,
+          toolArgs: pending.toolArgs,
+          createdAt: pending.createdAt,
+          isUndone: pending.isUndone || false,
+        });
+      }
+    }
+
+    // Assemble final TurnData[]
+    const finalTurns: TurnData[] = [];
+    const allStepsFlat: StepData[] = [];
+    const chunks: ChunkData[] = [];
+
+    for (const t of turns) {
+      // Determine if turn is undone (if all steps in turn are undone)
+      const hasActiveSteps = t.steps.some(s => !s.isUndone);
+      const isTurnUndone = t.steps.length > 0 ? !hasActiveSteps : t.isUndone;
+      t.isUndone = isTurnUndone;
+
+      const assistantCombined = t.assistantResponses.join("\n").trim();
+      const turnText = [t.userPrompt, assistantCombined].filter(Boolean).join(" ").trim();
+
+      const inputTokens = countTokens(t.userPrompt);
+      const outputTokens = countTokens(assistantCombined);
+      const thinkingTokens = countTokens(t.thinkingBlocks.join("\n"));
+
+      const executionSteps = t.steps.filter(s => s.category === "execution");
+      const toolCount = executionSteps.length;
+      const errorCount = executionSteps.filter(s => s.status === "ERROR" || (s.exitCode && s.exitCode !== 0)).length;
+
+      const stepTimestamps = t.steps.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !Number.isNaN(ts));
+      const durationMs = stepTimestamps.length >= 2 ? Math.max(0, Math.max(...stepTimestamps) - Math.min(...stepTimestamps)) : 0;
+
+      const turnObj: TurnData = {
+        turnIndex: t.turnIndex,
+        userPrompt: t.userPrompt,
+        assistantResponse: assistantCombined,
+        turnSummary: t.userPrompt.length > 120 ? t.userPrompt.slice(0, 117) + "..." : t.userPrompt,
+        turnText,
+        inputTokens,
+        outputTokens,
+        thinkingTokens,
+        toolCount,
+        errorCount,
+        durationMs,
+        isUndone: isTurnUndone,
+        createdAt: t.createdAt || sessionCreatedAt,
+        steps: t.steps,
+      };
+
+      finalTurns.push(turnObj);
+      allStepsFlat.push(...t.steps);
+
+      if (t.userPrompt || assistantCombined) {
+        chunks.push({
+          stepIndex: t.steps[0]?.stepIndex ?? t.turnIndex,
+          text: `User: ${t.userPrompt}\nAssistant: ${assistantCombined}`,
+        });
+      }
+    }
+
+    // Compute active metrics (strictly where !isUndone)
+    const activeTurns = finalTurns.filter(t => !t.isUndone);
+    const activeSteps = allStepsFlat.filter(s => !s.isUndone);
+
+    const totalTurns = activeTurns.length;
+    const totalSteps = activeSteps.length;
+    const totalTokens = activeTurns.reduce((sum, t) => sum + (t.inputTokens || 0) + (t.outputTokens || 0) + (t.thinkingTokens || 0), 0);
+
+    const firstPrompt = activeTurns[0]?.userPrompt || finalTurns[0]?.userPrompt || "";
+    const secondPrompt = activeTurns[1]?.userPrompt || finalTurns[1]?.userPrompt || "";
+    const title = this.getSessionTitle(sessionId, localTitleMap, firstPrompt);
+
+    const allTimestamps = allStepsFlat.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !Number.isNaN(ts));
+    const lastActiveAt = allTimestamps.length > 0 ? Math.max(...allTimestamps) : (sessionCreatedAt || Date.now());
 
     return {
       id: sessionId,
       adapter: "antigravity",
       title,
-      projectPath: state.projectPath,
-      createdAt: state.createdAt,
+      projectPath,
+      createdAt: sessionCreatedAt || Date.now(),
       lastActiveAt,
-      firstPrompt: state.firstPrompt,
-      secondPrompt: state.secondPrompt,
+      totalTurns,
+      totalSteps,
+      totalTokens,
+      firstPrompt,
+      secondPrompt,
+      artifacts: [],
+      filesTouched: Array.from(filesTouchedSet),
+      turns: finalTurns,
+      steps: allStepsFlat,
       chunks,
-      steps,
-      subagentIds,
+      subagentIds: Array.from(new Set(subagentIds)),
     };
-  }
-
-  private static findAssistantReply(conversation: any[], startIndex: number): { text: string, index: number } | null {
-    for (let j = startIndex; j < conversation.length; j++) {
-      const nextMsg = conversation[j];
-      const sender = nextMsg.type || nextMsg.sender || "";
-      if (sender === "ai" || sender === "assistant") {
-        return { text: nextMsg.text || "", index: j };
-      }
-    }
-    return null;
-  }
-
-  private static parseBubbleCreatedAt(bubble: any, defaultCreatedAt: number): number {
-    if (!bubble.createdAt) {
-      return defaultCreatedAt;
-    }
-    if (typeof bubble.createdAt === "string") {
-      return new Date(bubble.createdAt).getTime();
-    }
-    return bubble.createdAt;
-  }
-
-  private static parseUserBubble(
-    bubble: any,
-    bubbleCreatedAt: number,
-    promptState: { firstPrompt: string; secondPrompt: string },
-    chunks: ChunkData[],
-    steps: StepData[],
-    state: { stepIndexCounter: number; currentUserText: string; currentAssistantTexts: string[] }
-  ): void {
-    const userText = bubble.text || "";
-
-    if (!promptState.firstPrompt) promptState.firstPrompt = userText;
-    else if (!promptState.secondPrompt) promptState.secondPrompt = userText;
-
-    if (state.currentUserText || state.currentAssistantTexts.length > 0) {
-      chunks.push({
-        stepIndex: state.stepIndexCounter,
-        text: `User: ${state.currentUserText}\nAssistant: ${state.currentAssistantTexts.join("\n")}`,
-      });
-      state.currentAssistantTexts = [];
-    }
-    state.currentUserText = userText;
-
-    steps.push({
-      stepIndex: state.stepIndexCounter++,
-      type: "USER_INPUT",
-      source: "USER_EXPLICIT",
-      status: "DONE",
-      content: userText,
-      createdAt: bubbleCreatedAt,
-    });
-  }
-
-  private static parseCursorNewFormat(
-    conversation: any[],
-    composerState: any,
-    promptState: { firstPrompt: string; secondPrompt: string },
-    chunks: ChunkData[],
-    steps: StepData[]
-  ): void {
-    const state = {
-      stepIndexCounter: 0,
-      currentUserText: "",
-      currentAssistantTexts: [] as string[],
-    };
-    const defaultCreatedAt = composerState.createdAt || Date.now();
-
-    for (const bubble of conversation) {
-      if (!bubble) continue;
-      const bubbleCreatedAt = this.parseBubbleCreatedAt(bubble, defaultCreatedAt);
-
-      if (bubble.type === 1) { // User
-        this.parseUserBubble(bubble, bubbleCreatedAt, promptState, chunks, steps, state);
-      } else if (bubble.type === 2) { // AI
-        this.parseCursorAIBubble(bubble, bubbleCreatedAt, state.stepIndexCounter, state.currentAssistantTexts, steps);
-        state.stepIndexCounter += 1;
-        if (bubble.toolFormerData) {
-          state.stepIndexCounter += 1;
-        }
-      }
-    }
-
-    if (state.currentUserText || state.currentAssistantTexts.length > 0) {
-      chunks.push({
-        stepIndex: state.stepIndexCounter,
-        text: `User: ${state.currentUserText}\nAssistant: ${state.currentAssistantTexts.join("\n")}`,
-      });
-    }
-  }
-
-  private static parseCursorAIBubble(
-    bubble: any,
-    bubbleCreatedAt: number,
-    stepIndex: number,
-    currentAssistantTexts: string[],
-    steps: StepData[]
-  ): void {
-    const stepContent = bubble.text || undefined;
-    let stepThinking: string | undefined = undefined;
-    if (bubble.thinking) {
-      if (typeof bubble.thinking === "string") {
-        stepThinking = bubble.thinking;
-      } else {
-        stepThinking = bubble.thinking.text || undefined;
-      }
-    }
-
-    let stepToolCalls: string | undefined = undefined;
-    if (bubble.toolFormerData) {
-      const toolName = bubble.toolFormerData.name;
-      let args = {};
-      try {
-        args = bubble.toolFormerData.params ? JSON.parse(bubble.toolFormerData.params) : {};
-      } catch {}
-      stepToolCalls = JSON.stringify([{
-        name: toolName,
-        args: args,
-      }]);
-    }
-
-    if (stepContent) {
-      currentAssistantTexts.push(stepContent);
-    }
-
-    steps.push({
-      stepIndex,
-      type: "PLANNER_RESPONSE",
-      source: "MODEL",
-      status: "DONE",
-      content: stepContent,
-      thinking: stepThinking,
-      toolCalls: stepToolCalls,
-      createdAt: bubbleCreatedAt,
-    });
-
-    // Separate tool result step
-    if (bubble.toolFormerData) {
-      const toolName = bubble.toolFormerData.name;
-      const isCommand = toolName === "execute_command" || toolName === "run_command";
-      const type = isCommand ? "COMMAND" : "MCP_TOOL";
-      const status = bubble.toolFormerData.status === "completed" ? "DONE" : "ERROR";
-      const content = bubble.toolFormerData.result || bubble.toolFormerData.error || "";
-
-      steps.push({
-        stepIndex: stepIndex + 1,
-        type,
-        source: "SYSTEM",
-        status,
-        content,
-        createdAt: bubbleCreatedAt,
-      });
-    }
   }
 
   static parseCursorComposer(composerId: string, composerState: any): SessionData | null {
@@ -549,49 +737,166 @@ export class SessionParser {
     }
 
     const conversation = composerState.conversation;
+    const turns: TurnData[] = [];
+    const allSteps: StepData[] = [];
     const chunks: ChunkData[] = [];
-    const steps: StepData[] = [];
-    const promptState = { firstPrompt: "", secondPrompt: "" };
+    const filesTouchedSet = new Set<string>();
 
-    // Check if the conversation uses the new bubble-based format
-    const isNewFormat = conversation.some((msg: any) => msg && (msg.type === 1 || msg.type === 2));
+    let turnCounter = 0;
+    let stepIndexCounter = 0;
+    const defaultCreatedAt = composerState.createdAt || Date.now();
 
-    if (isNewFormat) {
-      this.parseCursorNewFormat(conversation, composerState, promptState, chunks, steps);
-    } else {
-      // Legacy parsing
-      for (let i = 0; i < conversation.length; i++) {
-        const msg = conversation[i];
-        if (!msg) continue;
-        const sender = msg.type || msg.sender || "";
-        if (sender === "user") {
-          this.parseComposerTurn(msg, i, conversation, composerState, chunks, steps, promptState);
+    for (let i = 0; i < conversation.length; i++) {
+      const msg = conversation[i];
+      if (!msg) continue;
+
+      const isUser = msg.type === 1 || msg.type === "user" || msg.sender === "user";
+
+      if (isUser) {
+        turnCounter += 1;
+        const userText = cleanUserRequest(msg.text || "");
+        const createdAt = msg.createdAt ? new Date(msg.createdAt).getTime() : defaultCreatedAt;
+
+        const turnSteps: StepData[] = [];
+        turnSteps.push({
+          stepIndex: stepIndexCounter++,
+          turnIndex: turnCounter,
+          stepOrder: 1,
+          category: "user",
+          status: "DONE",
+          content: userText,
+          createdAt,
+          isUndone: false,
+        });
+
+        // Look ahead for AI response
+        let assistantText = "";
+        let assistantThinking: string | undefined = undefined;
+        let stepOrderCounter = 2;
+
+        if (i + 1 < conversation.length) {
+          const nextMsg = conversation[i + 1];
+          const nextIsAI = nextMsg && (nextMsg.type === 2 || nextMsg.type === "ai" || nextMsg.sender === "ai" || nextMsg.sender === "assistant");
+          if (nextIsAI) {
+            assistantText = nextMsg.text || "";
+            if (nextMsg.thinking) {
+              assistantThinking = typeof nextMsg.thinking === "string" ? nextMsg.thinking : nextMsg.thinking.text;
+            }
+
+            if (assistantText.trim() || assistantThinking?.trim()) {
+              turnSteps.push({
+                stepIndex: stepIndexCounter++,
+                turnIndex: turnCounter,
+                stepOrder: stepOrderCounter++,
+                category: "agent",
+                status: "DONE",
+                content: assistantText || undefined,
+                thinking: assistantThinking || undefined,
+                createdAt: nextMsg.createdAt ? new Date(nextMsg.createdAt).getTime() : createdAt,
+                isUndone: false,
+              });
+            }
+
+            // Parse tool former data if present
+            if (nextMsg.toolFormerData) {
+              const toolName = nextMsg.toolFormerData.name || "tool";
+              const isCommand = toolName === "execute_command" || toolName === "run_command";
+              const kind = isCommand ? "command" : "mcp";
+              const status = nextMsg.toolFormerData.status === "completed" ? "DONE" : "ERROR";
+              const toolResult = nextMsg.toolFormerData.result || nextMsg.toolFormerData.error || undefined;
+              let toolArgs: string | undefined = undefined;
+              try {
+                toolArgs = nextMsg.toolFormerData.params ? JSON.stringify(JSON.parse(nextMsg.toolFormerData.params)) : undefined;
+              } catch {
+                toolArgs = nextMsg.toolFormerData.params;
+              }
+
+              turnSteps.push({
+                stepIndex: stepIndexCounter++,
+                turnIndex: turnCounter,
+                stepOrder: stepOrderCounter++,
+                category: "execution",
+                kind,
+                status,
+                toolName,
+                toolArgs,
+                toolResult,
+                createdAt: nextMsg.createdAt ? new Date(nextMsg.createdAt).getTime() : createdAt,
+                isUndone: false,
+              });
+            }
+
+            i++; // skip processed AI message
+          }
         }
+
+        const turnText = [userText, assistantText].filter(Boolean).join(" ").trim();
+        const inputTokens = countTokens(userText);
+        const outputTokens = countTokens(assistantText);
+        const thinkingTokens = countTokens(assistantThinking);
+
+        const executionSteps = turnSteps.filter(s => s.category === "execution");
+        const toolCount = executionSteps.length;
+        const errorCount = executionSteps.filter(s => s.status === "ERROR").length;
+
+        turns.push({
+          turnIndex: turnCounter,
+          userPrompt: userText,
+          assistantResponse: assistantText,
+          turnSummary: userText.length > 120 ? userText.slice(0, 117) + "..." : userText,
+          turnText,
+          inputTokens,
+          outputTokens,
+          thinkingTokens,
+          toolCount,
+          errorCount,
+          durationMs: 0,
+          isUndone: false,
+          createdAt,
+          steps: turnSteps,
+        });
+
+        allSteps.push(...turnSteps);
+        chunks.push({
+          stepIndex: turnSteps[0].stepIndex,
+          text: `User: ${userText}\nAssistant: ${assistantText}`,
+        });
       }
     }
 
-    const title = this.getComposerTitle(composerId, composerState, promptState.firstPrompt);
+    const firstPrompt = turns[0]?.userPrompt || "";
+    const secondPrompt = turns[1]?.userPrompt || "";
+    const title = this.getComposerTitle(composerId, composerState, firstPrompt);
 
     let projectPath = composerState.workspacePath || null;
     if (projectPath && typeof projectPath === "string") {
       projectPath = projectPath.replaceAll("\\", "/");
     }
 
-    const createdAt = composerState.createdAt || Date.now();
-    const stepTimestamps = steps.map(s => s.createdAt).filter((t): t is number => t !== undefined);
-    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : createdAt;
+    const totalTurns = turns.length;
+    const totalSteps = allSteps.length;
+    const totalTokens = turns.reduce((sum, t) => sum + (t.inputTokens || 0) + (t.outputTokens || 0) + (t.thinkingTokens || 0), 0);
+
+    const stepTimestamps = allSteps.map(s => s.createdAt).filter((t): t is number => typeof t === "number" && !Number.isNaN(t));
+    const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : defaultCreatedAt;
 
     return {
       id: composerId,
       adapter: "cursor",
       title,
       projectPath,
-      createdAt,
+      createdAt: defaultCreatedAt,
       lastActiveAt,
-      firstPrompt: promptState.firstPrompt,
-      secondPrompt: promptState.secondPrompt,
+      totalTurns,
+      totalSteps,
+      totalTokens,
+      firstPrompt,
+      secondPrompt,
+      artifacts: [],
+      filesTouched: Array.from(filesTouchedSet),
+      turns,
+      steps: allSteps,
       chunks,
-      steps,
     };
   }
 }
