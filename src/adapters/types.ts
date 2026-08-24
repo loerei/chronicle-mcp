@@ -1,3 +1,5 @@
+import type { ProgressReporter } from "../progress.js";
+
 export interface SessionData {
   id: string;
   adapter: string;
@@ -16,6 +18,8 @@ export interface SessionData {
   filesTouched?: string[];
   firstPrompt: string;
   metadata?: Record<string, any>;
+  logMtime?: number;
+  logSize?: number;
   turns?: TurnData[];
 
   /** Transitional property for legacy module compatibility during S1 */
@@ -194,9 +198,15 @@ export interface SessionRelationshipResult {
   siblings: SessionRelationshipNode[];
 }
 
+export interface DiscoverSessionsOptions {
+  reporter?: ProgressReporter;
+  cachedStats?: Map<string, { logMtime: number; logSize: number }>;
+  force?: boolean;
+}
+
 export interface HistoryAdapter {
   name: string;
-  discoverSessions(reporter?: any): Promise<SessionData[]>;
+  discoverSessions(options?: DiscoverSessionsOptions | ProgressReporter): Promise<SessionData[]>;
 }
 
 export interface SessionBenchmarkMetrics {

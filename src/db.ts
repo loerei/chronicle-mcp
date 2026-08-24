@@ -191,6 +191,7 @@ export interface HistoryStore {
     artifactName?: string
   ): string[];
   getToolUsageStats(options?: ToolUsageStatsOptions): ToolUsageReport;
+  getSessionLogStats(): Map<string, { logMtime: number; logSize: number }>;
   searchTurnsVector(
     queryVector: VectorInput,
     limit: number,
@@ -636,7 +637,9 @@ export function initDatabaseSchema(db: DatabaseSync): void {
       artifacts TEXT,
       files_touched TEXT,
       first_prompt TEXT,
-      metadata TEXT
+      metadata TEXT,
+      log_mtime INTEGER,
+      log_size INTEGER
     );
   `);
 
@@ -653,14 +656,22 @@ export function initDatabaseSchema(db: DatabaseSync): void {
       artifacts: "TEXT",
       files_touched: "TEXT",
       metadata: "TEXT",
+      log_mtime: "INTEGER",
+      log_size: "INTEGER",
     };
 
     for (const [colName, colDef] of Object.entries(requiredColumns)) {
       if (!columnNames.has(colName)) {
-        db.exec(`ALTER TABLE sessions ADD COLUMN ${colName} ${colDef};`);
+        try {
+          db.exec(`ALTER TABLE sessions ADD COLUMN ${colName} ${colDef};`);
+        } catch (e: any) {
+          console.error(`[Chronicle MCP] Failed to add column "${colName}" during database auto-migration:`, e?.message || e);
+        }
       }
     }
-  } catch {}
+  } catch (e: any) {
+    console.error("[Chronicle MCP] Database schema verification failed:", e?.message || e);
+  }
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);
@@ -776,13 +787,84 @@ export class InMemoryHistoryStore implements HistoryStore {
     turns?: TurnData[],
     steps?: StepData[]
   ): void {
+    const safeSteps = steps || session.steps || [];
+    const existing = this.sessionsMap.get(session.id);
+
+    let effectiveParentId = session.parentId || existing?.parentId || null;
+    if (effectiveParentId === session.id) {
+      effectiveParentId = null;
+    }
+
+    const parent = effectiveParentId ? this.sessionsMap.get(effectiveParentId) : undefined;
+    let resolvedDepth = session.depth && session.depth > 0 ? session.depth : 0;
+    if (!resolvedDepth) {
+      resolvedDepth = parent ? (parent.depth ?? 0) + 1 : (existing?.depth ?? 0);
+    }
+    const resolvedRootId = session.rootId || parent?.rootId || parent?.id || effectiveParentId || existing?.rootId || null;
+
+    let title = session.title ?? existing?.title ?? "Untitled Session";
+    if (existing?.title) {
+      const isGeneric = (t: string) => t.startsWith("Session ") || t.startsWith("Untitled") || t.startsWith("Unknown") || t === "";
+      if (isGeneric(title) && !isGeneric(existing.title)) {
+        title = existing.title;
+      }
+    }
+
+    const effectiveArtifacts = session.artifacts && session.artifacts.length > 0 ? session.artifacts : (existing?.artifacts || []);
+    const effectiveFilesTouched = session.filesTouched && session.filesTouched.length > 0 ? session.filesTouched : (existing?.filesTouched || []);
+    const effectiveMetadata = session.metadata && Object.keys(session.metadata).length > 0 ? session.metadata : (existing?.metadata || {});
+    const effectiveFirstPrompt = session.firstPrompt && session.firstPrompt !== "" ? session.firstPrompt : (existing?.firstPrompt || "");
+    const effectiveRole = session.role ?? existing?.role ?? undefined;
+    const effectiveProjectPath = session.projectPath ?? existing?.projectPath ?? null;
+    const effectiveLogMtime = session.logMtime ?? existing?.logMtime ?? undefined;
+    const effectiveLogSize = session.logSize ?? existing?.logSize ?? undefined;
+
+    const stepTimestamps = safeSteps
+      .map((s) => s.createdAt)
+      .filter((t): t is number => t !== undefined);
+    const lastActiveAt =
+      stepTimestamps.length > 0
+        ? Math.max(...stepTimestamps)
+        : session.lastActiveAt ?? session.createdAt ?? Date.now();
+
+    const totalTurns = turns ? turns.length : (session.totalTurns ?? existing?.totalTurns ?? 0);
+    const totalSteps = steps ? steps.length : (session.totalSteps ?? existing?.totalSteps ?? safeSteps.length);
+
+    let effectiveTurns: TurnData[] = [];
+    if (turns) {
+      effectiveTurns = turns.map((t) => ({ ...t }));
+    } else if (existing?.turns) {
+      effectiveTurns = [...existing.turns];
+    }
+
+    let effectiveSteps: StepData[] = [];
+    if (steps) {
+      effectiveSteps = steps.map((s) => ({ ...s }));
+    } else if (existing?.steps) {
+      effectiveSteps = [...existing.steps];
+    }
+
     const sessionCopy: SessionData = {
       ...session,
-      artifacts: session.artifacts ? [...session.artifacts] : [],
-      filesTouched: session.filesTouched ? [...session.filesTouched] : [],
-      metadata: session.metadata ? { ...session.metadata } : {},
-      turns: turns ? turns.map((t) => ({ ...t })) : [],
-      steps: steps ? steps.map((s) => ({ ...s })) : [],
+      title,
+      role: effectiveRole,
+      projectPath: effectiveProjectPath,
+      parentId: effectiveParentId,
+      rootId: resolvedRootId,
+      depth: resolvedDepth,
+      createdAt: session.createdAt ?? existing?.createdAt ?? Date.now(),
+      lastActiveAt,
+      totalTurns,
+      totalSteps,
+      totalTokens: session.totalTokens ?? existing?.totalTokens ?? 0,
+      artifacts: [...effectiveArtifacts],
+      filesTouched: [...effectiveFilesTouched],
+      firstPrompt: effectiveFirstPrompt,
+      metadata: { ...effectiveMetadata },
+      logMtime: effectiveLogMtime,
+      logSize: effectiveLogSize,
+      turns: effectiveTurns,
+      steps: effectiveSteps,
     };
     this.sessionsMap.set(session.id, sessionCopy);
 
@@ -817,14 +899,57 @@ export class InMemoryHistoryStore implements HistoryStore {
       );
     }
 
-    if (session.subagentIds && session.subagentIds.length > 0) {
-      for (const childId of session.subagentIds) {
-        const child = this.sessionsMap.get(childId);
-        if (child) {
-          child.parentId = session.id;
+    const referencedChildIds = new Set<string>([
+      ...(Array.isArray(session.subagentIds) ? session.subagentIds : []),
+      ...safeSteps.filter((st: any) => st?.subagentSessionId).map((st: any) => st.subagentSessionId as string),
+    ]);
+    for (const childId of referencedChildIds) {
+      if (childId && childId !== session.id) {
+        let child = this.sessionsMap.get(childId);
+        if (!child) {
+          child = {
+            id: childId,
+            adapter: session.adapter || "unknown",
+            title: "Unknown Subagent",
+            createdAt: session.createdAt || Date.now(),
+            lastActiveAt: session.lastActiveAt || Date.now(),
+            firstPrompt: "",
+            parentId: session.id,
+            rootId: resolvedRootId || session.id,
+            depth: resolvedDepth + 1,
+          };
+          this.sessionsMap.set(childId, child);
+        } else {
+          child.parentId = child.parentId || session.id;
+          child.rootId = child.rootId || resolvedRootId || session.id;
+          if ((child.depth ?? 0) === 0 && resolvedDepth + 1 > 0) {
+            child.depth = resolvedDepth + 1;
+          }
         }
       }
     }
+
+    const updateDescendants = (parentId: string, newRoot: string, curDepth: number) => {
+      if (curDepth >= 20) return;
+      for (const s of this.sessionsMap.values()) {
+        if (s.parentId === parentId && s.id !== parentId) {
+          s.rootId = newRoot;
+          s.depth = curDepth + 1;
+          updateDescendants(s.id, newRoot, curDepth + 1);
+        }
+      }
+    };
+    updateDescendants(session.id, resolvedRootId || session.id, resolvedDepth);
+  }
+
+  getSessionLogStats(): Map<string, { logMtime: number; logSize: number }> {
+    const result = new Map<string, { logMtime: number; logSize: number }>();
+    for (const [id, s] of this.sessionsMap.entries()) {
+      if (s.logMtime !== undefined && s.logSize !== undefined) {
+        result.set(id, { logMtime: s.logMtime, logSize: s.logSize });
+      }
+    }
+    return result;
   }
 
   getSession(id: string): SessionData | null {
@@ -1522,43 +1647,41 @@ export class SqliteHistoryStore implements HistoryStore {
     const db = this.db;
     db.exec("BEGIN TRANSACTION;");
     try {
-      let parentId = session.parentId || null;
-      if (parentId) {
-        const parentExists = db
-          .prepare("SELECT 1 FROM sessions WHERE id = ?")
-          .get(parentId);
-        if (!parentExists) {
-          parentId = null;
-        }
+      const safeSteps = steps || session.steps || [];
+      const artifactsJson = session.artifacts && session.artifacts.length > 0 ? JSON.stringify(session.artifacts) : null;
+      const filesTouchedJson = session.filesTouched && session.filesTouched.length > 0 ? JSON.stringify(session.filesTouched) : null;
+      const metadataJson = session.metadata && Object.keys(session.metadata).length > 0 ? JSON.stringify(session.metadata) : null;
+
+      const existing = db.prepare("SELECT parent_id, root_id, depth, title FROM sessions WHERE id = ?").get(session.id) as any;
+      let effectiveParentId = session.parentId || existing?.parent_id || null;
+      if (effectiveParentId === session.id) {
+        effectiveParentId = null;
       }
 
-      if (!parentId) {
-        const existing = db
-          .prepare("SELECT parent_id FROM sessions WHERE id = ?")
-          .get(session.id) as { parent_id: string | null } | undefined;
-        if (existing) {
-          parentId = existing.parent_id;
-        }
+      let parentRow: any = undefined;
+      if (effectiveParentId) {
+        parentRow = db.prepare("SELECT id, root_id, depth FROM sessions WHERE id = ?").get(effectiveParentId) as any;
       }
 
-      let rootId = session.rootId || null;
-      if (rootId) {
-        const rootExists = db
-          .prepare("SELECT 1 FROM sessions WHERE id = ?")
-          .get(rootId);
-        if (!rootExists) {
-          rootId = null;
-        }
+      let resolvedDepth = session.depth && session.depth > 0 ? session.depth : 0;
+      if (!resolvedDepth) {
+        resolvedDepth = parentRow ? (parentRow.depth ?? 0) + 1 : (existing?.depth ?? 0);
+      }
+      const resolvedRootId = session.rootId || parentRow?.root_id || parentRow?.id || effectiveParentId || existing?.root_id || null;
+
+      // 1. Pre-insert stub records for parent and root before primary upsert
+      const insertStub = db.prepare(`
+        INSERT OR IGNORE INTO sessions (id, adapter, title, created_at, last_active_at, first_prompt)
+        VALUES (?, ?, 'Unknown Session', ?, ?, '')
+      `);
+      if (effectiveParentId) {
+        insertStub.run(effectiveParentId, session.adapter || "unknown", session.createdAt || Date.now(), session.lastActiveAt || Date.now());
+      }
+      if (resolvedRootId && resolvedRootId !== effectiveParentId && resolvedRootId !== session.id) {
+        insertStub.run(resolvedRootId, session.adapter || "unknown", session.createdAt || Date.now(), session.lastActiveAt || Date.now());
       }
 
-      if (!rootId && parentId) {
-        const parentRow = db
-          .prepare("SELECT root_id FROM sessions WHERE id = ?")
-          .get(parentId) as { root_id: string | null } | undefined;
-        rootId = parentRow?.root_id || parentId;
-      }
-
-      const stepTimestamps = (steps || session.steps || [])
+      const stepTimestamps = safeSteps
         .map((s) => s.createdAt)
         .filter((t): t is number => t !== undefined);
       const lastActiveAt =
@@ -1566,25 +1689,25 @@ export class SqliteHistoryStore implements HistoryStore {
           ? Math.max(...stepTimestamps)
           : session.lastActiveAt ?? session.createdAt ?? Date.now();
 
-      const artifactsJson = session.artifacts ? JSON.stringify(session.artifacts) : null;
-      const filesTouchedJson = session.filesTouched
-        ? JSON.stringify(session.filesTouched)
-        : null;
-      const metadataJson = session.metadata ? JSON.stringify(session.metadata) : null;
-
       const totalTurns = turns ? turns.length : session.totalTurns ?? 0;
-      const totalSteps = steps ? steps.length : session.totalSteps ?? 0;
+      const totalSteps = steps ? steps.length : session.totalSteps ?? safeSteps.length;
 
+      // 2. Primary session upsert
       db.prepare(`
         INSERT INTO sessions (
           id, adapter, title, role, project_path, created_at, last_active_at,
           parent_id, root_id, depth, total_turns, total_steps, total_tokens,
-          artifacts, files_touched, first_prompt, metadata
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          artifacts, files_touched, first_prompt, metadata, log_mtime, log_size
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           adapter = excluded.adapter,
-          title = excluded.title,
+          title = CASE
+            WHEN excluded.title NOT LIKE 'Session %' AND excluded.title NOT LIKE 'Untitled%' AND excluded.title NOT LIKE 'Unknown%' AND excluded.title != ''
+            THEN excluded.title
+            WHEN title NOT LIKE 'Session %' AND title NOT LIKE 'Untitled%' AND title NOT LIKE 'Unknown%' AND title != ''
+            THEN title
+            ELSE excluded.title
+          END,
           role = COALESCE(excluded.role, role),
           project_path = COALESCE(excluded.project_path, project_path),
           created_at = excluded.created_at,
@@ -1595,10 +1718,28 @@ export class SqliteHistoryStore implements HistoryStore {
           total_turns = excluded.total_turns,
           total_steps = excluded.total_steps,
           total_tokens = excluded.total_tokens,
-          artifacts = COALESCE(excluded.artifacts, artifacts),
-          files_touched = COALESCE(excluded.files_touched, files_touched),
-          first_prompt = excluded.first_prompt,
-          metadata = COALESCE(excluded.metadata, metadata)
+          artifacts = CASE
+            WHEN excluded.artifacts IS NOT NULL AND excluded.artifacts != '[]'
+            THEN excluded.artifacts
+            ELSE artifacts
+          END,
+          files_touched = CASE
+            WHEN excluded.files_touched IS NOT NULL AND excluded.files_touched != '[]'
+            THEN excluded.files_touched
+            ELSE files_touched
+          END,
+          first_prompt = CASE
+            WHEN excluded.first_prompt IS NOT NULL AND excluded.first_prompt != ''
+            THEN excluded.first_prompt
+            ELSE first_prompt
+          END,
+          metadata = CASE
+            WHEN excluded.metadata IS NOT NULL AND excluded.metadata != '{}'
+            THEN excluded.metadata
+            ELSE metadata
+          END,
+          log_mtime = COALESCE(excluded.log_mtime, log_mtime),
+          log_size = COALESCE(excluded.log_size, log_size);
       `).run(
         session.id,
         session.adapter ?? "unknown",
@@ -1607,18 +1748,63 @@ export class SqliteHistoryStore implements HistoryStore {
         session.projectPath ?? null,
         session.createdAt ?? Date.now(),
         lastActiveAt,
-        parentId,
-        rootId,
-        session.depth ?? 0,
+        effectiveParentId,
+        resolvedRootId,
+        resolvedDepth,
         totalTurns,
         totalSteps,
         session.totalTokens ?? 0,
         artifactsJson,
         filesTouchedJson,
         session.firstPrompt ?? "",
-        metadataJson
+        metadataJson,
+        session.logMtime ?? null,
+        session.logSize ?? null
       );
 
+      // 3. Pre-insert child stubs AND resolve backward linkage strictly before transcript_steps
+      const childStubStmt = db.prepare(`
+        INSERT OR IGNORE INTO sessions (id, adapter, title, created_at, last_active_at, first_prompt, parent_id, root_id, depth)
+        VALUES (?, ?, 'Unknown Subagent', ?, ?, '', ?, ?, ?)
+      `);
+      const updateChildLinkStmt = db.prepare(`
+        UPDATE sessions
+        SET parent_id = COALESCE(parent_id, ?),
+            root_id = COALESCE(root_id, ?),
+            depth = CASE WHEN depth = 0 AND ? > 0 THEN ? ELSE depth END
+        WHERE id = ?
+      `);
+      const referencedChildIds = new Set<string>([
+        ...(Array.isArray(session.subagentIds) ? session.subagentIds : []),
+        ...safeSteps.filter((st: any) => st?.subagentSessionId).map((st: any) => st.subagentSessionId as string),
+      ]);
+      for (const childId of referencedChildIds) {
+        if (childId && childId !== session.id) {
+          childStubStmt.run(childId, session.adapter || "unknown", session.createdAt || Date.now(), session.lastActiveAt || Date.now(), session.id, resolvedRootId || session.id, resolvedDepth + 1);
+          updateChildLinkStmt.run(session.id, resolvedRootId || session.id, resolvedDepth + 1, resolvedDepth + 1, childId);
+        }
+      }
+
+      // 4. Depth-bounded recursive multi-level hierarchy descendant cascade
+      const cascadeDescendantsStmt = db.prepare(`
+        WITH RECURSIVE descendants(id, new_root, new_depth) AS (
+          SELECT id, ?, ? + 1
+          FROM sessions
+          WHERE parent_id = ?
+          UNION ALL
+          SELECT s.id, d.new_root, d.new_depth + 1
+          FROM sessions s
+          JOIN descendants d ON s.parent_id = d.id
+          WHERE d.new_depth < 20
+        )
+        UPDATE sessions
+        SET root_id = (SELECT new_root FROM descendants WHERE descendants.id = sessions.id),
+            depth = (SELECT new_depth FROM descendants WHERE descendants.id = sessions.id)
+        WHERE id IN (SELECT id FROM descendants);
+      `);
+      cascadeDescendantsStmt.run(resolvedRootId || session.id, resolvedDepth, session.id);
+
+      // 5. Insert transcript_turns
       if (turns && turns.length > 0) {
         db.prepare("DELETE FROM transcript_turns WHERE session_id = ?").run(session.id);
 
@@ -1654,6 +1840,7 @@ export class SqliteHistoryStore implements HistoryStore {
         }
       }
 
+      // 6. Insert transcript_steps
       if (steps && steps.length > 0) {
         db.prepare("DELETE FROM transcript_steps WHERE session_id = ?").run(session.id);
 
@@ -1693,18 +1880,22 @@ export class SqliteHistoryStore implements HistoryStore {
         }
       }
 
-      if (session.subagentIds && session.subagentIds.length > 0) {
-        const updateChild = db.prepare("UPDATE sessions SET parent_id = ? WHERE id = ?");
-        for (const childId of session.subagentIds) {
-          updateChild.run(session.id, childId);
-        }
-      }
-
       db.exec("COMMIT;");
     } catch (err) {
       db.exec("ROLLBACK;");
       throw err;
     }
+  }
+
+  getSessionLogStats(): Map<string, { logMtime: number; logSize: number }> {
+    const rows = this.db.prepare(
+      "SELECT id, log_mtime, log_size FROM sessions WHERE log_mtime IS NOT NULL AND log_size IS NOT NULL"
+    ).all() as Array<{ id: string; log_mtime: number; log_size: number }>;
+    const map = new Map<string, { logMtime: number; logSize: number }>();
+    for (const row of rows) {
+      map.set(row.id, { logMtime: row.log_mtime, logSize: row.log_size });
+    }
+    return map;
   }
 
   getSession(id: string): SessionData | null {
@@ -1729,6 +1920,8 @@ export class SqliteHistoryStore implements HistoryStore {
       filesTouched: row.files_touched ? JSON.parse(row.files_touched) : [],
       firstPrompt: row.first_prompt,
       metadata: row.metadata ? JSON.parse(row.metadata) : {},
+      logMtime: row.log_mtime ?? undefined,
+      logSize: row.log_size ?? undefined,
       turns: this.getTurns(id, { includeUndone: true }),
       steps: this.getSteps(id, { includeUndone: true }),
     };
@@ -1840,6 +2033,8 @@ export class SqliteHistoryStore implements HistoryStore {
       filesTouched: r.files_touched ? JSON.parse(r.files_touched) : [],
       firstPrompt: r.first_prompt,
       metadata: r.metadata ? JSON.parse(r.metadata) : {},
+      logMtime: r.log_mtime ?? undefined,
+      logSize: r.log_size ?? undefined,
     }));
   }
 

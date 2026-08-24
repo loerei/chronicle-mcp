@@ -43,16 +43,46 @@ export function isLegacyToolsEnabled(): boolean {
   );
 }
 
-async function syncSingleSession(s: any, store: any): Promise<boolean> {
-  if (s.turns && s.turns.length > 0) {
-    // 2-Layer session ingestion
+export async function syncSingleSession(s: any, store: any): Promise<boolean> {
+  const turns = s.turns || [];
+  const steps = s.steps || [];
+
+  async function ensureVectorized(turnList: TurnData[]): Promise<void> {
+    const unvectorized = turnList.filter((t) => !t.turnVector || t.turnVector.length === 0);
+    if (unvectorized.length > 0) {
+      const turnTexts = unvectorized.map((t) => t.turnText || t.userPrompt || "");
+      try {
+        const vectors = await getEmbeddingClient().embed(turnTexts);
+        unvectorized.forEach((t, idx) => {
+          t.turnVector = Float32Array.from(vectors[idx]);
+        });
+      } catch (e: any) {
+        console.error(`[Chronicle MCP] Embedding error for session ${s.id}:`, e?.message || e);
+      }
+    }
+  }
+
+  // 1. Top-Level Stat Fast-Path
+  if (s.logMtime !== undefined) {
+    await ensureVectorized(turns);
+    try {
+      store.saveSession(s, turns, steps);
+      return true;
+    } catch (e: any) {
+      console.error(`[Chronicle MCP] Failed to persist session "${s.title}" (${s.id}) to store:`, e?.message || e);
+      return false;
+    }
+  }
+
+  // 2. Legacy / Non-Stat Fallback Path (e.g. CursorAdapter, synthetic test sessions)
+  if (turns.length > 0) {
     const existingSession = store.getSession(s.id);
     if (existingSession) {
       const existingTurns = store.getTurns(s.id, { includeUndone: true });
       const existingSteps = store.getSteps(s.id, { includeUndone: true });
 
-      const turnsCountChanged = (s.turns || []).length !== existingTurns.length;
-      const stepsCountChanged = (s.steps || []).length !== existingSteps.length;
+      const turnsCountChanged = turns.length !== existingTurns.length;
+      const stepsCountChanged = steps.length !== existingSteps.length;
       const promptChanged = existingSession.firstPrompt !== s.firstPrompt;
       const titleChanged = existingSession.title !== s.title;
 
@@ -61,23 +91,14 @@ async function syncSingleSession(s: any, store: any): Promise<boolean> {
       }
     }
 
-    console.error(`[Chronicle MCP] Indexing session: "${s.title}" (${s.id}) - ${(s.turns || []).length} turns, ${(s.steps || []).length} steps`);
-
-    const unvectorizedTurns = (s.turns as TurnData[]).filter((t) => !t.turnVector || t.turnVector.length === 0);
-    if (unvectorizedTurns.length > 0) {
-      const turnTexts = unvectorizedTurns.map((t) => t.turnText || t.userPrompt || "");
-      try {
-        const vectors = await getEmbeddingClient().embed(turnTexts);
-        unvectorizedTurns.forEach((t, idx) => {
-          t.turnVector = Float32Array.from(vectors[idx]);
-        });
-      } catch (e: any) {
-        console.error(`[Chronicle MCP] Embedding error for session ${s.id}:`, e?.message || String(e));
-      }
+    await ensureVectorized(turns);
+    try {
+      store.saveSession(s, turns, steps);
+      return true;
+    } catch (e: any) {
+      console.error(`[Chronicle MCP] Failed to persist legacy session "${s.title}" (${s.id}) to store:`, e?.message || e);
+      return false;
     }
-
-    store.saveSession(s, s.turns, s.steps);
-    return true;
   }
 
   // Fallback to legacy chunk-based session save
@@ -100,12 +121,22 @@ async function syncSingleSession(s: any, store: any): Promise<boolean> {
       return false;
     }
 
-    store.save(s);
-    return true;
+    try {
+      store.save(s);
+      return true;
+    } catch (e: any) {
+      console.error(`[Chronicle MCP] Failed to persist legacy chunk session "${s.title}" (${s.id}) to store:`, e?.message || e);
+      return false;
+    }
   }
 
-  store.save(s);
-  return true;
+  try {
+    store.save(s);
+    return true;
+  } catch (e: any) {
+    console.error(`[Chronicle MCP] Failed to persist session "${s.title}" (${s.id}) to store:`, e?.message || e);
+    return false;
+  }
 }
 
 // Incremental Indexing function
@@ -115,30 +146,47 @@ export async function syncHistory(force: boolean = false, reporter?: ProgressRep
   }
 
   activeSync = (async () => {
+    const startTime = Date.now();
     const store = getStore();
-    console.error("[Chronicle MCP] Syncing history from registered adapters...");
+    const isForceFull = force || process.env.CHRONICLE_FORCE_FULL_SYNC === "true" || process.env.CHRONICLE_DISABLE_STAT_CACHE === "true";
+    console.error(`[Chronicle MCP] Syncing history from registered adapters...${isForceFull ? " (force full sync)" : ""}`);
+
+    let cachedStats: Map<string, { logMtime: number; logSize: number }> | undefined;
+    if (!isForceFull) {
+      try {
+        cachedStats = store.getSessionLogStats();
+      } catch (e: any) {
+        console.error("[Chronicle MCP] Failed to retrieve cached session log stats:", e?.message || e);
+      }
+    }
+
+    let scannedCount = 0;
+    let indexedCount = 0;
 
     for (const adapter of ADAPTERS) {
       try {
-        const sessions = await adapter.discoverSessions(reporter);
+        const sessions = await adapter.discoverSessions({ reporter, cachedStats, force: isForceFull });
+        scannedCount += sessions.length;
         let newCount = 0;
 
         for (const s of sessions) {
           const didSync = await syncSingleSession(s, store);
           if (didSync) {
             newCount++;
+            indexedCount++;
           }
         }
 
         if (newCount > 0) {
-          console.error(`[Chronicle MCP] Indexed ${newCount} new sessions from adapter "${adapter.name}".`);
+          console.error(`[Chronicle MCP] Indexed ${newCount} new/updated sessions from adapter "${adapter.name}".`);
         }
       } catch (e: any) {
-        console.error(`[Chronicle MCP] Adapter "${adapter.name}" failed:`, e.message);
+        console.error(`[Chronicle MCP] Adapter "${adapter.name}" failed:`, e?.message || e);
       }
     }
     reporter?.finish("Sync completed!");
-    console.error("[Chronicle MCP] Sync completed!");
+    const durationMs = Date.now() - startTime;
+    console.error(`[Chronicle MCP] Sync completed in ${durationMs}ms (scanned: ${scannedCount}, indexed: ${indexedCount})`);
   })();
 
   try {

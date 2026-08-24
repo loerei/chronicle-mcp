@@ -784,10 +784,30 @@ function analyzeSteps(steps: StepData[]): StepAnalysis {
       toolCallsCount += countToolCalls(step.type === "PLANNER_RESPONSE" ? step.toolCalls : undefined);
     }
 
-    const contentStr = step.content || "";
+    let contextText = "";
+    if (step.category === "user") {
+      contextText = step.content || "";
+    } else if (step.category === "agent") {
+      contextText = (step.content || "") + "\n" + (step.thinking || "");
+    } else if (step.category === "execution") {
+      contextText = [
+        step.toolName || "",
+        step.serverName || "",
+        step.filePath || "",
+        step.toolArgs || "",
+        step.toolResult || "",
+        step.errorMessage || "",
+      ].filter(Boolean).join(" ");
+    } else if (step.category === "system") {
+      contextText = step.content || "";
+    } else {
+      // Legacy structure
+      const contentStr = step.content || "";
+      const toolCallsStr = step.toolCalls || "";
+      contextText = contentStr + toolCallsStr;
+    }
+
     const thinkingStr = step.thinking || "";
-    const toolCallsStr = step.toolCalls || "";
-    const contextText = contentStr + toolCallsStr;
     stepContextTokens.push(contextText ? encoder.encode(contextText).length : 0);
     stepThinkingTokens.push(thinkingStr ? encoder.encode(thinkingStr).length : 0);
   }
@@ -801,6 +821,7 @@ interface CachingMetrics {
   cacheMissTokens: number;
   estimatedOutputTokens: number;
   lastModelCallIndex: number;
+  peakContextSize: number;
 }
 
 function sumTokens(tokens: number[], start: number, end: number): number {
@@ -811,11 +832,26 @@ function sumTokens(tokens: number[], start: number, end: number): number {
   return sum;
 }
 
+function isPlannerModelCall(step: StepData, index: number, steps: StepData[]): boolean {
+  if (step.type === "PLANNER_RESPONSE" || step.source === "MODEL") return true;
+  if (step.category === "agent") return true;
+  if (step.category === "execution") {
+    // If previous step was an agent step (dialogue/thoughts) within the same model response,
+    // they share the same model call. Otherwise, sequential tool calls are distinct model invocations.
+    if (index > 0 && steps[index - 1].category === "agent") {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 function simulateCaching(steps: StepData[], stepContextTokens: number[], stepThinkingTokens: number[]): CachingMetrics {
   let cumulativeInputTokens = 0;
   let cacheHitTokens = 0;
   let cacheMissTokens = 0;
   let estimatedOutputTokens = 0;
+  let peakContextSize = 0;
   let lastModelCallIndex = -1;
   let activeStartIndex = 0;
 
@@ -826,19 +862,27 @@ function simulateCaching(steps: StepData[], stepContextTokens: number[], stepThi
       continue;
     }
 
-    if (step.type !== "PLANNER_RESPONSE") continue;
+    if (!isPlannerModelCall(step, i, steps)) continue;
+
+    // The context size presented to the model at step i is all accumulated preceding active steps
+    const currentContextTokens = Math.max(stepContextTokens[activeStartIndex] || 0, sumTokens(stepContextTokens, activeStartIndex, i));
+
+    cumulativeInputTokens += currentContextTokens;
+    if (currentContextTokens > peakContextSize) {
+      peakContextSize = currentContextTokens;
+    }
 
     let hit = 0;
     let miss = 0;
 
     if (lastModelCallIndex === -1 || lastModelCallIndex < activeStartIndex) {
-      miss = sumTokens(stepContextTokens, activeStartIndex, i);
+      miss = currentContextTokens;
     } else {
-      hit = sumTokens(stepContextTokens, activeStartIndex, lastModelCallIndex + 1);
-      miss = sumTokens(stepContextTokens, lastModelCallIndex + 1, i);
+      const prevContextTokens = Math.max(stepContextTokens[activeStartIndex] || 0, sumTokens(stepContextTokens, activeStartIndex, lastModelCallIndex + 1));
+      hit = Math.min(prevContextTokens, currentContextTokens);
+      miss = Math.max(0, currentContextTokens - prevContextTokens);
     }
 
-    cumulativeInputTokens += (hit + miss);
     cacheHitTokens += hit;
     cacheMissTokens += miss;
     estimatedOutputTokens += stepContextTokens[i] + stepThinkingTokens[i];
@@ -846,7 +890,7 @@ function simulateCaching(steps: StepData[], stepContextTokens: number[], stepThi
     lastModelCallIndex = i;
   }
 
-  return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex };
+  return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex, peakContextSize };
 }
 
 function computeSingleSessionMetrics(sessionId: string, session: any, steps: StepData[]): SessionBenchmarkMetrics {
@@ -875,28 +919,15 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
     cacheHitTokens = cache.cacheHitTokens;
     cacheMissTokens = cache.cacheMissTokens;
     estimatedOutputTokens = cache.estimatedOutputTokens;
+    peakContextSize = cache.peakContextSize;
     const lastModelCallIndex = cache.lastModelCallIndex;
 
     if (lastModelCallIndex === -1) {
       const total = stepContextTokens.reduce((a, b) => a + b, 0);
       cacheMissTokens = total;
       cumulativeInputTokens = total;
+      peakContextSize = total;
     }
-
-    let maxContextSize = 0;
-    let activeStartIndex = 0;
-    for (let i = 0; i < steps.length; i++) {
-      if (steps[i].type === "CHECKPOINT") {
-        activeStartIndex = i;
-      }
-      if (steps[i].type === "PLANNER_RESPONSE") {
-        const currentContextSize = sumTokens(stepContextTokens, activeStartIndex, i);
-        if (currentContextSize > maxContextSize) {
-          maxContextSize = currentContextSize;
-        }
-      }
-    }
-    peakContextSize = maxContextSize > 0 ? maxContextSize : stepContextTokens.reduce((a, b) => a + b, 0);
 
     if (cumulativeInputTokens > 0) {
       cacheHitRate = (cacheHitTokens / cumulativeInputTokens) * 100;
@@ -960,7 +991,6 @@ export async function computeSessionBenchmarks(
     const metrics = computeSingleSessionMetrics(sessionId, session, steps);
     if (turns.length > 0) {
       metrics.totalTurns = turns.length;
-      let cumInput = 0;
       let cumOutput = 0;
       let cumThinking = 0;
       let toolCnt = 0;
@@ -968,7 +998,6 @@ export async function computeSessionBenchmarks(
       let totalDur = 0;
 
       for (const turn of turns) {
-        cumInput += (turn.inputTokens ?? 0);
         cumOutput += (turn.outputTokens ?? 0);
         cumThinking += (turn.thinkingTokens ?? 0);
         toolCnt += (turn.toolCount ?? 0);
@@ -976,19 +1005,29 @@ export async function computeSessionBenchmarks(
         totalDur += (turn.durationMs ?? 0);
       }
 
-      if (cumInput > 0) {
-        metrics.cumulativeInputTokens = cumInput;
-        metrics.estimatedOutputTokens = cumOutput + cumThinking;
-        metrics.cacheHitTokens = Math.max(0, cumInput - (turns[0].inputTokens ?? 0));
-        metrics.cacheMissTokens = cumInput - metrics.cacheHitTokens;
-        metrics.cacheHitRate = (metrics.cacheHitTokens / cumInput) * 100;
-        metrics.estimatedCostSavings = (1 - (metrics.cacheMissTokens + 0.1 * metrics.cacheHitTokens) / cumInput) * 100;
+      if (metrics.cumulativeInputTokens === 0) {
+        let cumInput = 0;
+        for (const turn of turns) {
+          cumInput += (turn.inputTokens ?? 0);
+        }
+        if (cumInput > 0) {
+          metrics.cumulativeInputTokens = cumInput;
+          metrics.peakContextSize = cumInput;
+          metrics.cacheHitTokens = Math.max(0, cumInput - (turns[0].inputTokens ?? 0));
+          metrics.cacheMissTokens = cumInput - metrics.cacheHitTokens;
+          metrics.cacheHitRate = (metrics.cacheHitTokens / cumInput) * 100;
+          metrics.estimatedCostSavings = (1 - (metrics.cacheMissTokens + 0.1 * metrics.cacheHitTokens) / cumInput) * 100;
+        }
+      }
+
+      if (cumOutput + cumThinking > 0) {
+        metrics.estimatedOutputTokens = Math.max(metrics.estimatedOutputTokens, cumOutput + cumThinking);
       }
       if (toolCnt > 0) {
-        metrics.toolCallsCount = toolCnt;
+        metrics.toolCallsCount = Math.max(metrics.toolCallsCount, toolCnt);
       }
       if (errCnt > 0) {
-        metrics.errorStepsCount = errCnt;
+        metrics.errorStepsCount = Math.max(metrics.errorStepsCount, errCnt);
       }
       if (totalDur > 0 && !metrics.durationMs) {
         metrics.durationMs = totalDur;

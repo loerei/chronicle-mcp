@@ -331,6 +331,106 @@ describe("Benchmarking Logic", () => {
     assert.ok(m.cumulativeInputTokens > 0);
   });
 
+  it("should accurately calculate 2-layer category StepData benchmark metrics (cumulative input, peak context, cache hit rate)", async () => {
+    const store = new InMemoryHistoryStore();
+    setStore(store);
+
+    const sessionId = "2layer-bench-session";
+
+    const turns: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "Find artifacts from /write-a-request",
+        assistantResponse: "Found 5 artifacts in history.",
+        turnText: "Find artifacts from /write-a-request Found 5 artifacts in history.",
+        inputTokens: 10,
+        outputTokens: 30,
+        thinkingTokens: 50,
+        toolCount: 2,
+        errorCount: 0,
+        durationMs: 5000,
+      },
+    ];
+
+    const steps: StepData[] = [
+      {
+        stepIndex: 1,
+        turnIndex: 1,
+        stepOrder: 1,
+        category: "user",
+        status: "DONE",
+        content: "Find artifacts from /write-a-request",
+        createdAt: 1700000000000,
+      },
+      {
+        stepIndex: 2,
+        turnIndex: 1,
+        stepOrder: 2,
+        category: "execution",
+        toolName: "search_history",
+        serverName: "chronicle",
+        status: "DONE",
+        toolArgs: JSON.stringify({ query: "write-a-request" }),
+        toolResult: JSON.stringify([{ id: "art-1" }, { id: "art-2" }]),
+        createdAt: 1700000001000,
+      },
+      {
+        stepIndex: 3,
+        turnIndex: 1,
+        stepOrder: 3,
+        category: "execution",
+        toolName: "get_session_artifacts",
+        serverName: "chronicle",
+        status: "DONE",
+        toolArgs: JSON.stringify({ sessionId: "art-1" }),
+        toolResult: JSON.stringify([{ name: "request_1.md" }]),
+        createdAt: 1700000002000,
+      },
+      {
+        stepIndex: 4,
+        turnIndex: 1,
+        stepOrder: 4,
+        category: "agent",
+        status: "DONE",
+        content: "Found 5 artifacts in history.",
+        thinking: "Let me summarize the 5 artifacts clearly.",
+        createdAt: 1700000004000,
+      },
+    ];
+
+    const session: SessionData = {
+      id: sessionId,
+      adapter: "antigravity",
+      title: "2-Layer Benchmark Session",
+      projectPath: "/projects/chronicle",
+      createdAt: 1700000000000,
+      firstPrompt: "Find artifacts from /write-a-request",
+    };
+
+    store.saveSession(session, turns, steps);
+
+    const benchmarks = await computeSessionBenchmarks([sessionId]);
+    assert.strictEqual(benchmarks.length, 1);
+
+    const m = benchmarks[0];
+    assert.strictEqual(m.sessionId, sessionId);
+    assert.strictEqual(m.totalSteps, 4);
+    assert.strictEqual(m.totalTurns, 1);
+    assert.strictEqual(m.toolCallsCount, 2);
+    assert.strictEqual(m.errorStepsCount, 0);
+
+    // Verify accurate non-zero cumulative input tokens and peak context
+    assert.ok(m.cumulativeInputTokens > 10, "Cumulative input must be greater than user prompt tokens");
+    assert.ok(m.peakContextSize > 10, "Peak context must be greater than user prompt tokens");
+    assert.ok(m.peakContextSize <= m.cumulativeInputTokens, "Peak context must be <= cumulative input");
+    assert.ok(m.estimatedOutputTokens >= 80, "Output tokens must include dialogue + thinking");
+    assert.ok(m.cacheHitTokens >= 0);
+    assert.ok(m.cacheHitRate >= 0);
+    assert.ok(m.cacheHitRate <= 100);
+    assert.ok(m.estimatedCostSavings >= 0);
+    assert.ok(m.estimatedCostSavings <= 100);
+  });
+
   it("should validate sub-5ms performance for computeSessionBenchmarks and hybrid search", async () => {
     setStore(sqliteStore);
     const mockEmbedding = new MockEmbeddingClient();
