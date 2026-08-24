@@ -126,10 +126,10 @@ export interface QueryOptions {
   endConversationStep?: number;
   includeToolResults?: boolean;
   categories?: StepCategory[];
-  category?: StepData["category"];
-  kind?: StepData["kind"];
+  category?: "user" | "agent" | "execution" | "system";
+  kind?: "mcp" | "command" | "native" | "subagent" | null;
   filePath?: string;
-  status?: StepData["status"];
+  status?: string;
   sort?: StepSortMode;
 }
 
@@ -212,11 +212,11 @@ export interface HistoryStore {
   getActiveProjectPath(): string | undefined;
   close(): void;
 
-  /** @deprecated Transitional shim for S2 compatibility */
+  /** Transitional compatibility shim */
   save(session: SessionData, embeddings?: SessionEmbeddings): void;
-  /** @deprecated Transitional shim for S2 compatibility */
+  /** Transitional compatibility shim */
   query(options: QueryOptions): QueryResult;
-  /** @deprecated Transitional shim for S2 compatibility */
+  /** Transitional compatibility shim */
   search(
     queryVector: number[],
     limit: number,
@@ -258,6 +258,155 @@ function normalizeQueryVector(
   const padded = new Float32Array(EMBEDDING_DIMENSION);
   padded.set(floatVec);
   return padded;
+}
+
+function matchInMemoryTurnFilter(
+  session: SessionData,
+  turn: TurnData,
+  resolvedProjectPath: string | undefined,
+  filter: SearchHistoryFilter | undefined
+): boolean {
+  if (
+    resolvedProjectPath !== undefined &&
+    !session.projectPath?.toLowerCase().includes(resolvedProjectPath.toLowerCase())
+  ) {
+    return false;
+  }
+
+  if (
+    filter?.role !== undefined &&
+    !session.role?.toLowerCase().includes(filter.role.toLowerCase())
+  ) {
+    return false;
+  }
+
+  if (filter?.onlySubagents === true && !session.parentId) {
+    return false;
+  }
+
+  const errCount = turn.errorCount ?? 0;
+  if (
+    (filter?.hasErrors === true && errCount <= 0) ||
+    (filter?.hasErrors === false && errCount > 0)
+  ) {
+    return false;
+  }
+
+  if (filter?.timeRange !== undefined) {
+    const range = parseTimeRange(filter.timeRange);
+    if (range) {
+      const turnTime = turn.createdAt ?? session.createdAt;
+      if (range.start !== null && turnTime < range.start) return false;
+      if (range.end !== null && turnTime > range.end) return false;
+    }
+  }
+
+  return true;
+}
+
+function buildStepFilterClauses(options: GetStepsOptions, sql: string, params: any[]): string {
+  if (options.category !== undefined) {
+    sql += ` AND category = ?`;
+    params.push(options.category);
+  }
+  if (options.kind !== undefined) {
+    sql += ` AND kind = ?`;
+    params.push(options.kind);
+  }
+  if (options.status !== undefined) {
+    sql += ` AND status = ?`;
+    params.push(options.status);
+  }
+  if (options.filePath !== undefined) {
+    sql += ` AND REPLACE(LOWER(file_path), char(92), '/') LIKE ?`;
+    params.push(`%${options.filePath.replaceAll("\\", "/").toLowerCase()}%`);
+  }
+  if (options.toolName !== undefined) {
+    if (Array.isArray(options.toolName)) {
+      if (options.toolName.length === 0) {
+        sql += ` AND 1 = 0`;
+      } else {
+        const placeholders = options.toolName.map(() => "?").join(",");
+        sql += ` AND tool_name IN (${placeholders})`;
+        params.push(...options.toolName);
+      }
+    } else {
+      sql += ` AND tool_name = ?`;
+      params.push(options.toolName);
+    }
+  }
+  if (options.serverName !== undefined) {
+    sql += ` AND server_name = ?`;
+    params.push(options.serverName);
+  }
+  return sql;
+}
+
+function mapRowToStepData(r: any): StepData {
+  return {
+    stepIndex: r.step_index,
+    turnIndex: r.turn_index,
+    stepOrder: r.step_order,
+    category: r.category,
+    kind: r.kind ?? undefined,
+    status: r.status,
+    content: r.content ?? undefined,
+    thinking: r.thinking ?? undefined,
+    toolName: r.tool_name ?? undefined,
+    serverName: r.server_name ?? undefined,
+    filePath: r.file_path ?? undefined,
+    exitCode: r.exit_code ?? undefined,
+    errorMessage: r.error_message ?? undefined,
+    toolArgs: r.tool_args ?? undefined,
+    toolResult: r.tool_result ?? undefined,
+    toolDurationMs: r.tool_duration_ms ?? undefined,
+    subagentSessionId: r.subagent_session_id ?? undefined,
+    createdAt: r.created_at,
+    isUndone: r.is_undone === 1,
+  };
+}
+
+function applySqliteTurnFilters(
+  resolvedProjectPath: string | undefined,
+  filter: SearchHistoryFilter | undefined,
+  sql: string,
+  params: any[]
+): string {
+  if (resolvedProjectPath !== undefined) {
+    sql += " AND LOWER(s.project_path) LIKE ?";
+    params.push(`%${resolvedProjectPath.toLowerCase()}%`);
+  }
+
+  if (filter?.role !== undefined) {
+    sql += " AND LOWER(s.role) LIKE ?";
+    params.push(`%${filter.role.toLowerCase()}%`);
+  }
+
+  if (filter?.hasErrors === true) {
+    sql += " AND t.error_count > 0";
+  } else if (filter?.hasErrors === false) {
+    sql += " AND (t.error_count IS NULL OR t.error_count = 0)";
+  }
+
+  if (filter?.onlySubagents === true) {
+    sql += " AND s.parent_id IS NOT NULL";
+  }
+
+  if (filter?.timeRange !== undefined) {
+    const range = parseTimeRange(filter.timeRange);
+    if (range) {
+      if (range.start !== null) {
+        sql += " AND t.created_at >= ?";
+        params.push(range.start);
+      }
+      if (range.end !== null) {
+        sql += " AND t.created_at <= ?";
+        params.push(range.end);
+      }
+    }
+  }
+
+  return sql;
 }
 
 /**
@@ -1213,43 +1362,10 @@ export class InMemoryHistoryStore implements HistoryStore {
       const session = this.sessionsMap.get(sid);
       if (!session) continue;
 
-      if (
-        resolvedProjectPath !== undefined &&
-        !session.projectPath?.toLowerCase().includes(resolvedProjectPath.toLowerCase())
-      ) {
-        continue;
-      }
-
-      if (
-        options.filter?.role !== undefined &&
-        !session.role?.toLowerCase().includes(options.filter.role.toLowerCase())
-      ) {
-        continue;
-      }
-
-      if (options.filter?.onlySubagents === true && !session.parentId) {
-        continue;
-      }
-
       for (const turn of turns) {
-        if (turn.isUndone) continue;
-        if (!turn.turnVector) continue;
-
-        const errCount = turn.errorCount ?? 0;
-        if (
-          (options.filter?.hasErrors === true && errCount <= 0) ||
-          (options.filter?.hasErrors === false && errCount > 0)
-        ) {
+        if (turn.isUndone || !turn.turnVector) continue;
+        if (!matchInMemoryTurnFilter(session, turn, resolvedProjectPath, options.filter)) {
           continue;
-        }
-
-        if (options.filter?.timeRange !== undefined) {
-          const range = parseTimeRange(options.filter.timeRange);
-          if (range) {
-            const turnTime = turn.createdAt ?? session.createdAt;
-            if (range.start !== null && turnTime < range.start) continue;
-            if (range.end !== null && turnTime > range.end) continue;
-          }
         }
 
         const tVec =
@@ -1302,42 +1418,10 @@ export class InMemoryHistoryStore implements HistoryStore {
       const session = this.sessionsMap.get(sid);
       if (!session) continue;
 
-      if (
-        resolvedProjectPath !== undefined &&
-        !session.projectPath?.toLowerCase().includes(resolvedProjectPath.toLowerCase())
-      ) {
-        continue;
-      }
-
-      if (
-        options.filter?.role !== undefined &&
-        !session.role?.toLowerCase().includes(options.filter.role.toLowerCase())
-      ) {
-        continue;
-      }
-
-      if (options.filter?.onlySubagents === true && !session.parentId) {
-        continue;
-      }
-
       for (const turn of turns) {
         if (turn.isUndone) continue;
-
-        const errCount = turn.errorCount ?? 0;
-        if (
-          (options.filter?.hasErrors === true && errCount <= 0) ||
-          (options.filter?.hasErrors === false && errCount > 0)
-        ) {
+        if (!matchInMemoryTurnFilter(session, turn, resolvedProjectPath, options.filter)) {
           continue;
-        }
-
-        if (options.filter?.timeRange !== undefined) {
-          const range = parseTimeRange(options.filter.timeRange);
-          if (range) {
-            const turnTime = turn.createdAt ?? session.createdAt;
-            if (range.start !== null && turnTime < range.start) continue;
-            if (range.end !== null && turnTime > range.end) continue;
-          }
         }
 
         let isMatch = false;
@@ -1854,45 +1938,7 @@ export class SqliteHistoryStore implements HistoryStore {
       params.push(options.stepIndex);
     }
 
-    if (options.category !== undefined) {
-      sql += ` AND category = ?`;
-      params.push(options.category);
-    }
-
-    if (options.kind !== undefined) {
-      sql += ` AND kind = ?`;
-      params.push(options.kind);
-    }
-
-    if (options.status !== undefined) {
-      sql += ` AND status = ?`;
-      params.push(options.status);
-    }
-
-    if (options.filePath !== undefined) {
-      sql += ` AND REPLACE(LOWER(file_path), char(92), '/') LIKE ?`;
-      params.push(`%${options.filePath.replaceAll("\\", "/").toLowerCase()}%`);
-    }
-
-    if (options.toolName !== undefined) {
-      if (Array.isArray(options.toolName)) {
-        if (options.toolName.length === 0) {
-          sql += ` AND 1 = 0`;
-        } else {
-          const placeholders = options.toolName.map(() => "?").join(",");
-          sql += ` AND tool_name IN (${placeholders})`;
-          params.push(...options.toolName);
-        }
-      } else {
-        sql += ` AND tool_name = ?`;
-        params.push(options.toolName);
-      }
-    }
-
-    if (options.serverName !== undefined) {
-      sql += ` AND server_name = ?`;
-      params.push(options.serverName);
-    }
+    sql = buildStepFilterClauses(options, sql, params);
 
     sql += ` ORDER BY turn_index ASC, step_order ASC`;
 
@@ -1902,27 +1948,7 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     const rows = this.db.prepare(sql).all(...params) as any[];
-    return rows.map((r) => ({
-      stepIndex: r.step_index,
-      turnIndex: r.turn_index,
-      stepOrder: r.step_order,
-      category: r.category,
-      kind: r.kind ?? undefined,
-      status: r.status,
-      content: r.content ?? undefined,
-      thinking: r.thinking ?? undefined,
-      toolName: r.tool_name ?? undefined,
-      serverName: r.server_name ?? undefined,
-      filePath: r.file_path ?? undefined,
-      exitCode: r.exit_code ?? undefined,
-      errorMessage: r.error_message ?? undefined,
-      toolArgs: r.tool_args ?? undefined,
-      toolResult: r.tool_result ?? undefined,
-      toolDurationMs: r.tool_duration_ms ?? undefined,
-      subagentSessionId: r.subagent_session_id ?? undefined,
-      createdAt: r.created_at,
-      isUndone: r.is_undone === 1,
-    }));
+    return rows.map((r) => mapRowToStepData(r));
   }
 
   getStepsForTurns(
@@ -1948,66 +1974,14 @@ export class SqliteHistoryStore implements HistoryStore {
       if (!options.includeUndone) {
         sql += ` AND is_undone = 0`;
       }
-      if (options.category !== undefined) {
-        sql += ` AND category = ?`;
-        params.push(options.category);
-      }
-      if (options.kind !== undefined) {
-        sql += ` AND kind = ?`;
-        params.push(options.kind);
-      }
-      if (options.status !== undefined) {
-        sql += ` AND status = ?`;
-        params.push(options.status);
-      }
-      if (options.filePath !== undefined) {
-        sql += ` AND REPLACE(LOWER(file_path), char(92), '/') LIKE ?`;
-        params.push(`%${options.filePath.replaceAll("\\", "/").toLowerCase()}%`);
-      }
-      if (options.toolName !== undefined) {
-        if (Array.isArray(options.toolName)) {
-          if (options.toolName.length === 0) {
-            sql += ` AND 1 = 0`;
-          } else {
-            const tPlaceholders = options.toolName.map(() => "?").join(",");
-            sql += ` AND tool_name IN (${tPlaceholders})`;
-            params.push(...options.toolName);
-          }
-        } else {
-          sql += ` AND tool_name = ?`;
-          params.push(options.toolName);
-        }
-      }
-      if (options.serverName !== undefined) {
-        sql += ` AND server_name = ?`;
-        params.push(options.serverName);
-      }
+
+      sql = buildStepFilterClauses(options, sql, params);
 
       sql += ` ORDER BY turn_index ASC, step_order ASC`;
 
       const rows = this.db.prepare(sql).all(...params) as any[];
       for (const r of rows) {
-        const step: StepData = {
-          stepIndex: r.step_index,
-          turnIndex: r.turn_index,
-          stepOrder: r.step_order,
-          category: r.category,
-          kind: r.kind ?? undefined,
-          status: r.status,
-          content: r.content ?? undefined,
-          thinking: r.thinking ?? undefined,
-          toolName: r.tool_name ?? undefined,
-          serverName: r.server_name ?? undefined,
-          filePath: r.file_path ?? undefined,
-          exitCode: r.exit_code ?? undefined,
-          errorMessage: r.error_message ?? undefined,
-          toolArgs: r.tool_args ?? undefined,
-          toolResult: r.tool_result ?? undefined,
-          toolDurationMs: r.tool_duration_ms ?? undefined,
-          subagentSessionId: r.subagent_session_id ?? undefined,
-          createdAt: r.created_at,
-          isUndone: r.is_undone === 1,
-        };
+        const step = mapRowToStepData(r);
         if (result.has(r.turn_index)) {
           result.get(r.turn_index)!.push(step);
         }
@@ -2413,40 +2387,7 @@ export class SqliteHistoryStore implements HistoryStore {
       WHERE t.is_undone = 0
     `;
     const params: any[] = [];
-
-    if (resolvedProjectPath !== undefined) {
-      sql += " AND LOWER(s.project_path) LIKE ?";
-      params.push(`%${resolvedProjectPath.toLowerCase()}%`);
-    }
-
-    if (options.filter?.role !== undefined) {
-      sql += " AND LOWER(s.role) LIKE ?";
-      params.push(`%${options.filter.role.toLowerCase()}%`);
-    }
-
-    if (options.filter?.hasErrors === true) {
-      sql += " AND t.error_count > 0";
-    } else if (options.filter?.hasErrors === false) {
-      sql += " AND (t.error_count IS NULL OR t.error_count = 0)";
-    }
-
-    if (options.filter?.onlySubagents === true) {
-      sql += " AND s.parent_id IS NOT NULL";
-    }
-
-    if (options.filter?.timeRange !== undefined) {
-      const range = parseTimeRange(options.filter.timeRange);
-      if (range) {
-        if (range.start !== null) {
-          sql += " AND t.created_at >= ?";
-          params.push(range.start);
-        }
-        if (range.end !== null) {
-          sql += " AND t.created_at <= ?";
-          params.push(range.end);
-        }
-      }
-    }
+    sql = applySqliteTurnFilters(resolvedProjectPath, options.filter, sql, params);
 
     const rows = this.db.prepare(sql).all(...params) as any[];
     const results: VectorSearchResult[] = [];
@@ -2505,40 +2446,7 @@ export class SqliteHistoryStore implements HistoryStore {
       WHERE transcript_turns_fts MATCH ? AND t.is_undone = 0
     `;
     const params: any[] = [ftsExpression];
-
-    if (resolvedProjectPath !== undefined) {
-      sql += " AND LOWER(s.project_path) LIKE ?";
-      params.push(`%${resolvedProjectPath.toLowerCase()}%`);
-    }
-
-    if (options.filter?.role !== undefined) {
-      sql += " AND LOWER(s.role) LIKE ?";
-      params.push(`%${options.filter.role.toLowerCase()}%`);
-    }
-
-    if (options.filter?.hasErrors === true) {
-      sql += " AND t.error_count > 0";
-    } else if (options.filter?.hasErrors === false) {
-      sql += " AND (t.error_count IS NULL OR t.error_count = 0)";
-    }
-
-    if (options.filter?.onlySubagents === true) {
-      sql += " AND s.parent_id IS NOT NULL";
-    }
-
-    if (options.filter?.timeRange !== undefined) {
-      const range = parseTimeRange(options.filter.timeRange);
-      if (range) {
-        if (range.start !== null) {
-          sql += " AND t.created_at >= ?";
-          params.push(range.start);
-        }
-        if (range.end !== null) {
-          sql += " AND t.created_at <= ?";
-          params.push(range.end);
-        }
-      }
-    }
+    sql = applySqliteTurnFilters(resolvedProjectPath, options.filter, sql, params);
 
     sql += " ORDER BY rank LIMIT ?";
     params.push(limit);

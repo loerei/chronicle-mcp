@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { getStore, getDb, type StepCategory, type StepSortMode } from "./db.js";
+import { getStore, getDb, type StepCategory } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
 import type { TurnData } from "./adapters/types.js";
 import { getEmbeddingClient } from "./embeddings.js";

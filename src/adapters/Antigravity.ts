@@ -32,7 +32,7 @@ export function discoverBrainArtifacts(sessionBrainDir: string): string[] {
 
 export class AntigravityAdapter implements HistoryAdapter {
   readonly name = "antigravity";
-  private brainDir: string;
+  private readonly brainDir: string;
 
   constructor(brainDir?: string) {
     this.brainDir = brainDir || path.join(os.homedir(), ".gemini", "antigravity", "brain");

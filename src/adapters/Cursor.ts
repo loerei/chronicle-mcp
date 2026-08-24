@@ -7,8 +7,8 @@ import { SessionParser } from "./SessionParser.js";
 
 export class CursorAdapter implements HistoryAdapter {
   readonly name = "cursor";
-  private customDbPath?: string;
-  private customDb?: DatabaseSync;
+  private readonly customDbPath?: string;
+  private readonly customDb?: DatabaseSync;
 
   constructor(options?: string | DatabaseSync | { dbPath?: string; db?: DatabaseSync }) {
     if (typeof options === "string") {
