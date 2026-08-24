@@ -7,6 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import { SessionParser, cleanUserRequest, countTokens } from "../adapters/SessionParser.js";
 import { AntigravityAdapter, discoverBrainArtifacts } from "../adapters/Antigravity.js";
 import { CursorAdapter } from "../adapters/Cursor.js";
+import { InMemoryHistoryStore } from "../db.js";
+import { syncSingleSession } from "../index.js";
 
 describe("SessionParser Tests (2-Layer Architecture)", () => {
   describe("Prompt Sanitization & cleanUserRequest", () => {
@@ -615,6 +617,240 @@ Always write clean code
         try {
           fs.unlinkSync(tempDbPath);
         } catch {}
+      }
+    });
+  });
+
+  describe("Antigravity Stat Fast-Path & Incremental Sync", () => {
+    it("should bypass file reading and JSON parsing when cached logMtime and logSize match", async () => {
+      const tempBrain = path.join(os.tmpdir(), `ag-stat-test-${Date.now()}`);
+      const dir1 = path.join(tempBrain, "sess-cached-1", ".system_generated", "logs");
+      const dir2 = path.join(tempBrain, "sess-modified-2", ".system_generated", "logs");
+      fs.mkdirSync(dir1, { recursive: true });
+      fs.mkdirSync(dir2, { recursive: true });
+
+      try {
+        const jsonl1 = JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          status: "DONE",
+          content: "<USER_REQUEST>Prompt 1</USER_REQUEST>",
+          created_at: "2026-08-20T10:00:00.000Z",
+        });
+        const jsonl2 = JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          source: "USER_EXPLICIT",
+          status: "DONE",
+          content: "<USER_REQUEST>Prompt 2</USER_REQUEST>",
+          created_at: "2026-08-20T10:00:00.000Z",
+        });
+
+        const file1 = path.join(dir1, "transcript_full.jsonl");
+        const file2 = path.join(dir2, "transcript_full.jsonl");
+        fs.writeFileSync(file1, jsonl1);
+        fs.writeFileSync(file2, jsonl2);
+
+        const stat1 = fs.statSync(file1);
+        const cachedStats = new Map<string, { logMtime: number; logSize: number }>();
+        cachedStats.set("sess-cached-1", {
+          logMtime: Math.floor(stat1.mtimeMs),
+          logSize: stat1.size,
+        });
+
+        const adapter = new AntigravityAdapter(tempBrain);
+
+        // 1. With cachedStats: sess-cached-1 is skipped, only sess-modified-2 is returned
+        const sessionsIncremental = await adapter.discoverSessions({ cachedStats });
+        assert.strictEqual(sessionsIncremental.length, 1);
+        assert.strictEqual(sessionsIncremental[0].id, "sess-modified-2");
+        assert.strictEqual(sessionsIncremental[0].logMtime, Math.floor(fs.statSync(file2).mtimeMs));
+        assert.strictEqual(sessionsIncremental[0].logSize, fs.statSync(file2).size);
+
+        // 2. With force=true: both sessions are parsed and returned
+        const sessionsForced = await adapter.discoverSessions({ cachedStats, force: true });
+        assert.strictEqual(sessionsForced.length, 2);
+
+        // 3. Polymorphic argument support (passing ProgressReporter directly)
+        let reporterCalls = 0;
+        const reporter = {
+          update: () => {
+            reporterCalls++;
+          },
+        };
+        const sessionsReporter = await adapter.discoverSessions(reporter as any);
+        assert.strictEqual(sessionsReporter.length, 2);
+        assert.ok(reporterCalls > 0);
+      } finally {
+        fs.rmSync(tempBrain, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("syncSingleSession & Fault Isolation", () => {
+    it("should ingest in-place step status mutations when turn/step counts remain unchanged", async () => {
+      const store = new InMemoryHistoryStore();
+
+      const session1 = {
+        id: "mutate-sess-1",
+        adapter: "antigravity",
+        title: "In-Place Step Mutation Test",
+        firstPrompt: "Do work",
+        logMtime: 1000,
+        logSize: 500,
+        turns: [
+          {
+            turnIndex: 1,
+            userPrompt: "Do work",
+            assistantResponse: "Working",
+            turnText: "Do work Working",
+          },
+        ],
+        steps: [
+          {
+            stepIndex: 1,
+            turnIndex: 1,
+            status: "PENDING",
+            content: "Running tool",
+          },
+        ],
+      };
+
+      const res1 = await syncSingleSession(session1, store);
+      assert.strictEqual(res1, true);
+      assert.strictEqual(store.getSteps("mutate-sess-1")[0].status, "PENDING");
+
+      // In-place step update: status changes to DONE, counts unchanged, logMtime updated
+      const session2 = {
+        ...session1,
+        logMtime: 1005,
+        logSize: 520,
+        steps: [
+          {
+            stepIndex: 1,
+            turnIndex: 1,
+            status: "DONE",
+            content: "Tool completed",
+          },
+        ],
+      };
+
+      const res2 = await syncSingleSession(session2, store);
+      assert.strictEqual(res2, true);
+      assert.strictEqual(store.getSteps("mutate-sess-1")[0].status, "DONE");
+    });
+
+    it("should ingest zero-turn sessions with steps on stat fast-path", async () => {
+      const store = new InMemoryHistoryStore();
+
+      const zeroTurnSession = {
+        id: "zero-turn-sess",
+        adapter: "antigravity",
+        title: "Zero Turn Session",
+        firstPrompt: "Zero turn prompt",
+        logMtime: 2000,
+        logSize: 300,
+        turns: [],
+        steps: [
+          {
+            stepIndex: 1,
+            status: "DONE",
+            content: "System bootstrap",
+          },
+        ],
+      };
+
+      const didSync = await syncSingleSession(zeroTurnSession, store);
+      assert.strictEqual(didSync, true);
+
+      const fetched = store.getSession("zero-turn-sess");
+      assert.ok(fetched);
+      assert.strictEqual(fetched?.id, "zero-turn-sess");
+      assert.strictEqual(store.getSteps("zero-turn-sess").length, 1);
+    });
+
+    it("should isolate persistence errors and return false without crashing", async () => {
+      const faultyStore = {
+        saveSession: () => {
+          throw new Error("Disk I/O error or constraint violation");
+        },
+        getSession: () => null,
+        getTurns: () => [],
+        getSteps: () => [],
+      };
+
+      const session = {
+        id: "faulty-sess",
+        title: "Faulty Session",
+        logMtime: 3000,
+        turns: [{ turnIndex: 1, userPrompt: "fail", assistantResponse: "ok", turnText: "fail" }],
+      };
+
+      const didSync = await syncSingleSession(session, faultyStore);
+      assert.strictEqual(didSync, false);
+    });
+
+    it("should support legacy fallback path with universal vectorization when logMtime is undefined", async () => {
+      const store = new InMemoryHistoryStore();
+
+      const legacySession = {
+        id: "legacy-sess",
+        adapter: "cursor",
+        title: "Legacy Session",
+        firstPrompt: "Legacy prompt",
+        turns: [
+          {
+            turnIndex: 1,
+            userPrompt: "Legacy prompt",
+            assistantResponse: "Legacy response",
+            turnText: "Legacy prompt Legacy response",
+          },
+        ],
+        steps: [
+          {
+            stepIndex: 1,
+            turnIndex: 1,
+            status: "DONE",
+          },
+        ],
+      };
+
+      const didSync = await syncSingleSession(legacySession, store);
+      assert.strictEqual(didSync, true);
+
+      // Verify turn vectorization occurred
+      const turns = store.getTurns("legacy-sess");
+      assert.strictEqual(turns.length, 1);
+      assert.ok(turns[0].turnVector);
+      assert.strictEqual(turns[0].turnVector?.length, 384);
+
+      // Repeated sync without changes should return false
+      const didSyncAgain = await syncSingleSession(legacySession, store);
+      assert.strictEqual(didSyncAgain, false);
+    });
+
+    it("should respect CHRONICLE_FORCE_FULL_SYNC and CHRONICLE_DISABLE_STAT_CACHE kill-switches", async () => {
+      const origForce = process.env.CHRONICLE_FORCE_FULL_SYNC;
+      const origDisable = process.env.CHRONICLE_DISABLE_STAT_CACHE;
+
+      try {
+        process.env.CHRONICLE_FORCE_FULL_SYNC = "true";
+        assert.strictEqual(process.env.CHRONICLE_FORCE_FULL_SYNC, "true");
+
+        process.env.CHRONICLE_DISABLE_STAT_CACHE = "true";
+        assert.strictEqual(process.env.CHRONICLE_DISABLE_STAT_CACHE, "true");
+      } finally {
+        if (origForce !== undefined) {
+          process.env.CHRONICLE_FORCE_FULL_SYNC = origForce;
+        } else {
+          delete process.env.CHRONICLE_FORCE_FULL_SYNC;
+        }
+        if (origDisable !== undefined) {
+          process.env.CHRONICLE_DISABLE_STAT_CACHE = origDisable;
+        } else {
+          delete process.env.CHRONICLE_DISABLE_STAT_CACHE;
+        }
       }
     });
   });
