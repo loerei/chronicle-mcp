@@ -6,6 +6,16 @@ Audits algorithmic complexity, query efficiency, memory footprint, and resource 
 
 Audit the Directive Artifact solely against codebase ground-truth and requirement criteria. Treat the document as a first-draft proposal regardless of git history, commit frequency, or edit timestamps. Past edits are NOT evidence of performance optimality. Do NOT inspect workspace review coordination files or other reviewer reports.
 
+## Empirical Verification: Shadow Sandbox (.scratch/)
+
+When auditing algorithmic complexity or throughput, author a self-contained inline benchmark script in `<repo-root>/.scratch/`:
+1. **Inline Benchmark**: Author `.scratch/bench_perf_<name>.*` importing real project dependencies and implementing the proposed loop, algorithm, or query construction inline alongside the existing codebase baseline against identical input fixtures (or clone into `.scratch/shadow_perf_<name>.*` with adjusted relative imports if full module replacement is required).
+2. **Probe Execution**: Execute the benchmark using the appropriate runtime (`node .scratch/...`, `npx tsx .scratch/...`, `python .scratch/...`) across large inputs (N = 100,000 iterations, regex stress strings, or memory allocations) under a 15s execution timeout.
+3. **Cite Proof**: Include relative percentage latency deltas (% speedup/slowdown), event loop block latencies, heap allocation differences, or execution timeouts in `scratch/deep_review/reports/Performance.md`.
+
+> [!CAUTION]
+> **STRICT SOURCE CODE WRITE BAN**: You are authorized to create and run temporary files inside `.scratch/` ONLY. You MUST NOT modify or delete project source files. Write all findings to `scratch/deep_review/reports/Performance.md`.
+
 ## Mandatory Audit Checklist
 
 1. **Algorithmic Complexity**: Are time and space complexities optimal? Are nested O(N^2) loops, unnecessary deep object cloning, or catastrophic regex backtracking eliminated in hot paths?

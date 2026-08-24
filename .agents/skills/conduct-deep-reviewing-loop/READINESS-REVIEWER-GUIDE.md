@@ -6,6 +6,16 @@ Audits whether the existing codebase and infrastructure are fully prepared to su
 
 Audit the Directive Artifact solely against codebase ground-truth and requirement criteria. Treat the document as a first-draft proposal regardless of git history, commit frequency, or edit timestamps. Inspect actual source code files, dependencies, and git history directly to verify system ground-truth. Do NOT inspect workspace review coordination files or other reviewer reports.
 
+## Empirical Verification: Shadow Sandbox (.scratch/)
+
+When auditing system prerequisites and dependencies, verify directly against codebase reality:
+1. **Baseline Checks**: Run type-checks (`tsc --noEmit`), linters, and dependency tree inspections (`npm ls`, `pip check`) under a 30s execution timeout to verify compiler and environment health. Reviewers MUST NOT run mutating package commands (`npm install`, `pip install`) or modify lockfiles.
+2. **Inline Import Check**: When the plan introduces new library APIs or imports, author `.scratch/check_readiness_<name>.*` attempting to import and instantiate the target package/symbol from existing installed dependencies using the appropriate runtime under a 15s execution timeout (or in `.scratch/shadow_readiness_<name>.*` with adjusted relative imports).
+3. **Cite Proof**: Include missing symbol errors, version mismatch logs, compilation failures, or execution timeouts in `scratch/deep_review/reports/Readiness.md`.
+
+> [!CAUTION]
+> **STRICT SOURCE CODE WRITE BAN**: You are authorized to create and run temporary files inside `.scratch/` ONLY. You MUST NOT modify or delete project source files. Write all findings to `scratch/deep_review/reports/Readiness.md`.
+
 ## Mandatory Audit Checklist
 
 1. **Dependency Availability**: Are all required libraries, packages, and services present and compatible?

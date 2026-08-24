@@ -22,6 +22,8 @@ scratch/deep_review/
 │   └── Reviewer_Choice_Rationale.md
 ├── Context.md               # [PUBLIC] Initialized by Layer 1 (DA path, rules, criteria, static SP)
 └── reports/                 # [REVIEWER OUTPUTS] Purged at pass starts; static overwrite (<Role>.md)
+
+<repo-root>/.scratch/        # [DIAGNOSTIC SANDBOX] Inline probes & shadow modules (.scratch/<action>_<role>_*, .scratch/shadow_*)
 ```
 
 Reviewers MUST read only their assigned target DA and `scratch/deep_review/Context.md`. Reviewers MUST NOT inspect `scratch/deep_review/host/` or reports of other reviewers.
@@ -96,7 +98,7 @@ Targeted re-review rounds do NOT count toward the `!SP` pass counter.
 - **Pass Counter (`PassCount`)**:
   - Increments by 1 ONLY when an unbroken Full Sweep round passes with zero blocking issues across all active roles in the frozen roster.
   - Resets to 0 if any role in any round returns `REVISION NEEDED`.
-- **Final Verdict**: Host issues `FINAL_PASS` ONLY when `PassCount >= SP`.
+- **Final Verdict**: Host issues `FINAL_PASS` ONLY when `PassCount >= SP`, recursively purges `<repo-root>/.scratch/*` diagnostic artifacts (idempotently handling missing directories), and presents clean final artifacts to Layer 1.
 
 ## 8. Modifier Commands Matrix
 

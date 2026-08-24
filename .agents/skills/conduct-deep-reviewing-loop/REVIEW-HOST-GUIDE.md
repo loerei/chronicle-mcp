@@ -11,7 +11,7 @@ Instructions for Review Host to route Layer 3 reviewers, filter feedback, and en
      | Role Identifier | Selection Status (INCLUDED / EXCLUDED) | Technical Rationale |
      ```
      Ensure `Architect` and `Logic` are `INCLUDED`, and explicitly mark remaining 8 roles as `INCLUDED` or `EXCLUDED`.
-1. **Workspace Preparation**: Purge all files in `scratch/deep_review/reports/` strictly at round start (before executing the first active tier) and before launching a Full Sweep pass (preserving intra-tier reports within an active pass). Validate `scratch/deep_review/Context.md` without overwriting criteria or `SP`.
+1. **Workspace Preparation**: Purge all files in `scratch/deep_review/reports/` and recursively purge all diagnostic files in `<repo-root>/.scratch/` (`.scratch/*`, idempotently handling missing directories) strictly at round start (before executing the first active tier) and before launching a Full Sweep pass (preserving intra-tier reports within an active pass). Validate `scratch/deep_review/Context.md` without overwriting criteria or `SP`.
 2. **DAG Routing & Targeted Execution**:
    - If `scratch/deep_review/host/Changelog.md` exists: Reset `PassCount = 0`, determine highest modified tier for Targeted DAG routing per `PROTOCOL.md` Section 6, then delete `scratch/deep_review/host/Changelog.md` before invoking reviewers.
    - If `scratch/deep_review/host/Changelog.md` is absent:
@@ -26,8 +26,8 @@ Instructions for Review Host to route Layer 3 reviewers, filter feedback, and en
      2. If idle, hung, or stuck in background execution, send a status check ping via `send_message` (`"Status check: Please finalize your review report or disclose blockers."`).
      3. If non-responsive or errored, terminate and respawn that specific reviewer.
 4. **Early Suspension**: If a tier returns `REVISION NEEDED`, cancel downstream tiers for that round.
-5. **Full Sweep Clearance**: When all targeted roles pass (`TARGETED_PASS`), purge `reports/` and run a Full Sweep across all active roles in the frozen roster on the static DA snapshot before issuing `FINAL_PASS` or incrementing `PassCount`.
-6. **Reporting**: Evaluate Layer 3 reports from `scratch/deep_review/reports/` using `HOW-TO-PICK-UP-THE-RIGHT-OPINIONS.md`. Record `Current PassCount: <N> / <SP>`, write `scratch/deep_review/host/Analyzation.md` and `scratch/deep_review/host/Changelog.md`.
+5. **Full Sweep Clearance**: When all targeted roles pass (`TARGETED_PASS`), purge `reports/` and recursively purge all diagnostic files in `<repo-root>/.scratch/` (idempotently handling missing directories), and run a Full Sweep across all active roles in the frozen roster on the static DA snapshot before issuing `FINAL_PASS` or incrementing `PassCount`.
+6. **Reporting & Final Teardown**: Evaluate Layer 3 reports from `scratch/deep_review/reports/` using `HOW-TO-PICK-UP-THE-RIGHT-OPINIONS.md`. Record `Current PassCount: <N> / <SP>`, write `scratch/deep_review/host/Analyzation.md` and `scratch/deep_review/host/Changelog.md`. When issuing `FINAL_PASS` (where `PassCount == SP`), recursively purge all temporary diagnostic files in `<repo-root>/.scratch/*` (idempotently handling missing directories).
 
 ## Role Summoning Table
 
