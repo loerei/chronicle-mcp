@@ -1,14 +1,33 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { SessionData, HistoryAdapter } from "./types.js";
 import { SessionParser } from "./SessionParser.js";
 
 export class CursorAdapter implements HistoryAdapter {
   name = "cursor";
+  private customDbPath?: string;
+  private customDb?: DatabaseSync;
+
+  constructor(options?: string | DatabaseSync | { dbPath?: string; db?: DatabaseSync }) {
+    if (typeof options === "string") {
+      this.customDbPath = options;
+    } else if (options && typeof options === "object") {
+      if ("prepare" in options) {
+        this.customDb = options as DatabaseSync;
+      } else {
+        this.customDbPath = options.dbPath;
+        this.customDb = options.db;
+      }
+    }
+  }
 
   private getDbPath(): string {
+    if (this.customDbPath) {
+      return this.customDbPath;
+    }
+
     const homedir = os.homedir();
     let dbPath = path.join(
       homedir,
@@ -115,14 +134,12 @@ export class CursorAdapter implements HistoryAdapter {
     return null;
   }
 
-  private retrieveConversationBubbles(db: any, composerId: string, composerData: any): any[] {
+  private retrieveConversationBubbles(bubbleStmt: StatementSync, composerId: string, composerData: any): any[] {
     const bubbleHeaders = composerData.fullConversationHeadersOnly || [];
     const conversationBubbles: any[] = [];
     for (const header of bubbleHeaders) {
       const bubbleKey = `bubbleId:${composerId}:${header.bubbleId}`;
-      const bubbleRow = db
-        .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
-        .get(bubbleKey) as any;
+      const bubbleRow = bubbleStmt.get(bubbleKey) as any;
       if (bubbleRow?.value) {
         try {
           conversationBubbles.push(JSON.parse(bubbleRow.value));
@@ -132,14 +149,14 @@ export class CursorAdapter implements HistoryAdapter {
     return conversationBubbles;
   }
 
-  private parseDiskKVRow(row: any, db: any, dbPath: string, sessions: SessionData[]): void {
+  private parseDiskKVRow(row: any, bubbleStmt: StatementSync, dbPath: string, sessions: SessionData[]): void {
     try {
       const composerId = row.key.replace("composerData:", "");
       const composerData = JSON.parse(row.value);
       if (!composerData) return;
 
       const resolvedWorkspacePath = this.resolveDiskKVWorkspacePath(composerData, dbPath);
-      const conversationBubbles = this.retrieveConversationBubbles(db, composerId, composerData);
+      const conversationBubbles = this.retrieveConversationBubbles(bubbleStmt, composerId, composerData);
 
       if (conversationBubbles.length > 0) {
         const state = {
@@ -158,17 +175,30 @@ export class CursorAdapter implements HistoryAdapter {
   }
 
   async discoverSessions(): Promise<SessionData[]> {
-    const dbPath = this.getDbPath();
+    let db: DatabaseSync | null = null;
+    let shouldClose = false;
 
-    if (!fs.existsSync(dbPath)) {
-      return [];
+    if (this.customDb) {
+      db = this.customDb;
+      shouldClose = false;
+    } else {
+      const dbPath = this.getDbPath();
+      if (!fs.existsSync(dbPath)) {
+        return [];
+      }
+      try {
+        db = new DatabaseSync(dbPath, { readOnly: true });
+        shouldClose = true;
+      } catch (openErr) {
+        console.warn("CursorAdapter failed to open SQLite database in readOnly mode:", openErr);
+        return [];
+      }
     }
 
     const sessions: SessionData[] = [];
+    const resolvedDbPath = this.customDbPath || this.getDbPath();
 
     try {
-      const db = new DatabaseSync(dbPath);
-
       // 1. Try cursorDiskKV first
       const diskKVCheck = db
         .prepare(
@@ -177,6 +207,8 @@ export class CursorAdapter implements HistoryAdapter {
         .get() as any;
 
       if (diskKVCheck) {
+        // Hoist prepared statement across all composer data rows
+        const bubbleStmt = db.prepare("SELECT value FROM cursorDiskKV WHERE key = ?");
         const rows = db
           .prepare(
             "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
@@ -184,7 +216,7 @@ export class CursorAdapter implements HistoryAdapter {
           .all() as any[];
 
         for (const row of rows) {
-          this.parseDiskKVRow(row, db, dbPath, sessions);
+          this.parseDiskKVRow(row, bubbleStmt, resolvedDbPath, sessions);
         }
       }
 
@@ -208,10 +240,14 @@ export class CursorAdapter implements HistoryAdapter {
           }
         }
       }
-
-      db.close();
     } catch (e) {
       console.warn("CursorAdapter discoverSessions database error:", e);
+    } finally {
+      if (shouldClose && db) {
+        try {
+          db.close();
+        } catch {}
+      }
     }
 
     return sessions;

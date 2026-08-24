@@ -4,8 +4,39 @@ import os from "node:os";
 import { SessionData, HistoryAdapter } from "./types.js";
 import { SessionParser } from "./SessionParser.js";
 
+/**
+ * Discovers markdown artifacts located in a session brain directory (shallow depth = 1).
+ * Ignores system-generated files, logs, scratch directories, and hidden files.
+ * Returns relative artifact basenames (e.g. ["implementation_plan.md", "walkthrough.md"]).
+ */
+export function discoverBrainArtifacts(sessionBrainDir: string): string[] {
+  if (!sessionBrainDir || !fs.existsSync(sessionBrainDir)) {
+    return [];
+  }
+
+  try {
+    const entries = fs.readdirSync(sessionBrainDir, { withFileTypes: true });
+    const artifacts: string[] = [];
+
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith(".md") && !entry.name.startsWith(".")) {
+        artifacts.push(entry.name);
+      }
+    }
+
+    return artifacts.sort();
+  } catch {
+    return [];
+  }
+}
+
 export class AntigravityAdapter implements HistoryAdapter {
   name = "antigravity";
+  private brainDir: string;
+
+  constructor(brainDir?: string) {
+    this.brainDir = brainDir || path.join(os.homedir(), ".gemini", "antigravity", "brain");
+  }
 
   private parseSingleSession(sid: string, brainDir: string, globalTitleMap: Map<string, string>): SessionData | null {
     const logDir = path.join(brainDir, sid, ".system_generated", "logs");
@@ -25,6 +56,11 @@ export class AntigravityAdapter implements HistoryAdapter {
         if (session.createdAt === 0) {
           session.createdAt = fs.statSync(logPath).mtimeMs;
         }
+
+        // Discover brain artifacts
+        const sessionBrainDir = path.join(brainDir, sid);
+        session.artifacts = discoverBrainArtifacts(sessionBrainDir);
+
         this.extractTitles(session, globalTitleMap);
         return session;
       }
@@ -35,7 +71,7 @@ export class AntigravityAdapter implements HistoryAdapter {
   private extractTitles(session: SessionData, globalTitleMap: Map<string, string>): void {
     if (!session.steps) return;
     for (const step of session.steps) {
-      if (step.type === "CONVERSATION_HISTORY") {
+      if (step.type === "CONVERSATION_HISTORY" || step.category === "system") {
         const historyText = step.content || "";
         const linesInHistory = historyText.split("\n");
         for (const hLine of linesInHistory) {
@@ -49,16 +85,22 @@ export class AntigravityAdapter implements HistoryAdapter {
   }
 
   async discoverSessions(reporter?: any): Promise<SessionData[]> {
-    const homedir = os.homedir();
-    const brainDir = path.join(homedir, ".gemini", "antigravity", "brain");
+    const brainDir = this.brainDir;
 
     if (!fs.existsSync(brainDir)) {
       return [];
     }
 
-    const sessionDirs = fs
-      .readdirSync(brainDir)
-      .filter((file) => fs.statSync(path.join(brainDir, file)).isDirectory() && file !== "tempmediaStorage");
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(brainDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const sessionDirs = entries
+      .filter((entry) => entry.isDirectory() && entry.name !== "tempmediaStorage" && !entry.name.startsWith("."))
+      .map((entry) => entry.name);
 
     const sessions: SessionData[] = [];
     const globalTitleMap = new Map<string, string>(); // sessionId -> title extracted from logs
@@ -81,6 +123,47 @@ export class AntigravityAdapter implements HistoryAdapter {
       if (title) {
         session.title = title;
       }
+    }
+
+    // Build session map for topology hierarchy resolution
+    const sessionMap = new Map<string, SessionData>();
+    for (const session of sessions) {
+      sessionMap.set(session.id, session);
+    }
+
+    // Link subagent parent IDs
+    for (const session of sessions) {
+      if (Array.isArray(session.subagentIds)) {
+        for (const childId of session.subagentIds) {
+          const child = sessionMap.get(childId);
+          if (child && !child.parentId) {
+            child.parentId = session.id;
+          }
+        }
+      }
+    }
+
+    // Compute rootId and depth with cycle detection
+    for (const session of sessions) {
+      let current = session;
+      let depth = 0;
+      const visited = new Set<string>([session.id]);
+
+      while (current.parentId && depth < 20) {
+        if (visited.has(current.parentId)) {
+          break; // cycle detected, terminate walk
+        }
+        visited.add(current.parentId);
+        const parent = sessionMap.get(current.parentId);
+        if (!parent) {
+          break;
+        }
+        current = parent;
+        depth += 1;
+      }
+
+      session.rootId = current.id;
+      session.depth = depth;
     }
 
     return sessions;
