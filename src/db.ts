@@ -796,7 +796,10 @@ export class InMemoryHistoryStore implements HistoryStore {
     }
 
     const parent = effectiveParentId ? this.sessionsMap.get(effectiveParentId) : undefined;
-    const resolvedDepth = session.depth && session.depth > 0 ? session.depth : (parent ? (parent.depth ?? 0) + 1 : (existing?.depth ?? 0));
+    let resolvedDepth = session.depth && session.depth > 0 ? session.depth : 0;
+    if (!resolvedDepth) {
+      resolvedDepth = parent ? (parent.depth ?? 0) + 1 : (existing?.depth ?? 0);
+    }
     const resolvedRootId = session.rootId || parent?.rootId || parent?.id || effectiveParentId || existing?.rootId || null;
 
     let title = session.title ?? existing?.title ?? "Untitled Session";
@@ -827,6 +830,20 @@ export class InMemoryHistoryStore implements HistoryStore {
     const totalTurns = turns ? turns.length : (session.totalTurns ?? existing?.totalTurns ?? 0);
     const totalSteps = steps ? steps.length : (session.totalSteps ?? existing?.totalSteps ?? safeSteps.length);
 
+    let effectiveTurns: TurnData[] = [];
+    if (turns) {
+      effectiveTurns = turns.map((t) => ({ ...t }));
+    } else if (existing?.turns) {
+      effectiveTurns = [...existing.turns];
+    }
+
+    let effectiveSteps: StepData[] = [];
+    if (steps) {
+      effectiveSteps = steps.map((s) => ({ ...s }));
+    } else if (existing?.steps) {
+      effectiveSteps = [...existing.steps];
+    }
+
     const sessionCopy: SessionData = {
       ...session,
       title,
@@ -846,8 +863,8 @@ export class InMemoryHistoryStore implements HistoryStore {
       metadata: { ...effectiveMetadata },
       logMtime: effectiveLogMtime,
       logSize: effectiveLogSize,
-      turns: turns ? turns.map((t) => ({ ...t })) : (existing?.turns ? [...existing.turns] : []),
-      steps: steps ? steps.map((s) => ({ ...s })) : (existing?.steps ? [...existing.steps] : []),
+      turns: effectiveTurns,
+      steps: effectiveSteps,
     };
     this.sessionsMap.set(session.id, sessionCopy);
 
@@ -1646,7 +1663,10 @@ export class SqliteHistoryStore implements HistoryStore {
         parentRow = db.prepare("SELECT id, root_id, depth FROM sessions WHERE id = ?").get(effectiveParentId) as any;
       }
 
-      const resolvedDepth = session.depth && session.depth > 0 ? session.depth : (parentRow ? (parentRow.depth ?? 0) + 1 : (existing?.depth ?? 0));
+      let resolvedDepth = session.depth && session.depth > 0 ? session.depth : 0;
+      if (!resolvedDepth) {
+        resolvedDepth = parentRow ? (parentRow.depth ?? 0) + 1 : (existing?.depth ?? 0);
+      }
       const resolvedRootId = session.rootId || parentRow?.root_id || parentRow?.id || effectiveParentId || existing?.root_id || null;
 
       // 1. Pre-insert stub records for parent and root before primary upsert

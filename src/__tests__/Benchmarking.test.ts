@@ -425,8 +425,10 @@ describe("Benchmarking Logic", () => {
     assert.ok(m.peakContextSize <= m.cumulativeInputTokens, "Peak context must be <= cumulative input");
     assert.ok(m.estimatedOutputTokens >= 80, "Output tokens must include dialogue + thinking");
     assert.ok(m.cacheHitTokens >= 0);
-    assert.ok(m.cacheHitRate >= 0 && m.cacheHitRate <= 100);
-    assert.ok(m.estimatedCostSavings >= 0 && m.estimatedCostSavings <= 100);
+    assert.ok(m.cacheHitRate >= 0);
+    assert.ok(m.cacheHitRate <= 100);
+    assert.ok(m.estimatedCostSavings >= 0);
+    assert.ok(m.estimatedCostSavings <= 100);
   });
 
   it("should validate sub-5ms performance for computeSessionBenchmarks and hybrid search", async () => {
