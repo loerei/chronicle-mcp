@@ -3,10 +3,12 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import {
   InMemoryHistoryStore,
   SqliteHistoryStore,
   HistoryStore,
+  initDatabaseSchema,
 } from "../db.js";
 import {
   SessionData,
@@ -671,6 +673,229 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
 
       store.close();
     });
+
+    it("should save and retrieve session log stats (logMtime and logSize) via getSessionLogStats", () => {
+      const store = storeFactory();
+
+      const sessionWithStats: SessionData = {
+        id: "sess-stat-1",
+        adapter: "antigravity",
+        title: "Stat Session 1",
+        createdAt: 1700000000000,
+        firstPrompt: "init",
+        logMtime: 1700000005000,
+        logSize: 1024,
+      };
+
+      const sessionWithoutStats: SessionData = {
+        id: "sess-stat-2",
+        adapter: "cursor",
+        title: "Stat Session 2",
+        createdAt: 1700000000000,
+        firstPrompt: "init",
+      };
+
+      store.saveSession(sessionWithStats);
+      store.saveSession(sessionWithoutStats);
+
+      const statsMap = store.getSessionLogStats();
+      assert.strictEqual(statsMap.size, 1);
+      assert.ok(statsMap.has("sess-stat-1"));
+      assert.strictEqual(statsMap.get("sess-stat-1")?.logMtime, 1700000005000);
+      assert.strictEqual(statsMap.get("sess-stat-1")?.logSize, 1024);
+      assert.strictEqual(statsMap.has("sess-stat-2"), false);
+
+      const fetched = store.getSession("sess-stat-1");
+      assert.strictEqual(fetched?.logMtime, 1700000005000);
+      assert.strictEqual(fetched?.logSize, 1024);
+
+      const list = store.listSessions();
+      const listed = list.find((s) => s.id === "sess-stat-1");
+      assert.strictEqual(listed?.logMtime, 1700000005000);
+      assert.strictEqual(listed?.logSize, 1024);
+
+      store.close();
+    });
+
+    it("should cascade root_id and depth to multi-level descendant chains (A -> B -> C -> D)", () => {
+      const store = storeFactory();
+
+      // Root A
+      const sessionA: SessionData = {
+        id: "chain-A",
+        adapter: "antigravity",
+        title: "Root Chain A",
+        createdAt: 1700000000000,
+        firstPrompt: "Root prompt",
+        depth: 0,
+        rootId: "chain-A",
+      };
+      store.saveSession(sessionA);
+
+      // Child B
+      const sessionB: SessionData = {
+        id: "chain-B",
+        adapter: "antigravity",
+        title: "Child B",
+        parentId: "chain-A",
+        createdAt: 1700000001000,
+        firstPrompt: "Child B prompt",
+      };
+      store.saveSession(sessionB);
+
+      // Grandchild C
+      const sessionC: SessionData = {
+        id: "chain-C",
+        adapter: "antigravity",
+        title: "Grandchild C",
+        parentId: "chain-B",
+        createdAt: 1700000002000,
+        firstPrompt: "Grandchild C prompt",
+      };
+      store.saveSession(sessionC);
+
+      // Great-grandchild D
+      const sessionD: SessionData = {
+        id: "chain-D",
+        adapter: "antigravity",
+        title: "Great-grandchild D",
+        parentId: "chain-C",
+        createdAt: 1700000003000,
+        firstPrompt: "Great-grandchild D prompt",
+      };
+      store.saveSession(sessionD);
+
+      const b = store.getSession("chain-B");
+      const c = store.getSession("chain-C");
+      const d = store.getSession("chain-D");
+
+      assert.strictEqual(b?.rootId, "chain-A");
+      assert.strictEqual(b?.depth, 1);
+      assert.strictEqual(c?.rootId, "chain-A");
+      assert.strictEqual(c?.depth, 2);
+      assert.strictEqual(d?.rootId, "chain-A");
+      assert.strictEqual(d?.depth, 3);
+
+      store.close();
+    });
+
+    it("should protect non-null metadata, non-empty collections, firstPrompt, and titles against empty/generic degradation on incremental upsert", () => {
+      const store = storeFactory();
+
+      const initialSession: SessionData = {
+        id: "sess-protect",
+        adapter: "antigravity",
+        title: "Meaningful Feature Implementation",
+        role: "Lead Architect",
+        projectPath: "d:/projects/test",
+        createdAt: 1700000000000,
+        firstPrompt: "Detailed original user prompt",
+        artifacts: ["implementation_plan.md"],
+        filesTouched: ["src/index.ts"],
+        metadata: { model: "gemini-ultra", flag: true },
+      };
+      store.saveSession(initialSession);
+
+      // Incremental upsert with empty/generic fallbacks
+      const degradedSession: SessionData = {
+        id: "sess-protect",
+        adapter: "antigravity",
+        title: "Session sess-protect", // Generic title
+        role: undefined,
+        createdAt: 1700000000000,
+        firstPrompt: "", // Empty prompt
+        artifacts: [], // Empty collections
+        filesTouched: [],
+        metadata: {},
+      };
+      store.saveSession(degradedSession);
+
+      const fetched = store.getSession("sess-protect");
+      assert.strictEqual(fetched?.title, "Meaningful Feature Implementation");
+      assert.strictEqual(fetched?.role, "Lead Architect");
+      assert.strictEqual(fetched?.firstPrompt, "Detailed original user prompt");
+      assert.deepStrictEqual(fetched?.artifacts, ["implementation_plan.md"]);
+      assert.deepStrictEqual(fetched?.filesTouched, ["src/index.ts"]);
+      assert.deepStrictEqual(fetched?.metadata, { model: "gemini-ultra", flag: true });
+
+      store.close();
+    });
+
+    it("should preserve existing parentId, rootId, and depth when parent is skipped in incremental sync", () => {
+      const store = storeFactory();
+
+      const parentSession: SessionData = {
+        id: "parent-sess",
+        adapter: "antigravity",
+        title: "Parent Session",
+        createdAt: 1700000000000,
+        firstPrompt: "Parent prompt",
+        depth: 0,
+        rootId: "parent-sess",
+      };
+      store.saveSession(parentSession);
+
+      const childSession: SessionData = {
+        id: "child-sess",
+        adapter: "antigravity",
+        title: "Child Session",
+        parentId: "parent-sess",
+        createdAt: 1700000001000,
+        firstPrompt: "Child prompt",
+      };
+      store.saveSession(childSession);
+
+      // Simulate incremental update on child without parent metadata
+      const incrementalChild: SessionData = {
+        id: "child-sess",
+        adapter: "antigravity",
+        title: "Child Session Updated",
+        createdAt: 1700000001000,
+        firstPrompt: "Child prompt",
+      };
+      store.saveSession(incrementalChild);
+
+      const fetched = store.getSession("child-sess");
+      assert.strictEqual(fetched?.parentId, "parent-sess");
+      assert.strictEqual(fetched?.rootId, "parent-sess");
+      assert.strictEqual(fetched?.depth, 1);
+
+      store.close();
+    });
+
+    it("should safely handle child stubs and backward linkage when child is referenced in subagent steps", () => {
+      const store = storeFactory();
+
+      const parentSession: SessionData = {
+        id: "caller-parent",
+        adapter: "antigravity",
+        title: "Caller Parent",
+        createdAt: 1700000000000,
+        firstPrompt: "Spawning subagent",
+        subagentIds: ["subagent-child-1"],
+      };
+
+      const steps: StepData[] = [
+        {
+          stepIndex: 1,
+          turnIndex: 1,
+          category: "execution",
+          kind: "subagent",
+          status: "DONE",
+          subagentSessionId: "subagent-child-1",
+        },
+      ];
+
+      store.saveSession(parentSession, undefined, steps);
+
+      const child = store.getSession("subagent-child-1");
+      assert.ok(child);
+      assert.strictEqual(child?.parentId, "caller-parent");
+      assert.strictEqual(child?.rootId, "caller-parent");
+      assert.strictEqual(child?.depth, 1);
+
+      store.close();
+    });
   });
 }
 
@@ -687,6 +912,48 @@ let dbCount = 0;
 runTestSuite("SqliteHistoryStore", () => {
   const dbFile = path.join(tempDbDir, `test-${++dbCount}.db`);
   return new SqliteHistoryStore(dbFile);
+});
+
+describe("SqliteHistoryStore Auto-Migration & Schema Introspection", () => {
+  it("should auto-migrate legacy sessions table missing log_mtime and log_size columns", () => {
+    const legacyDbFile = path.join(tempDbDir, `legacy-${++dbCount}.db`);
+    const db = new DatabaseSync(legacyDbFile);
+
+    // Create legacy table missing log_mtime and log_size
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        adapter TEXT NOT NULL,
+        title TEXT NOT NULL,
+        role TEXT,
+        project_path TEXT,
+        created_at INTEGER NOT NULL,
+        last_active_at INTEGER NOT NULL,
+        parent_id TEXT,
+        depth INTEGER DEFAULT 0,
+        total_turns INTEGER DEFAULT 0,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        artifacts TEXT,
+        files_touched TEXT,
+        first_prompt TEXT,
+        metadata TEXT
+      );
+    `);
+
+    // Run initDatabaseSchema
+    initDatabaseSchema(db);
+
+    // Inspect columns
+    const columns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
+    const columnSet = new Set(columns.map((c) => c.name));
+
+    assert.ok(columnSet.has("log_mtime"), "Should have migrated log_mtime");
+    assert.ok(columnSet.has("log_size"), "Should have migrated log_size");
+    assert.ok(columnSet.has("root_id"), "Should have migrated root_id");
+
+    db.close();
+  });
 });
 
 after(() => {
