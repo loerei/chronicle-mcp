@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { SessionData, HistoryAdapter } from "./types.js";
+import { SessionData, HistoryAdapter, DiscoverSessionsOptions } from "./types.js";
+import { ProgressReporter } from "../progress.js";
 import { SessionParser } from "./SessionParser.js";
 
 /**
@@ -38,36 +39,6 @@ export class AntigravityAdapter implements HistoryAdapter {
     this.brainDir = brainDir || path.join(os.homedir(), ".gemini", "antigravity", "brain");
   }
 
-  private parseSingleSession(sid: string, brainDir: string, globalTitleMap: Map<string, string>): SessionData | null {
-    const logDir = path.join(brainDir, sid, ".system_generated", "logs");
-    let logPath = path.join(logDir, "transcript_full.jsonl");
-    if (!fs.existsSync(logPath)) {
-      logPath = path.join(logDir, "transcript.jsonl");
-    }
-
-    if (!fs.existsSync(logPath)) {
-      return null;
-    }
-
-    try {
-      const content = fs.readFileSync(logPath, "utf-8");
-      const session = SessionParser.parseAntigravity(sid, content);
-      if (session) {
-        if (session.createdAt === 0) {
-          session.createdAt = fs.statSync(logPath).mtimeMs;
-        }
-
-        // Discover brain artifacts
-        const sessionBrainDir = path.join(brainDir, sid);
-        session.artifacts = discoverBrainArtifacts(sessionBrainDir);
-
-        this.extractTitles(session, globalTitleMap);
-        return session;
-      }
-    } catch {}
-    return null;
-  }
-
   private extractTitles(session: SessionData, globalTitleMap: Map<string, string>): void {
     if (!session.steps) return;
     for (const step of session.steps) {
@@ -84,12 +55,18 @@ export class AntigravityAdapter implements HistoryAdapter {
     }
   }
 
-  async discoverSessions(reporter?: any): Promise<SessionData[]> {
+  async discoverSessions(options?: DiscoverSessionsOptions | ProgressReporter): Promise<SessionData[]> {
     const brainDir = this.brainDir;
 
     if (!fs.existsSync(brainDir)) {
       return [];
     }
+
+    const opts: DiscoverSessionsOptions =
+      options && typeof (options as any).update === "function"
+        ? { reporter: options as ProgressReporter }
+        : (options as DiscoverSessionsOptions) || {};
+    const reporter = opts.reporter;
 
     let entries: fs.Dirent[] = [];
     try {
@@ -106,14 +83,65 @@ export class AntigravityAdapter implements HistoryAdapter {
     const globalTitleMap = new Map<string, string>(); // sessionId -> title extracted from logs
 
     const total = sessionDirs.length;
-    reporter?.start(total, "Scanning Antigravity sessions...");
+    const startTime = Date.now();
+    let skippedCount = 0;
+
+    (reporter as any)?.start?.(total, "Scanning Antigravity sessions...");
 
     for (let i = 0; i < sessionDirs.length; i++) {
       const sid = sessionDirs[i];
-      const session = this.parseSingleSession(sid, brainDir, globalTitleMap);
-      if (session) {
-        sessions.push(session);
+      const logDir = path.join(brainDir, sid, ".system_generated", "logs");
+      let logPath = path.join(logDir, "transcript_full.jsonl");
+      if (!fs.existsSync(logPath)) {
+        logPath = path.join(logDir, "transcript.jsonl");
       }
+
+      if (!fs.existsSync(logPath)) {
+        reporter?.update(i + 1, total, sid);
+        continue;
+      }
+
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(logPath);
+      } catch (e: any) {
+        console.error(`[Chronicle MCP] Failed to stat session transcript "${sid}" at ${logPath}:`, e?.message || e);
+        reporter?.update(i + 1, total, sid);
+        continue;
+      }
+
+      const currentMtime = Math.floor(stat.mtimeMs);
+
+      if (!opts.force && opts.cachedStats?.has(sid)) {
+        const cached = opts.cachedStats.get(sid)!;
+        if (currentMtime === cached.logMtime && stat.size === cached.logSize) {
+          skippedCount++;
+          reporter?.update(i + 1, total, sid);
+          continue;
+        }
+      }
+
+      let session: SessionData | null = null;
+      try {
+        const content = fs.readFileSync(logPath, "utf-8");
+        session = SessionParser.parseAntigravity(sid, content);
+        if (session) {
+          if (session.createdAt === 0) {
+            session.createdAt = currentMtime;
+          }
+          session.logMtime = currentMtime;
+          session.logSize = stat.size;
+
+          const sessionBrainDir = path.join(brainDir, sid);
+          session.artifacts = discoverBrainArtifacts(sessionBrainDir);
+
+          this.extractTitles(session, globalTitleMap);
+          sessions.push(session);
+        }
+      } catch (e: any) {
+        console.error(`[Chronicle MCP] Failed to parse session transcript "${sid}" at ${logPath}:`, e?.message || e);
+      }
+
       reporter?.update(i + 1, total, session?.title || sid);
     }
 
@@ -145,9 +173,16 @@ export class AntigravityAdapter implements HistoryAdapter {
 
     // Compute rootId and depth with cycle detection
     for (const session of sessions) {
+      if (!session.parentId) {
+        session.rootId = session.id;
+        session.depth = 0;
+        continue;
+      }
+
       let current = session;
       let depth = 0;
       const visited = new Set<string>([session.id]);
+      let parentResolved = true;
 
       while (current.parentId && depth < 20) {
         if (visited.has(current.parentId)) {
@@ -156,15 +191,20 @@ export class AntigravityAdapter implements HistoryAdapter {
         visited.add(current.parentId);
         const parent = sessionMap.get(current.parentId);
         if (!parent) {
+          parentResolved = false;
           break;
         }
         current = parent;
         depth += 1;
       }
 
-      session.rootId = current.id;
-      session.depth = depth;
+      if (parentResolved) {
+        session.rootId = current.id;
+        session.depth = depth;
+      }
     }
+
+    console.error(`[Chronicle MCP] [Antigravity] Scanned ${total} session directories: ${skippedCount} unchanged (stat-cached), ${sessions.length} parsed in ${Date.now() - startTime}ms`);
 
     return sessions;
   }
