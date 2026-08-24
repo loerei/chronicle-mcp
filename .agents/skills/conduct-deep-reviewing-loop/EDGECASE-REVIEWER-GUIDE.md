@@ -9,9 +9,9 @@ Audit the Directive Artifact solely against codebase ground-truth and requiremen
 ## Empirical Verification: Shadow Sandbox (.scratch/)
 
 When auditing boundary conditions or failure paths, author a self-contained inline probe script in `<repo-root>/.scratch/`:
-1. **Inline Probe**: Author `.scratch/repro_edgecase_<name>.*` directly importing unmodified project dependencies and defining or wrapping the uncommitted proposed logic inline (or clone the target file into `.scratch/shadow_edgecase_<name>.*` with adjusted relative imports if full-module replacement is required).
+1. **Inline Probe**: Author `.scratch/repro_edgecase_<name>.*` via `write_to_file` directly importing unmodified project dependencies and defining or wrapping the uncommitted proposed logic inline (or clone the target file into `.scratch/shadow_edgecase_<name>.*` with adjusted relative imports if full-module replacement is required).
 2. **Probe Execution**: Execute the probe using the appropriate runtime (`node .scratch/...`, `npx tsx .scratch/...`, `python .scratch/...`) with boundary payloads (null, 0, empty collection, overflow, concurrent bursts) under a 15s execution timeout.
-3. **Cite Proof**: Include thrown stack traces, unexpected return values, unhandled promise rejections, or execution timeouts/process hangs in `scratch/deep_review/reports/Edgecase.md`.
+3. **Cite Proof**: Write evaluation to `scratch/deep_review/reports/Edgecase.md` via `write_to_file`, including thrown stack traces, unexpected return values, unhandled promise rejections, or execution timeouts/process hangs.
 
 > [!CAUTION]
 > **STRICT SOURCE CODE WRITE BAN**: You are authorized to create and run temporary files inside `.scratch/` ONLY. You MUST NOT modify or delete project source files. Write all findings to `scratch/deep_review/reports/Edgecase.md`.

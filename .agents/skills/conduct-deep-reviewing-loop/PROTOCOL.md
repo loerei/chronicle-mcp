@@ -28,6 +28,9 @@ scratch/deep_review/
 
 Reviewers MUST read only their assigned target DA and `scratch/deep_review/Context.md`. Reviewers MUST NOT inspect `scratch/deep_review/host/` or reports of other reviewers.
 
+### File Authoring Protocol
+Reviewers and Host MUST use `write_to_file` for all file creations (`.scratch/` probe scripts, `reports/<Role>.md`, `host/*.md`). Embedding multi-line code or report content inside `run_command` inline strings (`node -e`, `python -c`, `echo`) is strictly prohibited to prevent shell escaping failures and hanging processes.
+
 Layer 1 initializes `scratch/deep_review/Context.md` at workflow start. Context files MUST remain frozen during active reviewer execution.
 
 ### Context Content Rules
