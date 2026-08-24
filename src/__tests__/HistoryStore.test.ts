@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, after } from "node:test";
 import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
@@ -687,4 +687,10 @@ let dbCount = 0;
 runTestSuite("SqliteHistoryStore", () => {
   const dbFile = path.join(tempDbDir, `test-${++dbCount}.db`);
   return new SqliteHistoryStore(dbFile);
+});
+
+after(() => {
+  try {
+    fs.rmSync(tempDbDir, { recursive: true, force: true });
+  } catch {}
 });

@@ -46,6 +46,7 @@ describe("SearchEngine & Progressive Disclosure Test Suite", () => {
     try {
       store.close();
     } catch {}
+    setStore(null as any);
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {}

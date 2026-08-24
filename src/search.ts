@@ -490,37 +490,43 @@ export async function queryTranscript(
         if (step.category === "execution" && !hasExecutions) return false;
         if (step.category === "system" && !hasSystem) return false;
 
-        if (normalizedFilePath && step.filePath) {
+        if (normalizedFilePath) {
+          if (!step.filePath) return false;
           const stepFp = step.filePath.replace(/\\/g, "/").toLowerCase();
           if (!stepFp.includes(normalizedFilePath)) return false;
         }
 
         if (toolFilter) {
-          if (toolFilter.name && step.toolName) {
+          if (toolFilter.name) {
+            if (!step.toolName) return false;
             const targetNames = Array.isArray(toolFilter.name)
               ? toolFilter.name.map((n) => n.toLowerCase())
               : [toolFilter.name.toLowerCase()];
             if (!targetNames.includes(step.toolName.toLowerCase())) return false;
           }
-          if (
-            toolFilter.server &&
-            step.serverName &&
-            step.serverName.toLowerCase() !== toolFilter.server.toLowerCase()
-          ) {
-            return false;
+          if (toolFilter.server) {
+            if (
+              !step.serverName ||
+              step.serverName.toLowerCase() !== toolFilter.server.toLowerCase()
+            ) {
+              return false;
+            }
           }
-          if (
-            toolFilter.status &&
-            step.status.toLowerCase() !== toolFilter.status.toLowerCase()
-          ) {
-            return false;
+          if (toolFilter.status) {
+            if (
+              !step.status ||
+              step.status.toLowerCase() !== toolFilter.status.toLowerCase()
+            ) {
+              return false;
+            }
           }
-          if (
-            toolFilter.kind &&
-            step.kind &&
-            step.kind.toLowerCase() !== toolFilter.kind.toLowerCase()
-          ) {
-            return false;
+          if (toolFilter.kind) {
+            if (
+              !step.kind ||
+              step.kind.toLowerCase() !== toolFilter.kind.toLowerCase()
+            ) {
+              return false;
+            }
           }
         }
         return true;
@@ -783,7 +789,11 @@ function analyzeSteps(steps: StepData[]): StepAnalysis {
       errorStepsCount++;
     }
 
-    toolCallsCount += countToolCalls(step.type === "PLANNER_RESPONSE" ? step.toolCalls : undefined);
+    if (step.toolName !== undefined || step.category === "execution") {
+      toolCallsCount++;
+    } else {
+      toolCallsCount += countToolCalls(step.type === "PLANNER_RESPONSE" ? step.toolCalls : undefined);
+    }
 
     const contentStr = step.content || "";
     const thinkingStr = step.thinking || "";
@@ -909,10 +919,11 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
     }
   } else {
     // Fallback
-    totalSteps = session.chunks.length;
+    const chunks = session.chunks || [];
+    totalSteps = chunks.length || (session.totalSteps ?? 0);
     let fullChunksText = "";
-    for (const chunk of session.chunks) {
-      fullChunksText += chunk.text + "\n";
+    for (const chunk of chunks) {
+      fullChunksText += (chunk.text || "") + "\n";
     }
 
     if (fullChunksText) {
@@ -949,25 +960,50 @@ export async function computeSessionBenchmarks(
   const metricsList: SessionBenchmarkMetrics[] = [];
 
   for (const sessionId of sessionIds) {
-    const result = store.query({
-      sessionId,
-      includeSteps: true,
-    });
-
-    const session = result.sessions[0] || store.getSession(sessionId);
+    const session = store.getSession(sessionId);
     if (!session) {
       continue;
     }
 
     const turns = store.getTurns(sessionId, { includeUndone: false });
-    const steps =
-      result.steps && result.steps.length > 0
-        ? result.steps
-        : store.getSteps(sessionId, { includeUndone: false });
+    const steps = store.getSteps(sessionId, { includeUndone: false });
 
     const metrics = computeSingleSessionMetrics(sessionId, session, steps);
     if (turns.length > 0) {
       metrics.totalTurns = turns.length;
+      let cumInput = 0;
+      let cumOutput = 0;
+      let cumThinking = 0;
+      let toolCnt = 0;
+      let errCnt = 0;
+      let totalDur = 0;
+
+      for (const turn of turns) {
+        cumInput += (turn.inputTokens ?? 0);
+        cumOutput += (turn.outputTokens ?? 0);
+        cumThinking += (turn.thinkingTokens ?? 0);
+        toolCnt += (turn.toolCount ?? 0);
+        errCnt += (turn.errorCount ?? 0);
+        totalDur += (turn.durationMs ?? 0);
+      }
+
+      if (cumInput > 0) {
+        metrics.cumulativeInputTokens = cumInput;
+        metrics.estimatedOutputTokens = cumOutput + cumThinking;
+        metrics.cacheHitTokens = Math.max(0, cumInput - (turns[0].inputTokens ?? 0));
+        metrics.cacheMissTokens = cumInput - metrics.cacheHitTokens;
+        metrics.cacheHitRate = (metrics.cacheHitTokens / cumInput) * 100;
+        metrics.estimatedCostSavings = (1 - (metrics.cacheMissTokens + 0.1 * metrics.cacheHitTokens) / cumInput) * 100;
+      }
+      if (toolCnt > 0) {
+        metrics.toolCallsCount = toolCnt;
+      }
+      if (errCnt > 0) {
+        metrics.errorStepsCount = errCnt;
+      }
+      if (totalDur > 0 && !metrics.durationMs) {
+        metrics.durationMs = totalDur;
+      }
     }
     metricsList.push(metrics);
   }

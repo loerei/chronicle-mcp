@@ -4,6 +4,7 @@ import { setStore, getStore, SqliteHistoryStore } from "../db.js";
 import { SessionData, TurnData, StepData } from "../adapters/types.js";
 import { dotProduct, searchHistory, getSessionDetailsFromDb } from "../search.js";
 import { EMBEDDING_DIMENSION } from "../embeddings.js";
+import { handleChronicleGuide } from "../guide.js";
 
 describe("Chronicle Search Engine Tests", () => {
   let store: SqliteHistoryStore;
@@ -17,6 +18,7 @@ describe("Chronicle Search Engine Tests", () => {
     try {
       store.close();
     } catch {}
+    setStore(null as any);
   });
 
   it("should compute dot products correctly", () => {
@@ -242,7 +244,11 @@ describe("Chronicle Search Engine Tests", () => {
   });
 
   it("should return valid chronicle_guide documentation structure", () => {
-    const guideText = "chronicle-mcp (v1.2.0)";
-    assert.ok(guideText.includes("chronicle-mcp"));
+    const guideRes = handleChronicleGuide();
+    assert.ok(guideRes.content && guideRes.content.length > 0);
+    const parsed = JSON.parse(guideRes.content[0].text);
+    assert.strictEqual(parsed.version, "2.0.0");
+    assert.ok(parsed.content.includes("2-layer turn & step exploration"));
+    assert.ok(parsed.content.includes("flowchart TD"));
   });
 });

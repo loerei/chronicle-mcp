@@ -127,6 +127,10 @@ export interface QueryOptions {
   endConversationStep?: number;
   includeToolResults?: boolean;
   categories?: StepCategory[];
+  category?: StepData["category"];
+  kind?: StepData["kind"];
+  filePath?: string;
+  status?: StepData["status"];
   sort?: StepSortMode;
 }
 
@@ -824,20 +828,21 @@ export class InMemoryHistoryStore implements HistoryStore {
       steps = steps.filter((s) => s.status === options.status);
     }
     if (options.filePath !== undefined) {
-      const fp = options.filePath.toLowerCase();
-      steps = steps.filter((s) => s.filePath?.toLowerCase().includes(fp));
+      const fp = options.filePath.replace(/\\/g, "/").toLowerCase();
+      steps = steps.filter((s) => s.filePath?.replace(/\\/g, "/").toLowerCase().includes(fp));
     }
     if (options.toolName !== undefined || options.serverName !== undefined) {
       steps = steps.filter((s) => {
-        if (s.toolName) {
+        if (options.toolName !== undefined) {
+          if (!s.toolName) return false;
           if (Array.isArray(options.toolName)) {
-            if (!options.toolName.includes(s.toolName)) return false;
-          } else if (options.toolName && s.toolName !== options.toolName) {
+            if (options.toolName.length === 0 || !options.toolName.includes(s.toolName)) return false;
+          } else if (s.toolName !== options.toolName) {
             return false;
           }
         }
-        if (options.serverName && s.serverName !== options.serverName) {
-          return false;
+        if (options.serverName !== undefined) {
+          if (!s.serverName || s.serverName !== options.serverName) return false;
         }
         return true;
       });
@@ -1410,13 +1415,19 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   query(options: QueryOptions): QueryResult {
-    const sessions = this.listSessions({
-      projectPath: options.projectPath,
-      scope: options.scope,
-      timeRange: options.timeRange,
-      limit: options.limit,
-      sortBy: options.sortBy,
-    });
+    let sessions: SessionData[];
+    if (options.sessionId) {
+      const single = this.getSession(options.sessionId);
+      sessions = single ? [single] : [];
+    } else {
+      sessions = this.listSessions({
+        projectPath: options.projectPath,
+        scope: options.scope,
+        timeRange: options.timeRange,
+        limit: options.limit,
+        sortBy: options.sortBy,
+      });
+    }
 
     const sessionIds = new Set(sessions.map((s) => s.id));
     let matchedSteps: StepData[] = [];
@@ -1425,8 +1436,12 @@ export class InMemoryHistoryStore implements HistoryStore {
     for (const sid of sessionIds) {
       const sSteps = this.getSteps(sid, {
         stepIndex: options.stepIndex,
-        category: options.categories ? undefined : undefined,
-        status: options.stepStatus as any,
+        category: options.category,
+        kind: options.kind || undefined,
+        toolName: options.toolName,
+        serverName: options.serverName,
+        filePath: options.filePath,
+        status: (options.stepStatus || options.status) as any,
         includeUndone: options.includeUndone,
       });
       matchedSteps = matchedSteps.concat(sSteps);
@@ -1916,15 +1931,19 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     if (options.filePath !== undefined) {
-      sql += ` AND LOWER(file_path) LIKE ?`;
-      params.push(`%${options.filePath.toLowerCase()}%`);
+      sql += ` AND REPLACE(LOWER(file_path), '\\', '/') LIKE ?`;
+      params.push(`%${options.filePath.replace(/\\/g, "/").toLowerCase()}%`);
     }
 
     if (options.toolName !== undefined) {
       if (Array.isArray(options.toolName)) {
-        const placeholders = options.toolName.map(() => "?").join(",");
-        sql += ` AND tool_name IN (${placeholders})`;
-        params.push(...options.toolName);
+        if (options.toolName.length === 0) {
+          sql += ` AND 1 = 0`;
+        } else {
+          const placeholders = options.toolName.map(() => "?").join(",");
+          sql += ` AND tool_name IN (${placeholders})`;
+          params.push(...options.toolName);
+        }
       } else {
         sql += ` AND tool_name = ?`;
         params.push(options.toolName);
@@ -2003,14 +2022,18 @@ export class SqliteHistoryStore implements HistoryStore {
         params.push(options.status);
       }
       if (options.filePath !== undefined) {
-        sql += ` AND LOWER(file_path) LIKE ?`;
-        params.push(`%${options.filePath.toLowerCase()}%`);
+        sql += ` AND REPLACE(LOWER(file_path), '\\', '/') LIKE ?`;
+        params.push(`%${options.filePath.replace(/\\/g, "/").toLowerCase()}%`);
       }
       if (options.toolName !== undefined) {
         if (Array.isArray(options.toolName)) {
-          const tPlaceholders = options.toolName.map(() => "?").join(",");
-          sql += ` AND tool_name IN (${tPlaceholders})`;
-          params.push(...options.toolName);
+          if (options.toolName.length === 0) {
+            sql += ` AND 1 = 0`;
+          } else {
+            const tPlaceholders = options.toolName.map(() => "?").join(",");
+            sql += ` AND tool_name IN (${tPlaceholders})`;
+            params.push(...options.toolName);
+          }
         } else {
           sql += ` AND tool_name = ?`;
           params.push(options.toolName);
@@ -2641,13 +2664,19 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   query(options: QueryOptions): QueryResult {
-    const sessions = this.listSessions({
-      projectPath: options.projectPath,
-      scope: options.scope,
-      timeRange: options.timeRange,
-      limit: options.limit,
-      sortBy: options.sortBy,
-    });
+    let sessions: SessionData[];
+    if (options.sessionId) {
+      const single = this.getSession(options.sessionId);
+      sessions = single ? [single] : [];
+    } else {
+      sessions = this.listSessions({
+        projectPath: options.projectPath,
+        scope: options.scope,
+        timeRange: options.timeRange,
+        limit: options.limit,
+        sortBy: options.sortBy,
+      });
+    }
 
     const sessionIds = new Set(sessions.map((s) => s.id));
     let matchedSteps: StepData[] = [];
@@ -2656,7 +2685,12 @@ export class SqliteHistoryStore implements HistoryStore {
     for (const sid of sessionIds) {
       const sSteps = this.getSteps(sid, {
         stepIndex: options.stepIndex,
-        status: options.stepStatus as any,
+        category: options.category,
+        kind: options.kind || undefined,
+        toolName: options.toolName,
+        serverName: options.serverName,
+        filePath: options.filePath,
+        status: (options.stepStatus || options.status) as any,
         includeUndone: options.includeUndone,
       });
       matchedSteps = matchedSteps.concat(sSteps);

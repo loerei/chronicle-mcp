@@ -185,4 +185,14 @@ describe("QueryTranscript Unit & Integration Suite", () => {
     });
     assert.ok(res.text.includes("src/index.ts"));
   });
+
+  after(() => {
+    try {
+      store.close();
+    } catch {}
+    setStore(null as any);
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
+  });
 });
