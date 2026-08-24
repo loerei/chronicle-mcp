@@ -20,7 +20,6 @@ import {
   blobToVector,
   cosineSimilarityFloat32,
   EMBEDDING_DIMENSION,
-  EMBEDDING_BLOB_SIZE,
 } from "./embeddings.js";
 
 // ============================================================
@@ -30,7 +29,7 @@ import {
 export interface ListSessionsOptions {
   projectPath?: string;
   scope?: "workspace" | "all";
-  adapter?: "antigravity" | "cursor" | string;
+  adapter?: string;
   parentId?: string;
   role?: string;
   hasErrors?: boolean;
@@ -158,6 +157,8 @@ export interface SearchHistoryFilter {
   timeRange?: string; // "start:end"
 }
 
+export type VectorInput = Float32Array | Buffer | number[];
+
 export interface HistoryStore {
   saveSession(
     session: SessionData,
@@ -191,7 +192,7 @@ export interface HistoryStore {
   ): string[];
   getToolUsageStats(options?: ToolUsageStatsOptions): ToolUsageReport;
   searchTurnsVector(
-    queryVector: Float32Array | Buffer | number[],
+    queryVector: VectorInput,
     limit: number,
     options?: {
       projectPath?: string;
@@ -277,7 +278,7 @@ export function sanitizeFts5Query(queryText: string, onlyUserPrompts = false): s
     return null;
   }
 
-  const quotedTokens = tokens.map((token) => `"${token.replace(/"/g, '""')}"`);
+  const quotedTokens = tokens.map((token) => `"${token.replaceAll('"', '""')}"`);
 
   if (onlyUserPrompts) {
     return `user_prompt : ( ${quotedTokens.join(" ")} )`;
@@ -729,10 +730,12 @@ export class InMemoryHistoryStore implements HistoryStore {
       return timeB - timeA;
     });
 
-    const limit =
-      typeof options.limit === "number" && Number.isFinite(options.limit)
-        ? Math.max(1, Math.floor(options.limit))
-        : (options.offset !== undefined ? 10 : undefined);
+    let limit: number | undefined;
+    if (typeof options.limit === "number" && Number.isFinite(options.limit)) {
+      limit = Math.max(1, Math.floor(options.limit));
+    } else if (options.offset !== undefined) {
+      limit = 10;
+    }
 
     const offset =
       typeof options.offset === "number" && Number.isFinite(options.offset)
@@ -828,8 +831,8 @@ export class InMemoryHistoryStore implements HistoryStore {
       steps = steps.filter((s) => s.status === options.status);
     }
     if (options.filePath !== undefined) {
-      const fp = options.filePath.replace(/\\/g, "/").toLowerCase();
-      steps = steps.filter((s) => s.filePath?.replace(/\\/g, "/").toLowerCase().includes(fp));
+      const fp = options.filePath.replaceAll("\\", "/").toLowerCase();
+      steps = steps.filter((s) => s.filePath?.replaceAll("\\", "/").toLowerCase().includes(fp));
     }
     if (options.toolName !== undefined || options.serverName !== undefined) {
       steps = steps.filter((s) => {
@@ -1189,7 +1192,7 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   searchTurnsVector(
-    queryVector: Float32Array | Buffer | number[],
+    queryVector: VectorInput,
     limit: number,
     options: {
       projectPath?: string;
@@ -1210,22 +1213,18 @@ export class InMemoryHistoryStore implements HistoryStore {
       const session = this.sessionsMap.get(sid);
       if (!session) continue;
 
-      if (resolvedProjectPath !== undefined) {
-        if (
-          !session.projectPath ||
-          !session.projectPath.toLowerCase().includes(resolvedProjectPath.toLowerCase())
-        ) {
-          continue;
-        }
+      if (
+        resolvedProjectPath !== undefined &&
+        !session.projectPath?.toLowerCase().includes(resolvedProjectPath.toLowerCase())
+      ) {
+        continue;
       }
 
-      if (options.filter?.role !== undefined) {
-        if (
-          !session.role ||
-          !session.role.toLowerCase().includes(options.filter.role.toLowerCase())
-        ) {
-          continue;
-        }
+      if (
+        options.filter?.role !== undefined &&
+        !session.role?.toLowerCase().includes(options.filter.role.toLowerCase())
+      ) {
+        continue;
       }
 
       if (options.filter?.onlySubagents === true && !session.parentId) {
@@ -1236,9 +1235,11 @@ export class InMemoryHistoryStore implements HistoryStore {
         if (turn.isUndone) continue;
         if (!turn.turnVector) continue;
 
-        if (options.filter?.hasErrors === true && (turn.errorCount ?? 0) <= 0) {
-          continue;
-        } else if (options.filter?.hasErrors === false && (turn.errorCount ?? 0) > 0) {
+        const errCount = turn.errorCount ?? 0;
+        if (
+          (options.filter?.hasErrors === true && errCount <= 0) ||
+          (options.filter?.hasErrors === false && errCount > 0)
+        ) {
           continue;
         }
 
@@ -1256,7 +1257,7 @@ export class InMemoryHistoryStore implements HistoryStore {
             ? turn.turnVector
             : Float32Array.from(turn.turnVector as number[]);
         const similarity = cosineSimilarityFloat32(floatVec, tVec);
-        const safeSimilarity = isNaN(similarity) ? 0 : similarity;
+        const safeSimilarity = Number.isNaN(similarity) ? 0 : similarity;
 
         results.push({
           sessionId: sid,
@@ -1301,22 +1302,18 @@ export class InMemoryHistoryStore implements HistoryStore {
       const session = this.sessionsMap.get(sid);
       if (!session) continue;
 
-      if (resolvedProjectPath !== undefined) {
-        if (
-          !session.projectPath ||
-          !session.projectPath.toLowerCase().includes(resolvedProjectPath.toLowerCase())
-        ) {
-          continue;
-        }
+      if (
+        resolvedProjectPath !== undefined &&
+        !session.projectPath?.toLowerCase().includes(resolvedProjectPath.toLowerCase())
+      ) {
+        continue;
       }
 
-      if (options.filter?.role !== undefined) {
-        if (
-          !session.role ||
-          !session.role.toLowerCase().includes(options.filter.role.toLowerCase())
-        ) {
-          continue;
-        }
+      if (
+        options.filter?.role !== undefined &&
+        !session.role?.toLowerCase().includes(options.filter.role.toLowerCase())
+      ) {
+        continue;
       }
 
       if (options.filter?.onlySubagents === true && !session.parentId) {
@@ -1326,9 +1323,11 @@ export class InMemoryHistoryStore implements HistoryStore {
       for (const turn of turns) {
         if (turn.isUndone) continue;
 
-        if (options.filter?.hasErrors === true && (turn.errorCount ?? 0) <= 0) {
-          continue;
-        } else if (options.filter?.hasErrors === false && (turn.errorCount ?? 0) > 0) {
+        const errCount = turn.errorCount ?? 0;
+        if (
+          (options.filter?.hasErrors === true && errCount <= 0) ||
+          (options.filter?.hasErrors === false && errCount > 0)
+        ) {
           continue;
         }
 
@@ -1394,64 +1393,11 @@ export class InMemoryHistoryStore implements HistoryStore {
   // ============================================================
 
   save(session: SessionData, embeddings?: SessionEmbeddings): void {
-    const turns: TurnData[] = [];
-    const steps: StepData[] = session.steps || [];
-
-    if (session.chunks && session.chunks.length > 0) {
-      let idx = 1;
-      for (const chunk of session.chunks) {
-        const vec = embeddings?.chunks.get(chunk.stepIndex);
-        turns.push({
-          turnIndex: idx++,
-          userPrompt: chunk.text,
-          assistantResponse: "",
-          turnText: chunk.text,
-          turnVector: vec ? Float32Array.from(vec) : new Float32Array(EMBEDDING_DIMENSION),
-        });
-      }
-    }
-
-    this.saveSession(session, turns, steps);
+    legacySaveShim(this, session, embeddings);
   }
 
   query(options: QueryOptions): QueryResult {
-    let sessions: SessionData[];
-    if (options.sessionId) {
-      const single = this.getSession(options.sessionId);
-      sessions = single ? [single] : [];
-    } else {
-      sessions = this.listSessions({
-        projectPath: options.projectPath,
-        scope: options.scope,
-        timeRange: options.timeRange,
-        limit: options.limit,
-        sortBy: options.sortBy,
-      });
-    }
-
-    const sessionIds = new Set(sessions.map((s) => s.id));
-    let matchedSteps: StepData[] = [];
-    const matchedChunks: ChunkData[] = [];
-
-    for (const sid of sessionIds) {
-      const sSteps = this.getSteps(sid, {
-        stepIndex: options.stepIndex,
-        category: options.category,
-        kind: options.kind || undefined,
-        toolName: options.toolName,
-        serverName: options.serverName,
-        filePath: options.filePath,
-        status: (options.stepStatus || options.status) as any,
-        includeUndone: options.includeUndone,
-      });
-      matchedSteps = matchedSteps.concat(sSteps);
-    }
-
-    return {
-      sessions,
-      steps: matchedSteps,
-      chunks: matchedChunks,
-    };
+    return legacyQueryShim(this, options);
   }
 
   search(
@@ -1459,16 +1405,7 @@ export class InMemoryHistoryStore implements HistoryStore {
     limit: number,
     options?: { projectPath?: string; scope?: "workspace" | "all" }
   ): SearchResult[] {
-    const results = this.searchTurnsVector(queryVector, limit, options);
-    return results.map((r) => ({
-      sessionId: r.sessionId,
-      adapter: "antigravity",
-      title: r.title,
-      projectPath: r.projectPath,
-      stepIndex: r.turnIndex,
-      chunkText: r.userPrompt,
-      similarity: r.similarity,
-    }));
+    return legacySearchShim(this, queryVector, limit, options);
   }
 }
 
@@ -1769,10 +1706,12 @@ export class SqliteHistoryStore implements HistoryStore {
     const sortBy = options.sortBy || "active";
     sql += sortBy === "created" ? " ORDER BY created_at DESC" : " ORDER BY last_active_at DESC";
 
-    const limit =
-      typeof options.limit === "number" && Number.isFinite(options.limit)
-        ? Math.max(1, Math.floor(options.limit))
-        : (options.offset !== undefined ? 10 : undefined);
+    let limit: number | undefined;
+    if (typeof options.limit === "number" && Number.isFinite(options.limit)) {
+      limit = Math.max(1, Math.floor(options.limit));
+    } else if (options.offset !== undefined) {
+      limit = 10;
+    }
 
     const offset =
       typeof options.offset === "number" && Number.isFinite(options.offset)
@@ -1931,8 +1870,8 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     if (options.filePath !== undefined) {
-      sql += ` AND REPLACE(LOWER(file_path), '\\', '/') LIKE ?`;
-      params.push(`%${options.filePath.replace(/\\/g, "/").toLowerCase()}%`);
+      sql += ` AND REPLACE(LOWER(file_path), char(92), '/') LIKE ?`;
+      params.push(`%${options.filePath.replaceAll("\\", "/").toLowerCase()}%`);
     }
 
     if (options.toolName !== undefined) {
@@ -2022,8 +1961,8 @@ export class SqliteHistoryStore implements HistoryStore {
         params.push(options.status);
       }
       if (options.filePath !== undefined) {
-        sql += ` AND REPLACE(LOWER(file_path), '\\', '/') LIKE ?`;
-        params.push(`%${options.filePath.replace(/\\/g, "/").toLowerCase()}%`);
+        sql += ` AND REPLACE(LOWER(file_path), char(92), '/') LIKE ?`;
+        params.push(`%${options.filePath.replaceAll("\\", "/").toLowerCase()}%`);
       }
       if (options.toolName !== undefined) {
         if (Array.isArray(options.toolName)) {
@@ -2450,7 +2389,7 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   searchTurnsVector(
-    queryVector: Float32Array | Buffer | number[],
+    queryVector: VectorInput,
     limit: number,
     options: {
       projectPath?: string;
@@ -2516,7 +2455,7 @@ export class SqliteHistoryStore implements HistoryStore {
       if (!row.turn_vector) continue;
       const turnVec = blobToVector(row.turn_vector);
       const similarity = cosineSimilarityFloat32(floatVec, turnVec);
-      const safeSimilarity = isNaN(similarity) ? 0 : similarity;
+      const safeSimilarity = Number.isNaN(similarity) ? 0 : similarity;
 
       results.push({
         sessionId: row.session_id,
@@ -2643,64 +2582,11 @@ export class SqliteHistoryStore implements HistoryStore {
   // ============================================================
 
   save(session: SessionData, embeddings?: SessionEmbeddings): void {
-    const turns: TurnData[] = [];
-    const steps: StepData[] = session.steps || [];
-
-    if (session.chunks && session.chunks.length > 0) {
-      let idx = 1;
-      for (const chunk of session.chunks) {
-        const vec = embeddings?.chunks.get(chunk.stepIndex);
-        turns.push({
-          turnIndex: idx++,
-          userPrompt: chunk.text,
-          assistantResponse: "",
-          turnText: chunk.text,
-          turnVector: vec ? Float32Array.from(vec) : new Float32Array(EMBEDDING_DIMENSION),
-        });
-      }
-    }
-
-    this.saveSession(session, turns, steps);
+    legacySaveShim(this, session, embeddings);
   }
 
   query(options: QueryOptions): QueryResult {
-    let sessions: SessionData[];
-    if (options.sessionId) {
-      const single = this.getSession(options.sessionId);
-      sessions = single ? [single] : [];
-    } else {
-      sessions = this.listSessions({
-        projectPath: options.projectPath,
-        scope: options.scope,
-        timeRange: options.timeRange,
-        limit: options.limit,
-        sortBy: options.sortBy,
-      });
-    }
-
-    const sessionIds = new Set(sessions.map((s) => s.id));
-    let matchedSteps: StepData[] = [];
-    const matchedChunks: ChunkData[] = [];
-
-    for (const sid of sessionIds) {
-      const sSteps = this.getSteps(sid, {
-        stepIndex: options.stepIndex,
-        category: options.category,
-        kind: options.kind || undefined,
-        toolName: options.toolName,
-        serverName: options.serverName,
-        filePath: options.filePath,
-        status: (options.stepStatus || options.status) as any,
-        includeUndone: options.includeUndone,
-      });
-      matchedSteps = matchedSteps.concat(sSteps);
-    }
-
-    return {
-      sessions,
-      steps: matchedSteps,
-      chunks: matchedChunks,
-    };
+    return legacyQueryShim(this, options);
   }
 
   search(
@@ -2708,15 +2594,92 @@ export class SqliteHistoryStore implements HistoryStore {
     limit: number,
     options?: { projectPath?: string; scope?: "workspace" | "all" }
   ): SearchResult[] {
-    const results = this.searchTurnsVector(queryVector, limit, options);
-    return results.map((r) => ({
-      sessionId: r.sessionId,
-      adapter: "antigravity",
-      title: r.title,
-      projectPath: r.projectPath,
-      stepIndex: r.turnIndex,
-      chunkText: r.userPrompt,
-      similarity: r.similarity,
-    }));
+    return legacySearchShim(this, queryVector, limit, options);
   }
+}
+
+export function legacySaveShim(
+  store: HistoryStore,
+  session: SessionData,
+  embeddings?: SessionEmbeddings
+): void {
+  const turns: TurnData[] = [];
+  const steps: StepData[] = session.steps || [];
+
+  if (session.chunks && session.chunks.length > 0) {
+    let idx = 1;
+    for (const chunk of session.chunks) {
+      const vec = embeddings?.chunks.get(chunk.stepIndex);
+      turns.push({
+        turnIndex: idx++,
+        userPrompt: chunk.text,
+        assistantResponse: "",
+        turnText: chunk.text,
+        turnVector: vec ? Float32Array.from(vec) : new Float32Array(EMBEDDING_DIMENSION),
+      });
+    }
+  }
+
+  store.saveSession(session, turns, steps);
+}
+
+export function legacyQueryShim(
+  store: HistoryStore,
+  options: QueryOptions
+): QueryResult {
+  let sessions: SessionData[];
+  if (options.sessionId) {
+    const single = store.getSession(options.sessionId);
+    sessions = single ? [single] : [];
+  } else {
+    sessions = store.listSessions({
+      projectPath: options.projectPath,
+      scope: options.scope,
+      timeRange: options.timeRange,
+      limit: options.limit,
+      sortBy: options.sortBy,
+    });
+  }
+
+  const sessionIds = new Set(sessions.map((s) => s.id));
+  let matchedSteps: StepData[] = [];
+  const matchedChunks: ChunkData[] = [];
+
+  for (const sid of sessionIds) {
+    const sSteps = store.getSteps(sid, {
+      stepIndex: options.stepIndex,
+      category: options.category,
+      kind: options.kind || undefined,
+      toolName: options.toolName,
+      serverName: options.serverName,
+      filePath: options.filePath,
+      status: (options.stepStatus || options.status) as any,
+      includeUndone: options.includeUndone,
+    });
+    matchedSteps = matchedSteps.concat(sSteps);
+  }
+
+  return {
+    sessions,
+    steps: matchedSteps,
+    chunks: matchedChunks,
+  };
+}
+
+export function legacySearchShim(
+  store: HistoryStore,
+  queryVector: number[],
+  limit: number,
+  options?: { projectPath?: string; scope?: "workspace" | "all" }
+): SearchResult[] {
+  const results = store.searchTurnsVector(queryVector, limit, options);
+  return results.map((r) => ({
+    sessionId: r.sessionId,
+    adapter: "antigravity",
+    title: r.title,
+    projectPath: r.projectPath,
+    stepIndex: r.turnIndex,
+    chunkText: r.userPrompt,
+    similarity: r.similarity,
+  }));
 }

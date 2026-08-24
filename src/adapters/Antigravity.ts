@@ -24,14 +24,14 @@ export function discoverBrainArtifacts(sessionBrainDir: string): string[] {
       }
     }
 
-    return artifacts.sort();
+    return artifacts.sort((a, b) => a.localeCompare(b));
   } catch {
     return [];
   }
 }
 
 export class AntigravityAdapter implements HistoryAdapter {
-  name = "antigravity";
+  readonly name = "antigravity";
   private brainDir: string;
 
   constructor(brainDir?: string) {

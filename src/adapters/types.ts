@@ -18,15 +18,15 @@ export interface SessionData {
   metadata?: Record<string, any>;
   turns?: TurnData[];
 
-  /** @deprecated Transitional property for legacy module compatibility during S1 */
+  /** Transitional property for legacy module compatibility during S1 */
   secondPrompt?: any;
-  /** @deprecated Transitional property for legacy module compatibility during S1 */
+  /** Transitional property for legacy module compatibility during S1 */
   chunks?: any;
-  /** @deprecated Transitional property for legacy module compatibility during S1 */
+  /** Transitional property for legacy module compatibility during S1 */
   steps?: StepData[];
-  /** @deprecated Transitional property for legacy module compatibility during S1 */
+  /** Transitional property for legacy module compatibility during S1 */
   subagentIds?: string[];
-  /** @deprecated Transitional property for legacy module compatibility during S1 */
+  /** Transitional property for legacy module compatibility during S1 */
   childSessionIds?: string[];
 }
 
@@ -69,15 +69,15 @@ export interface StepData {
   createdAt?: number;
   isUndone?: boolean;
 
-  /** @deprecated Transitional property for legacy step compatibility during S1 */
+  /** Transitional property for legacy step compatibility during S1 */
   type?: any;
-  /** @deprecated Transitional property for legacy step compatibility during S1 */
+  /** Transitional property for legacy step compatibility during S1 */
   source?: any;
-  /** @deprecated Transitional property for legacy step compatibility during S1 */
+  /** Transitional property for legacy step compatibility during S1 */
   toolCalls?: any;
 }
 
-/** @deprecated Transitional interface for legacy chunk compatibility during S1 */
+/** Transitional interface for legacy chunk compatibility during S1 */
 export interface ChunkData {
   stepIndex: number;
   text: string;
@@ -110,19 +110,19 @@ export interface TranscriptQueryOptions {
   limit?: number;
   output?: string;
 
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   startStep?: number;
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   endStep?: number;
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   startConversationStep?: number;
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   endConversationStep?: number;
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   categories?: string[];
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   sources?: string[];
-  /** @deprecated Transitional property for legacy query compatibility */
+  /** Transitional property for legacy query compatibility */
   sort?: string;
 }
 

@@ -10,9 +10,7 @@ const RE_USER_REQUEST_TAGS = /<\/?USER_REQUEST\b[^>]*>/gi;
 let cachedTokenizer: Tiktoken | null = null;
 
 function getTokenizer(): Tiktoken {
-  if (!cachedTokenizer) {
-    cachedTokenizer = getEncoding("cl100k_base");
-  }
+  cachedTokenizer ??= getEncoding("cl100k_base");
   return cachedTokenizer;
 }
 
@@ -204,10 +202,12 @@ function extractProjectPathFromToolCalls(toolCalls: any[]): string | null {
   return null;
 }
 
+export type ParserToolKind = "mcp" | "command" | "native" | "subagent";
+
 interface PendingToolCall {
   toolName: string;
   serverName?: string;
-  kind?: "mcp" | "command" | "native" | "subagent";
+  kind?: ParserToolKind;
   filePath?: string;
   toolArgs?: string;
   stepIndex: number;
@@ -215,7 +215,7 @@ interface PendingToolCall {
   isUndone?: boolean;
 }
 
-function inferToolKind(toolName: string, serverName?: string): "mcp" | "command" | "native" | "subagent" {
+function inferToolKind(toolName: string, serverName?: string): ParserToolKind {
   const lowerTool = (toolName || "").toLowerCase();
   const lowerServer = (serverName || "").toLowerCase();
 
@@ -492,7 +492,7 @@ export class SessionParser {
         }
 
         // Emit agent step iff non-empty content or thinking exists
-        if (content.trim() || (thinking && thinking.trim())) {
+        if (content.trim() || thinking?.trim()) {
           activeTurn.steps.push({
             stepIndex,
             turnIndex: activeTurn.turnIndex,
@@ -551,8 +551,17 @@ export class SessionParser {
 
         // Extract execution details
         const toolResult = normalizePayload(raw.content || raw.result || raw.output || undefined);
-        const exitCode = typeof raw.exit_code === "number" ? raw.exit_code : (stepStatus === "ERROR" ? 1 : 0);
-        const errorMessage = stepStatus === "ERROR" ? (raw.error || raw.error_message || (exitCode !== 0 ? `Process exited with code ${exitCode}` : undefined)) : undefined;
+        let exitCode = 0;
+        if (typeof raw.exit_code === "number") {
+          exitCode = raw.exit_code;
+        } else if (stepStatus === "ERROR") {
+          exitCode = 1;
+        }
+
+        let errorMessage: string | undefined = undefined;
+        if (stepStatus === "ERROR") {
+          errorMessage = raw.error || raw.error_message || (exitCode !== 0 ? `Process exited with code ${exitCode}` : undefined);
+        }
 
         let subagentSessionId: string | undefined = undefined;
         if (raw.content && typeof raw.content === "string") {
@@ -655,7 +664,7 @@ export class SessionParser {
       const toolCount = executionSteps.length;
       const errorCount = executionSteps.filter(s => s.status === "ERROR" || (s.exitCode && s.exitCode !== 0)).length;
 
-      const stepTimestamps = t.steps.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !isNaN(ts));
+      const stepTimestamps = t.steps.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !Number.isNaN(ts));
       const durationMs = stepTimestamps.length >= 2 ? Math.max(0, Math.max(...stepTimestamps) - Math.min(...stepTimestamps)) : 0;
 
       const turnObj: TurnData = {
@@ -698,7 +707,7 @@ export class SessionParser {
     const secondPrompt = activeTurns[1]?.userPrompt || finalTurns[1]?.userPrompt || "";
     const title = this.getSessionTitle(sessionId, localTitleMap, firstPrompt);
 
-    const allTimestamps = allStepsFlat.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !isNaN(ts));
+    const allTimestamps = allStepsFlat.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !Number.isNaN(ts));
     const lastActiveAt = allTimestamps.length > 0 ? Math.max(...allTimestamps) : (sessionCreatedAt || Date.now());
 
     return {
@@ -742,7 +751,6 @@ export class SessionParser {
       if (!msg) continue;
 
       const isUser = msg.type === 1 || msg.type === "user" || msg.sender === "user";
-      const isAI = msg.type === 2 || msg.type === "ai" || msg.sender === "ai" || msg.sender === "assistant";
 
       if (isUser) {
         turnCounter += 1;
@@ -775,7 +783,7 @@ export class SessionParser {
               assistantThinking = typeof nextMsg.thinking === "string" ? nextMsg.thinking : nextMsg.thinking.text;
             }
 
-            if (assistantText.trim() || (assistantThinking && assistantThinking.trim())) {
+            if (assistantText.trim() || assistantThinking?.trim()) {
               turnSteps.push({
                 stepIndex: stepIndexCounter++,
                 turnIndex: turnCounter,
@@ -869,7 +877,7 @@ export class SessionParser {
     const totalSteps = allSteps.length;
     const totalTokens = turns.reduce((sum, t) => sum + (t.inputTokens || 0) + (t.outputTokens || 0) + (t.thinkingTokens || 0), 0);
 
-    const stepTimestamps = allSteps.map(s => s.createdAt).filter((t): t is number => typeof t === "number" && !isNaN(t));
+    const stepTimestamps = allSteps.map(s => s.createdAt).filter((t): t is number => typeof t === "number" && !Number.isNaN(t));
     const lastActiveAt = stepTimestamps.length > 0 ? Math.max(...stepTimestamps) : defaultCreatedAt;
 
     return {

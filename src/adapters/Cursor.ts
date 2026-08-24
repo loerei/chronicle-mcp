@@ -6,7 +6,7 @@ import { SessionData, HistoryAdapter } from "./types.js";
 import { SessionParser } from "./SessionParser.js";
 
 export class CursorAdapter implements HistoryAdapter {
-  name = "cursor";
+  readonly name = "cursor";
   private customDbPath?: string;
   private customDb?: DatabaseSync;
 
@@ -180,7 +180,6 @@ export class CursorAdapter implements HistoryAdapter {
 
     if (this.customDb) {
       db = this.customDb;
-      shouldClose = false;
     } else {
       const dbPath = this.getDbPath();
       if (!fs.existsSync(dbPath)) {

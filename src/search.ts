@@ -4,7 +4,6 @@ import {
   getStore,
   SearchResult as DbSearchResult,
   SearchHistoryFilter,
-  StepCategory,
 } from "./db.js";
 import { getEmbeddingClient } from "./embeddings.js";
 import {
@@ -140,7 +139,7 @@ export async function searchHistory(
   const mode = options.mode || "hybrid";
   const limit = Math.max(
     1,
-    typeof options.limit === "number" && !isNaN(options.limit)
+    typeof options.limit === "number" && !Number.isNaN(options.limit)
       ? options.limit
       : 5
   );
@@ -377,12 +376,10 @@ export async function queryTranscript(
       } else {
         slicedTurns = [];
       }
+    } else if (options.turnIndex <= T) {
+      slicedTurns = [allTurns[options.turnIndex - 1]];
     } else {
-      if (options.turnIndex <= T) {
-        slicedTurns = [allTurns[options.turnIndex - 1]];
-      } else {
-        slicedTurns = [];
-      }
+      slicedTurns = [];
     }
   } else if (options.lastTurns !== undefined) {
     if (options.lastTurns <= 0) {
@@ -394,18 +391,14 @@ export async function queryTranscript(
     options.startTurn !== undefined ||
     options.endTurn !== undefined
   ) {
-    const start =
-      options.startTurn !== undefined
-        ? options.startTurn < 0
-          ? Math.max(1, T + 1 + options.startTurn)
-          : Math.max(1, options.startTurn)
-        : 1;
-    const end =
-      options.endTurn !== undefined
-        ? options.endTurn < 0
-          ? Math.min(T, Math.max(1, T + 1 + options.endTurn))
-          : Math.min(T, options.endTurn)
-        : T;
+    let start = 1;
+    if (options.startTurn !== undefined) {
+      start = options.startTurn < 0 ? Math.max(1, T + 1 + options.startTurn) : Math.max(1, options.startTurn);
+    }
+    let end = T;
+    if (options.endTurn !== undefined) {
+      end = options.endTurn < 0 ? Math.min(T, Math.max(1, T + 1 + options.endTurn)) : Math.min(T, options.endTurn);
+    }
 
     if (start <= end) {
       slicedTurns = allTurns.slice(start - 1, end);
@@ -450,7 +443,7 @@ export async function queryTranscript(
     !options.include || options.include.includes("system_events");
 
   const normalizedFilePath = options.filePath
-    ? options.filePath.replace(/\\/g, "/").toLowerCase()
+    ? options.filePath.replaceAll("\\", "/").toLowerCase()
     : undefined;
 
   const toolFilter = options.toolFilter;
@@ -461,8 +454,7 @@ export async function queryTranscript(
     outputSections.push(cappedNotice);
   }
 
-  for (let i = 0; i < slicedTurns.length; i++) {
-    const turn = slicedTurns[i];
+  for (const turn of slicedTurns) {
     const unifiedIndex = turn.unifiedTurnIndex;
 
     let header = `### [Turn ${unifiedIndex}]`;
@@ -492,7 +484,7 @@ export async function queryTranscript(
 
         if (normalizedFilePath) {
           if (!step.filePath) return false;
-          const stepFp = step.filePath.replace(/\\/g, "/").toLowerCase();
+          const stepFp = step.filePath.replaceAll("\\", "/").toLowerCase();
           if (!stepFp.includes(normalizedFilePath)) return false;
         }
 
@@ -506,24 +498,21 @@ export async function queryTranscript(
           }
           if (toolFilter.server) {
             if (
-              !step.serverName ||
-              step.serverName.toLowerCase() !== toolFilter.server.toLowerCase()
+              step.serverName?.toLowerCase() !== toolFilter.server.toLowerCase()
             ) {
               return false;
             }
           }
           if (toolFilter.status) {
             if (
-              !step.status ||
-              step.status.toLowerCase() !== toolFilter.status.toLowerCase()
+              step.status?.toLowerCase() !== toolFilter.status.toLowerCase()
             ) {
               return false;
             }
           }
           if (toolFilter.kind) {
             if (
-              !step.kind ||
-              step.kind.toLowerCase() !== toolFilter.kind.toLowerCase()
+              step.kind?.toLowerCase() !== toolFilter.kind.toLowerCase()
             ) {
               return false;
             }
@@ -572,7 +561,7 @@ export async function queryTranscript(
     // detailLevel === "full"
     for (const step of turnSteps) {
       if (step.thinking && hasThinking) {
-        outputSections.push(`> [!NOTE] Thinking\n> ${step.thinking.replace(/\n/g, "\n> ")}`);
+        outputSections.push(`> [!NOTE] Thinking\n> ${step.thinking.replaceAll("\n", "\n> ")}`);
       }
 
       if (step.category === "execution") {

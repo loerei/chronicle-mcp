@@ -102,6 +102,7 @@ describe("QueryTranscript Unit & Integration Suite", () => {
     try {
       store.close();
     } catch {}
+    setStore(null as any);
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {}
@@ -184,15 +185,5 @@ describe("QueryTranscript Unit & Integration Suite", () => {
       filePath: "src/index.ts",
     });
     assert.ok(res.text.includes("src/index.ts"));
-  });
-
-  after(() => {
-    try {
-      store.close();
-    } catch {}
-    setStore(null as any);
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    } catch {}
   });
 });

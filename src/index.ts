@@ -8,9 +8,9 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
-import { getStore, getDb, StepCategory, StepSortMode } from "./db.js";
+import { getStore, getDb, type StepCategory, type StepSortMode } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
-import { SessionData, TurnData } from "./adapters/types.js";
+import type { TurnData } from "./adapters/types.js";
 import { getEmbeddingClient } from "./embeddings.js";
 import {
   searchHistory,
@@ -1019,13 +1019,13 @@ export async function handleGetSessionArtifacts(
   }
 
   if (descriptors.length === 0) {
+    const subtreeSuffix = includeSubtree ? " (including subtree)" : "";
+    const filterSuffix = artifactNameFilter ? ` matching "${artifactNameFilter}"` : "";
     return {
       content: [
         {
           type: "text",
-          text: `No markdown artifacts found for session "${sessionId}"${
-            includeSubtree ? " (including subtree)" : ""
-          }${artifactNameFilter ? ` matching "${artifactNameFilter}"` : ""}.`,
+          text: `No markdown artifacts found for session "${sessionId}"${subtreeSuffix}${filterSuffix}.`,
         },
       ],
     };

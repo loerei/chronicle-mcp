@@ -82,7 +82,7 @@ export function cosineSimilarityFloat32(
   }
 
   const sim = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-  return isNaN(sim) ? 0 : sim;
+  return Number.isNaN(sim) ? 0 : sim;
 }
 
 let extractor: any = null;
@@ -119,7 +119,7 @@ export class TransformersEmbeddingClient implements EmbeddingClient {
 }
 
 export class MockEmbeddingClient implements EmbeddingClient {
-  private mockVectors: Map<string, number[]> = new Map();
+  private readonly mockVectors: Map<string, number[]> = new Map();
   private dimension: number = EMBEDDING_DIMENSION;
 
   constructor(dimension: number = EMBEDDING_DIMENSION) {
@@ -152,8 +152,7 @@ export class MockEmbeddingClient implements EmbeddingClient {
       const vec = new Array(this.dimension).fill(0);
       let hash = 0;
       for (let i = 0; i < text.length; i++) {
-        hash = (hash << 5) - hash + text.charCodeAt(i);
-        hash |= 0;
+        hash = Math.trunc((hash << 5) - hash + (text.codePointAt(i) || 0));
       }
       const val = ((Math.abs(hash) % 1000) + 1) / 1001;
       vec[0] = val;
