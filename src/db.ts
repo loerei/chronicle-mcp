@@ -409,6 +409,26 @@ function applySqliteTurnFilters(
   return sql;
 }
 
+function buildToolUsageReport(
+  tools: PerToolStat[],
+  thrashingTools: ThrashingTool[],
+  totalCalls: number,
+  totalErrors: number
+): ToolUsageReport {
+  const overallFailureRate =
+    totalCalls > 0 ? Math.round((totalErrors * 1000.0) / totalCalls) / 10.0 : 0.0;
+
+  return {
+    summary: {
+      totalCalls,
+      totalErrors,
+      overallFailureRate,
+    },
+    tools,
+    thrashingTools,
+  };
+}
+
 /**
  * Sanitizes and formats a raw text string into a safe SQLite FTS5 MATCH expression.
  * Escapes internal quotes, strips empty tokens, and supports column-group isolation.
@@ -1326,18 +1346,7 @@ export class InMemoryHistoryStore implements HistoryStore {
       .filter((t) => t.consecutiveFailures >= 3)
       .sort((a, b) => b.consecutiveFailures - a.consecutiveFailures);
 
-    const overallFailureRate =
-      totalCalls > 0 ? Math.round((totalErrors * 1000.0) / totalCalls) / 10.0 : 0.0;
-
-    return {
-      summary: {
-        totalCalls,
-        totalErrors,
-        overallFailureRate,
-      },
-      tools,
-      thrashingTools,
-    };
+    return buildToolUsageReport(tools, thrashingTools, totalCalls, totalErrors);
   }
 
   searchTurnsVector(
@@ -2348,18 +2357,7 @@ export class SqliteHistoryStore implements HistoryStore {
       sampleError: r.sample_error ?? undefined,
     }));
 
-    const overallFailureRate =
-      totalCalls > 0 ? Math.round((totalErrors * 1000.0) / totalCalls) / 10.0 : 0.0;
-
-    return {
-      summary: {
-        totalCalls,
-        totalErrors,
-        overallFailureRate,
-      },
-      tools,
-      thrashingTools,
-    };
+    return buildToolUsageReport(tools, thrashingTools, totalCalls, totalErrors);
   }
 
   searchTurnsVector(
