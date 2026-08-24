@@ -12,6 +12,7 @@ import {
   SessionData,
   TurnData,
   StepData,
+  PerToolStat,
 } from "../adapters/types.js";
 import {
   vectorToBlob,
@@ -522,6 +523,103 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.ok(rootSubtree.includes("brain/child/plan.md"));
       assert.ok(rootSubtree.includes("brain/grandchild/report.md"));
       assert.ok(rootSubtree.includes("brain/shared/notes.md"));
+
+      // 3. Artifact descriptors with session attribution and substring filtering
+      const descriptors = store.getArtifactDescriptors("sess-root-art", true, "plan");
+      assert.strictEqual(descriptors.length, 1);
+      assert.strictEqual(descriptors[0].sessionId, "sess-child-art");
+      assert.strictEqual(descriptors[0].filename, "brain/child/plan.md");
+
+      store.close();
+    });
+
+    it("should compute per-tool execution statistics and detect thrash loops", () => {
+      const store = storeFactory();
+
+      const session: SessionData = {
+        id: "sess-tool-stats",
+        adapter: "antigravity",
+        title: "Stats Session",
+        projectPath: "d:/projects/stats",
+        createdAt: 1700000000000,
+        lastActiveAt: 1700000010000,
+        firstPrompt: "fix bug",
+      };
+
+      const turns: TurnData[] = [
+        {
+          turnIndex: 1,
+          userPrompt: "fix bug",
+          assistantResponse: "fixing bug",
+          turnText: "fix bug",
+          toolCount: 4,
+          errorCount: 3,
+        },
+      ];
+
+      const steps: StepData[] = [
+        {
+          stepIndex: 1,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "patch_file",
+          serverName: "patchitright",
+          filePath: "src/broken.ts",
+          status: "ERROR",
+          errorMessage: "Patch target mismatch at line 42",
+          toolDurationMs: 120,
+        },
+        {
+          stepIndex: 2,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "patch_file",
+          serverName: "patchitright",
+          filePath: "src/broken.ts",
+          status: "ERROR",
+          errorMessage: "Patch target mismatch at line 42",
+          toolDurationMs: 150,
+        },
+        {
+          stepIndex: 3,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "patch_file",
+          serverName: "patchitright",
+          filePath: "src/broken.ts",
+          status: "ERROR",
+          errorMessage: "Patch target mismatch at line 42",
+          toolDurationMs: 140,
+        },
+        {
+          stepIndex: 4,
+          turnIndex: 1,
+          category: "execution",
+          toolName: "view_file",
+          status: "DONE",
+          filePath: "src/broken.ts",
+          toolDurationMs: 50,
+        },
+      ];
+
+      store.saveSession(session, turns, steps);
+
+      const report = store.getToolUsageStats({ projectPath: "d:/projects/stats" });
+      assert.strictEqual(report.summary.totalCalls, 4);
+      assert.strictEqual(report.summary.totalErrors, 3);
+
+      const patchStat = report.tools.find(
+        (s: PerToolStat) => s.toolName === "patch_file" && s.serverName === "patchitright"
+      );
+      assert.ok(patchStat);
+      assert.strictEqual(patchStat.totalCalls, 3);
+      assert.strictEqual(patchStat.errorCount, 3);
+      assert.strictEqual(patchStat.failureRate, 100);
+
+      // Thrashing detected (>=3 consecutive failures on same tool)
+      assert.strictEqual(report.thrashingTools.length, 1);
+      assert.strictEqual(report.thrashingTools[0].toolName, "patch_file");
+      assert.strictEqual(report.thrashingTools[0].consecutiveFailures, 3);
 
       store.close();
     });

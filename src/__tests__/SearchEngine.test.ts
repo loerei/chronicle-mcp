@@ -395,12 +395,12 @@ describe("SearchEngine & Progressive Disclosure Test Suite", () => {
     assert.ok(resLast2.text.includes("[Turn 5]"));
     assert.ok(!resLast2.text.includes("[Turn 3]"));
 
-    // Out-of-bounds negative index clamps cleanly to Turn 1
+    // Out-of-bounds negative index returns empty string
     const resClamp = await queryTranscript({
       sessionId: "sess-slice-1",
       turnIndex: -999,
     });
-    assert.ok(resClamp.text.includes("[Turn 1]"));
+    assert.strictEqual(resClamp.text, "");
   });
 
   // Scenario 6: Empty Session & Safety Cap Retrieval

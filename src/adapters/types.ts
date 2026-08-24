@@ -216,3 +216,45 @@ export interface SessionBenchmarkMetrics {
   errorStepsCount: number;
   hasDetailedSteps: boolean;
 }
+
+
+export interface ArtifactDescriptor {
+  sessionId: string;
+  filename: string;
+}
+
+export interface ToolUsageStatsOptions {
+  limit?: number;
+  projectPath?: string;
+  scope?: "workspace" | "all";
+  timeRange?: string;
+}
+
+export interface PerToolStat {
+  serverName: string;
+  toolName: string;
+  totalCalls: number;
+  errorCount: number;
+  successCount: number;
+  failureRate: number;
+  avgDurationMs: number;
+}
+
+export interface ThrashingTool {
+  sessionId: string;
+  turnIndex: number;
+  serverName: string;
+  toolName: string;
+  consecutiveFailures: number;
+  sampleError?: string;
+}
+
+export interface ToolUsageReport {
+  summary: {
+    totalCalls: number;
+    totalErrors: number;
+    overallFailureRate: number;
+  };
+  tools: PerToolStat[];
+  thrashingTools: ThrashingTool[];
+}

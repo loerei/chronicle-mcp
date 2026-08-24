@@ -7,7 +7,13 @@ import {
   StepCategory,
 } from "./db.js";
 import { getEmbeddingClient } from "./embeddings.js";
-import { SessionBenchmarkMetrics, StepData, TurnData } from "./adapters/types.js";
+import {
+  SessionBenchmarkMetrics,
+  StepData,
+  TurnData,
+  ToolUsageStatsOptions,
+  ToolUsageReport,
+} from "./adapters/types.js";
 import { getEncoding } from "js-tiktoken";
 
 const encoder = getEncoding("cl100k_base");
@@ -291,6 +297,7 @@ export async function queryTranscript(
 
   interface AnnotatedTurn extends TurnData {
     localTurnIndex: number;
+    unifiedTurnIndex: number;
     sessionId: string;
     role?: string;
     sessionTitle?: string;
@@ -309,6 +316,7 @@ export async function queryTranscript(
         allTurns.push({
           ...turn,
           localTurnIndex: turn.turnIndex,
+          unifiedTurnIndex: 0,
           sessionId: sid,
           role: sess?.role,
           sessionTitle: sess?.title,
@@ -323,14 +331,18 @@ export async function queryTranscript(
       if (sessDiff !== 0) return sessDiff;
       return a.turnIndex - b.turnIndex;
     });
+    for (let i = 0; i < allTurns.length; i++) {
+      allTurns[i].unifiedTurnIndex = i + 1;
+    }
   } else {
     const sess = store.getSession(targetSessionId);
     const turns = store.getTurns(targetSessionId, {
       includeUndone: options.includeUndone,
     });
-    allTurns = turns.map((turn) => ({
+    allTurns = turns.map((turn, idx) => ({
       ...turn,
       localTurnIndex: turn.turnIndex,
+      unifiedTurnIndex: idx + 1,
       sessionId: targetSessionId!,
       role: sess?.role,
       sessionTitle: sess?.title,
@@ -356,13 +368,28 @@ export async function queryTranscript(
   let cappedNotice = "";
 
   if (options.turnIndex !== undefined) {
-    const resolvedTurn =
-      options.turnIndex < 0
-        ? Math.max(1, T + 1 + options.turnIndex)
-        : options.turnIndex;
-    slicedTurns = allTurns.filter((_, idx) => idx + 1 === resolvedTurn);
-  } else if (options.lastTurns !== undefined && options.lastTurns > 0) {
-    slicedTurns = allTurns.slice(-options.lastTurns);
+    if (options.turnIndex === 0) {
+      slicedTurns = [];
+    } else if (options.turnIndex < 0) {
+      const resolvedTurn = T + 1 + options.turnIndex;
+      if (resolvedTurn >= 1 && resolvedTurn <= T) {
+        slicedTurns = [allTurns[resolvedTurn - 1]];
+      } else {
+        slicedTurns = [];
+      }
+    } else {
+      if (options.turnIndex <= T) {
+        slicedTurns = [allTurns[options.turnIndex - 1]];
+      } else {
+        slicedTurns = [];
+      }
+    }
+  } else if (options.lastTurns !== undefined) {
+    if (options.lastTurns <= 0) {
+      slicedTurns = [];
+    } else {
+      slicedTurns = allTurns.slice(-Math.min(T, options.lastTurns));
+    }
   } else if (
     options.startTurn !== undefined ||
     options.endTurn !== undefined
@@ -371,7 +398,7 @@ export async function queryTranscript(
       options.startTurn !== undefined
         ? options.startTurn < 0
           ? Math.max(1, T + 1 + options.startTurn)
-          : options.startTurn
+          : Math.max(1, options.startTurn)
         : 1;
     const end =
       options.endTurn !== undefined
@@ -381,9 +408,9 @@ export async function queryTranscript(
         : T;
 
     if (start <= end) {
-      slicedTurns = allTurns.filter(
-        (_, idx) => idx + 1 >= start && idx + 1 <= end
-      );
+      slicedTurns = allTurns.slice(start - 1, end);
+    } else {
+      slicedTurns = [];
     }
   } else if (!hasExplicitSlicing && T > 100) {
     slicedTurns = allTurns.slice(-100);
@@ -436,7 +463,7 @@ export async function queryTranscript(
 
   for (let i = 0; i < slicedTurns.length; i++) {
     const turn = slicedTurns[i];
-    const unifiedIndex = allTurns.indexOf(turn) + 1;
+    const unifiedIndex = turn.unifiedTurnIndex;
 
     let header = `### [Turn ${unifiedIndex}]`;
     if (options.includeSubtree === true || turn.sessionId !== targetSessionId) {
@@ -571,58 +598,66 @@ export async function queryTranscript(
 
   // Export to disk if output option specified
   if (options.output) {
-    const rawPath = options.output;
-    let targetPath = path.resolve(rawPath);
+    try {
+      const rawPath = options.output;
+      let targetPath = path.resolve(rawPath);
 
-    const isDir =
-      (fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()) ||
-      !path.extname(targetPath);
+      const isDir =
+        (fs.existsSync(targetPath) && fs.statSync(targetPath).isDirectory()) ||
+        !path.extname(targetPath);
 
-    if (isDir) {
-      const sanitizedId = (targetSessionId || "query").replace(
-        /[^a-zA-Z0-9_-]/g,
-        "_"
-      );
-      const ext = rawPath.endsWith(".json") ? ".json" : ".md";
-      fs.mkdirSync(targetPath, { recursive: true });
-      targetPath = path.join(
-        targetPath,
-        `transcript_${sanitizedId}_${Date.now()}${ext}`
-      );
-    } else {
-      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-    }
+      if (isDir) {
+        const sanitizedId = (targetSessionId || "query").replace(
+          /[^a-zA-Z0-9_-]/g,
+          "_"
+        );
+        const ext = rawPath.endsWith(".json") ? ".json" : ".md";
+        fs.mkdirSync(targetPath, { recursive: true });
+        targetPath = path.join(
+          targetPath,
+          `transcript_${sanitizedId}_${Date.now()}${ext}`
+        );
+      } else {
+        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      }
 
-    if (targetPath.endsWith(".json")) {
-      const exportData = {
-        sessionId: targetSessionId,
-        includeSubtree: options.includeSubtree,
-        detailLevel,
-        turnCount: slicedTurns.length,
-        turns: slicedTurns.map((t) => ({
-          turnIndex: allTurns.indexOf(t) + 1,
-          localTurnIndex: t.localTurnIndex,
-          sessionId: t.sessionId,
-          role: t.role,
-          userPrompt: t.userPrompt,
-          assistantResponse: t.assistantResponse,
-          steps: loadedStepsMap.get(t.sessionId)?.get(t.localTurnIndex) || [],
-        })),
+      if (targetPath.endsWith(".json")) {
+        const exportData = {
+          sessionId: targetSessionId,
+          includeSubtree: options.includeSubtree,
+          detailLevel,
+          turnCount: slicedTurns.length,
+          turns: slicedTurns.map((t) => ({
+            turnIndex: t.unifiedTurnIndex,
+            localTurnIndex: t.localTurnIndex,
+            sessionId: t.sessionId,
+            role: t.role,
+            userPrompt: t.userPrompt,
+            assistantResponse: t.assistantResponse,
+            steps: loadedStepsMap.get(t.sessionId)?.get(t.localTurnIndex) || [],
+          })),
+        };
+        fs.writeFileSync(
+          targetPath,
+          JSON.stringify(exportData, null, 2),
+          "utf8"
+        );
+      } else {
+        fs.writeFileSync(targetPath, formattedText, "utf8");
+      }
+
+      return {
+        text: `Transcript successfully exported to: ${targetPath} (${formattedText.length} characters)`,
+        truncated: false,
+        charCount: formattedText.length,
       };
-      fs.writeFileSync(
-        targetPath,
-        JSON.stringify(exportData, null, 2),
-        "utf8"
-      );
-    } else {
-      fs.writeFileSync(targetPath, formattedText, "utf8");
+    } catch (err: any) {
+      return {
+        text: `Error exporting transcript: ${err?.message || String(err)}`,
+        truncated: false,
+        charCount: 0,
+      };
     }
-
-    return {
-      text: `Transcript successfully exported to: ${targetPath} (${formattedText.length} characters)`,
-      truncated: false,
-      charCount: formattedText.length,
-    };
   }
 
   return {
@@ -916,15 +951,25 @@ export async function computeSessionBenchmarks(
   for (const sessionId of sessionIds) {
     const result = store.query({
       sessionId,
-      includeSteps: true
+      includeSteps: true,
     });
 
-    const session = result.sessions[0];
+    const session = result.sessions[0] || store.getSession(sessionId);
     if (!session) {
       continue;
     }
 
-    metricsList.push(computeSingleSessionMetrics(sessionId, session, result.steps));
+    const turns = store.getTurns(sessionId, { includeUndone: false });
+    const steps =
+      result.steps && result.steps.length > 0
+        ? result.steps
+        : store.getSteps(sessionId, { includeUndone: false });
+
+    const metrics = computeSingleSessionMetrics(sessionId, session, steps);
+    if (turns.length > 0) {
+      metrics.totalTurns = turns.length;
+    }
+    metricsList.push(metrics);
   }
 
   return metricsList;
@@ -947,28 +992,11 @@ function incrementToolStats(toolCallsStr: string, stats: Record<string, number>)
   } catch {}
 }
 
-export async function getToolUsageStats(options: { limit?: number; projectPath?: string; scope?: "workspace" | "all" } = {}): Promise<Record<string, number>> {
+export async function getToolUsageStats(
+  options: ToolUsageStatsOptions = {}
+): Promise<ToolUsageReport> {
   const store = getStore();
-  const limit = options.limit ?? 30;
-  const projectPath = options.projectPath;
-  const scope = options.scope;
-
-  const result = store.query({
-    projectPath,
-    scope,
-    limit,
-    includeSteps: true
-  });
-
-  const stats: Record<string, number> = {};
-
-  for (const step of result.steps) {
-    if (step.toolCalls) {
-      incrementToolStats(step.toolCalls, stats);
-    }
-  }
-
-  return stats;
+  return store.getToolUsageStats(options);
 }
 
 export interface StepContextPoint {

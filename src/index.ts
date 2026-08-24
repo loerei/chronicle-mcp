@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import { getStore, getDb, StepCategory, StepSortMode } from "./db.js";
 import { ADAPTERS } from "./adapters/index.js";
+import { SessionData, TurnData } from "./adapters/types.js";
 import { getEmbeddingClient } from "./embeddings.js";
 import {
   searchHistory,
@@ -21,6 +22,8 @@ import {
 } from "./search.js";
 import { ProgressReporter, ProgressNotify } from "./progress.js";
 import { handleChronicleGuide } from "./guide.js";
+
+export { handleChronicleGuide } from "./guide.js";
 
 let activeSync: Promise<void> | null = null;
 
@@ -41,76 +44,67 @@ export function isLegacyToolsEnabled(): boolean {
 }
 
 async function syncSingleSession(s: any, store: any): Promise<boolean> {
-  // Check if session already indexed
+  if (s.turns && s.turns.length > 0) {
+    // 2-Layer session ingestion
+    const existingSession = store.getSession(s.id);
+    if (existingSession) {
+      const existingTurns = store.getTurns(s.id, { includeUndone: true });
+      const existingSteps = store.getSteps(s.id, { includeUndone: true });
+
+      const turnsCountChanged = (s.turns || []).length !== existingTurns.length;
+      const stepsCountChanged = (s.steps || []).length !== existingSteps.length;
+      const promptChanged = existingSession.firstPrompt !== s.firstPrompt;
+      const titleChanged = existingSession.title !== s.title;
+
+      if (!turnsCountChanged && !stepsCountChanged && !promptChanged && !titleChanged) {
+        return false;
+      }
+    }
+
+    console.error(`[Chronicle MCP] Indexing session: "${s.title}" (${s.id}) - ${(s.turns || []).length} turns, ${(s.steps || []).length} steps`);
+
+    const unvectorizedTurns = (s.turns as TurnData[]).filter((t) => !t.turnVector || t.turnVector.length === 0);
+    if (unvectorizedTurns.length > 0) {
+      const turnTexts = unvectorizedTurns.map((t) => t.turnText || t.userPrompt || "");
+      try {
+        const vectors = await getEmbeddingClient().embed(turnTexts);
+        unvectorizedTurns.forEach((t, idx) => {
+          t.turnVector = Float32Array.from(vectors[idx]);
+        });
+      } catch (e: any) {
+        console.error(`[Chronicle MCP] Embedding error for session ${s.id}:`, e?.message || String(e));
+      }
+    }
+
+    store.saveSession(s, s.turns, s.steps);
+    return true;
+  }
+
+  // Fallback to legacy chunk-based session save
   const checkResult = store.query({ sessionId: s.id });
   if (checkResult.sessions.length > 0) {
     const existingSession = checkResult.sessions[0];
-    const existingChunkIndices = new Set(existingSession.chunks.map((c: any) => c.stepIndex));
+    const existingChunkIndices = new Set((existingSession.chunks || []).map((c: any) => c.stepIndex));
 
     const stepsResult = store.query({ sessionId: s.id, includeSteps: true, includeUndone: true });
     const existingStepIndices = new Set(stepsResult.steps.map((step: any) => step.stepIndex));
 
-    const newChunks = s.chunks.filter((c: any) => !existingChunkIndices.has(c.stepIndex));
+    const newChunks = (s.chunks || []).filter((c: any) => !existingChunkIndices.has(c.stepIndex));
     const newSteps = (s.steps || []).filter((step: any) => !existingStepIndices.has(step.stepIndex));
 
     const stepsCountChanged = (s.steps || []).length !== stepsResult.steps.length;
-    const promptChanged = existingSession.firstPrompt !== s.firstPrompt || existingSession.secondPrompt !== s.secondPrompt;
+    const promptChanged = existingSession.firstPrompt !== s.firstPrompt;
     const titleChanged = existingSession.title !== s.title;
 
-    const dbUndoneCount = stepsResult.steps.filter((st: any) => st.isUndone).length;
-    const parserUndoneCount = (s.steps || []).filter((st: any) => st.isUndone).length;
-    const undoneCountChanged = dbUndoneCount !== parserUndoneCount;
-
-    if (newChunks.length === 0 && newSteps.length === 0 && !titleChanged && !stepsCountChanged && !promptChanged && !undoneCountChanged) {
+    if (newChunks.length === 0 && newSteps.length === 0 && !titleChanged && !stepsCountChanged && !promptChanged) {
       return false;
     }
 
-    console.error(`[Chronicle MCP] Indexing updates for session: "${s.title}" (${s.id}) - ${newChunks.length} new chunks, ${newSteps.length} new steps`);
-
-    // Recompute summary vector if title or first prompt changed
-    let summaryVector = undefined;
-    if (existingSession.title !== s.title || existingSession.firstPrompt !== s.firstPrompt) {
-      const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
-      [summaryVector] = await getEmbeddingClient().embed([summaryText]);
-    }
-
-    // Compute Level 2 vectors only for the new chunks
-    const chunkVectors = new Map<number, number[]>();
-    if (newChunks.length > 0) {
-      const chunkTexts = newChunks.map((chunk: any) => chunk.text);
-      const vectors = await getEmbeddingClient().embed(chunkTexts);
-      newChunks.forEach((chunk: any, index: number) => {
-        chunkVectors.set(chunk.stepIndex, vectors[index]);
-      });
-    }
-
-    store.save(s, {
-      summary: summaryVector,
-      chunks: chunkVectors
-    });
+    store.save(s);
     return true;
   }
 
-  console.error(`[Chronicle MCP] Indexing new session: "${s.title}" (${s.id})`);
-
-  // Compute Level 1 vector (Session identity)
-  const summaryText = `Title: ${s.title} | Context: ${s.projectPath || "unknown"} | Start: ${s.firstPrompt} ${s.secondPrompt}`;
-  const [summaryVector] = await getEmbeddingClient().embed([summaryText]);
-
-  // Compute Level 2 vectors (Granular turns)
-  const chunkVectors = new Map<number, number[]>();
-  if (s.chunks.length > 0) {
-    const chunkTexts = s.chunks.map((chunk: any) => chunk.text);
-    const vectors = await getEmbeddingClient().embed(chunkTexts);
-    s.chunks.forEach((chunk: any, index: number) => {
-      chunkVectors.set(chunk.stepIndex, vectors[index]);
-    });
-  }
-
-  store.save(s, {
-    summary: summaryVector,
-    chunks: chunkVectors
-  });
+  store.save(s);
   return true;
 }
 
@@ -195,11 +189,12 @@ const conversationStepParams = {
 };
 
 // Register Tool Definitions
-server.setRequestHandler(ListToolsRequestSchema, async () => {
+export function getMcpToolDefinitions(): any[] {
   const tools: any[] = [
     {
       name: "chronicle_guide",
-      description: "Self-guide tool providing usage patterns, tool selection matrix, and token-saving rules for chronicle-mcp.",
+      description:
+        "Self-guide tool providing usage patterns, tool selection matrix, and token-saving rules for chronicle-mcp.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -217,12 +212,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           parentId: {
             type: "string",
-            description: "Filter sessions by parent session ID. Use 'root' or 'null' to filter top-level root sessions only.",
+            description:
+              "Filter sessions by parent session ID. Use 'root' or 'null' to filter top-level root sessions only.",
+          },
+          role: {
+            type: "string",
+            description: "Filter sessions by subagent role.",
+          },
+          hasErrors: {
+            type: "boolean",
+            description:
+              "Filter sessions containing errors (true) or clean error-free sessions (false).",
           },
           limit: {
             type: "number",
-            description: "Max number of sessions to return",
+            description: "Max number of sessions to return (default: 10).",
             default: 10,
+          },
+          offset: {
+            type: "number",
+            description: "Pagination offset index.",
           },
           projectPath: {
             type: "string",
@@ -231,25 +240,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
-            default: "all"
+            description:
+              "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
+            default: "all",
           },
           timeRange: {
             type: "string",
-            description: "Search sessions within a time range, formatted as 'start:end' (e.g. '2026-06-20:2026-06-22' or '1781298371:1781308371'). Leave one side blank for open-ended range."
+            description:
+              "Search sessions within a time range, formatted as 'start:end' (e.g. '2026-06-20:2026-06-22' or '1781298371:1781308371').",
           },
           sortBy: {
             type: "string",
             enum: ["created", "active"],
-            description: "Sort sessions by: 'created' for creation time; 'active' for latest activity time.",
-            default: "active"
+            description:
+              "Sort sessions by: 'created' for creation time; 'active' for latest activity time.",
+            default: "active",
           },
         },
       },
     },
     {
       name: "get_session_relationship",
-      description: "Expose parent session, child subagent sessions, siblings, and ancestry hierarchy for a given session ID.",
+      description:
+        "Expose parent session, child subagent sessions, siblings, and ancestry hierarchy for a given session ID.",
       inputSchema: {
         type: "object",
         properties: {
@@ -264,8 +277,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           maxDepth: {
             type: "integer",
-            description: "Maximum depth for recursive child subagent tree graph.",
-            default: 2,
+            description:
+              "Maximum depth for recursive child subagent tree graph (1-10, default: 3).",
+            default: 3,
             minimum: 1,
             maximum: 10,
           },
@@ -275,25 +289,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "query_transcript",
-      description: "Read, query, slice, and progressively disclose conversation transcripts with token-saving detailLevel ('compact', 'full', 'summary'), turn slicing, subagent subtree resolution, and execution filters.",
+      description:
+        "Read, query, slice, and progressively disclose conversation transcripts with token-saving detailLevel ('compact', 'full', 'summary'), turn slicing, subagent subtree resolution, and execution filters.",
       inputSchema: {
         type: "object",
         properties: {
           sessionId: {
             type: "string",
-            description: "Session ID to inspect. If omitted, defaults to the most recent workspace session.",
+            description:
+              "Session ID to inspect. If omitted, defaults to the most recent workspace session.",
           },
           turnIndex: {
             type: "integer",
-            description: "Specific 1-based turn index to retrieve, or negative index (e.g. -1 for latest turn).",
+            description:
+              "Specific 1-based turn index to retrieve, or negative index (e.g. -1 for latest turn).",
           },
           startTurn: {
             type: "integer",
-            description: "Start turn index (inclusive), supports negative indexing (e.g. -3 for last 3 turns).",
+            description:
+              "Start turn index (inclusive), supports negative indexing (e.g. -3 for last 3 turns).",
           },
           endTurn: {
             type: "integer",
-            description: "End turn index (inclusive), supports negative indexing (e.g. -1 for latest turn).",
+            description:
+              "End turn index (inclusive), supports negative indexing (e.g. -1 for latest turn).",
           },
           lastTurns: {
             type: "integer",
@@ -302,7 +321,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           detailLevel: {
             type: "string",
             enum: ["compact", "full", "summary"],
-            description: "Detail level: 'compact' (dialogue + execution summary, saving ~80% tokens), 'full' (complete dialogue, thinking, tool args & results), 'summary' (conversational dialogue only).",
+            description:
+              "Detail level: 'compact' (dialogue + execution summary, saving ~80% tokens), 'full' (complete dialogue, thinking, tool args & results), 'summary' (conversational dialogue only).",
             default: "compact",
           },
           include: {
@@ -311,11 +331,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "string",
               enum: ["dialogue", "thinking", "executions", "system_events"],
             },
-            description: "Array masks to conditionally include dialogue, thinking, executions, or system_events.",
+            description:
+              "Array masks to conditionally include dialogue, thinking, executions, or system_events.",
           },
           filePath: {
             type: "string",
-            description: "Filter execution steps touching a specific file path or basename.",
+            description:
+              "Filter execution steps touching a specific file path or basename.",
           },
           toolFilter: {
             type: "object",
@@ -342,11 +364,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 description: "Filter by execution kind.",
               },
             },
-            description: "Filter execution steps by tool name, server, status, or kind.",
+            description:
+              "Filter execution steps by tool name, server, status, or kind.",
           },
           includeSubtree: {
             type: "boolean",
-            description: "Recursively resolve and aggregate turns across all descendant subagents in chronological order.",
+            description:
+              "Recursively resolve and aggregate turns across all descendant subagents in chronological order.",
             default: false,
           },
           includeUndone: {
@@ -356,19 +380,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           maxResultChars: {
             type: "integer",
-            description: "Safety truncation limit for individual execution payloads. Default: 2500.",
+            description:
+              "Safety truncation limit for individual execution payloads. Default: 2500.",
             default: 2500,
           },
           output: {
             type: "string",
-            description: "Path to write output file directly (.md or .json). If a directory is specified, a default timestamped filename will be generated.",
+            description:
+              "Path to write output file directly (.md or .json). If a directory is specified, a default timestamped filename will be generated.",
           },
         },
       },
     },
     {
       name: "get_session_artifacts",
-      description: "Retrieve markdown artifacts (walkthrough.md, implementation_plan.md, task.md) for a session.",
+      description:
+        "Retrieve markdown artifacts (walkthrough.md, implementation_plan.md, task.md) for a session.",
       inputSchema: {
         type: "object",
         properties: {
@@ -376,9 +403,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             type: "string",
             description: "Unique session ID.",
           },
+          artifactName: {
+            type: "string",
+            description: "Optional artifact filename or substring filter.",
+          },
+          includeSubtree: {
+            type: "boolean",
+            description: "Include artifacts from descendant subagent sessions.",
+            default: false,
+          },
           output: {
             type: "string",
-            description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
+            description:
+              "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
           },
         },
         required: ["sessionId"],
@@ -386,18 +423,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "search_history",
-      description: "Perform zero-copy turn-level hybrid (FTS5 + Vector BLOB RRF), semantic, or keyword search across development sessions.",
+      description:
+        "Perform zero-copy turn-level hybrid (FTS5 + Vector BLOB RRF), semantic, or keyword search across development sessions.",
       inputSchema: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "Search query text, symbol, error code, or natural language question.",
+            description:
+              "Search query text, symbol, error code, or natural language question.",
           },
           mode: {
             type: "string",
             enum: ["hybrid", "semantic", "keyword"],
-            description: "Search mode: 'hybrid' (combines FTS5 BM25 + Vector cosine similarity via RRF k=60), 'semantic' (dense vector cosine similarity), 'keyword' (exact FTS5 symbol matching).",
+            description:
+              "Search mode: 'hybrid' (combines FTS5 BM25 + Vector cosine similarity via RRF k=60), 'semantic' (dense vector cosine similarity), 'keyword' (exact FTS5 symbol matching).",
             default: "hybrid",
           },
           limit: {
@@ -408,7 +448,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope: 'workspace' limits to active project; 'all' searches globally.",
+            description:
+              "Search scope: 'workspace' limits to active project; 'all' searches globally.",
             default: "workspace",
           },
           projectPath: {
@@ -424,7 +465,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               },
               hasErrors: {
                 type: "boolean",
-                description: "Filter turns containing errors.",
+                description: "Filter turns containing errors (true) or clean error-free turns (false).",
               },
               onlySubagents: {
                 type: "boolean",
@@ -432,7 +473,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               },
               onlyUserPrompts: {
                 type: "boolean",
-                description: "Restricts keyword search match strictly to user_prompt column.",
+                description:
+                  "Restricts keyword search match strictly to user_prompt column.",
               },
               timeRange: {
                 type: "string",
@@ -447,13 +489,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     },
     {
       name: "get_tool_usage_stats",
-      description: "Retrieve tool execution statistics (counts) across recent sessions.",
+      description:
+        "Retrieve comprehensive tool execution analytics (per-tool call counts, failure rates, avg duration) and thrash loop detection across sessions.",
       inputSchema: {
         type: "object",
         properties: {
           limit: {
             type: "number",
-            description: "Number of recent sessions to analyze",
+            description: "Number of recent sessions to analyze (default: 30).",
             default: 30,
           },
           projectPath: {
@@ -463,15 +506,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           scope: {
             type: "string",
             enum: ["workspace", "all"],
-            description: "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
-            default: "all"
+            description:
+              "Search scope: 'workspace' limits results to the active project; 'all' searches globally.",
+            default: "all",
+          },
+          timeRange: {
+            type: "string",
+            description: "Analyze sessions within a time range ('start:end').",
           },
         },
       },
     },
     {
       name: "get_session_benchmarks",
-      description: "Compare duration, tool calls, token usage, and errors across sessions.",
+      description:
+        "Compare duration, tool calls, token usage, and errors across sessions.",
       inputSchema: {
         type: "object",
         properties: {
@@ -505,16 +554,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           output: {
             type: "string",
-            description: "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
+            description:
+              "Absolute path to the output file or directory. If a directory is specified, a default filename will be generated.",
           },
           linechart_output: {
             type: "string",
-            description: "Optional absolute path to export an interactive HTML line chart visualizing context window size over steps with Checkpoints and conversational steps highlighted.",
+            description:
+              "Optional absolute path to export an interactive HTML line chart visualizing context window size over steps with Checkpoints and conversational steps highlighted.",
           },
         },
         required: ["sessionIds"],
       },
-    }
+    },
   ];
 
   if (!isAutoSyncEnabled()) {
@@ -532,7 +583,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools.push(
       {
         name: "get_session_details",
-        description: "[Legacy Wrapper] Retrieve conversational history and steps of a specific session.",
+        description:
+          "[Legacy Wrapper] Retrieve conversational history and steps of a specific session.",
         inputSchema: {
           type: "object",
           properties: {
@@ -551,7 +603,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "get_step_details",
-        description: "[Legacy Wrapper] Retrieve content, thinking, and tool execution details for specific step indexes in a session.",
+        description:
+          "[Legacy Wrapper] Retrieve content, thinking, and tool execution details for specific step indexes in a session.",
         inputSchema: {
           type: "object",
           properties: {
@@ -566,7 +619,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_steps",
-        description: "[Legacy Wrapper] Search across indexed steps by text query, step type, status, or tool name.",
+        description:
+          "[Legacy Wrapper] Search across indexed steps by text query, step type, status, or tool name.",
         inputSchema: {
           type: "object",
           properties: {
@@ -588,7 +642,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     );
   }
 
-  return { tools };
+  return tools;
+}
+
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return { tools: getMcpToolDefinitions() };
 });
 
 function handleOutputWrite(
@@ -624,16 +682,11 @@ function handleOutputWrite(
     }
 
     if (isDir) {
-      if (!fs.existsSync(outputPath)) {
-        fs.mkdirSync(outputPath, { recursive: true });
-      }
+      fs.mkdirSync(outputPath, { recursive: true });
       const filename = defaultFilename || `output_${Date.now()}.md`;
       targetPath = path.join(outputPath, filename);
     } else {
-      const parentDir = path.dirname(outputPath);
-      if (!fs.existsSync(parentDir)) {
-        fs.mkdirSync(parentDir, { recursive: true });
-      }
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
     }
 
     fs.writeFileSync(targetPath, md, "utf-8");
@@ -659,36 +712,48 @@ function handleOutputWrite(
   }
 }
 
-async function handleListSessions(args: any): Promise<any> {
+export async function handleListSessions(args: any): Promise<any> {
   const adapter = args?.adapter as string | undefined;
   const parentId = args?.parentId as string | undefined;
-  const limit = (args?.limit as number) || 10;
+  const role = args?.role as string | undefined;
+  const hasErrors = typeof args?.hasErrors === "boolean" ? args.hasErrors : undefined;
+  const limit = typeof args?.limit === "number" ? args.limit : 10;
+  const offset = typeof args?.offset === "number" ? args.offset : undefined;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as ScopeType | undefined;
   const timeRange = args?.timeRange as string | undefined;
   const sortBy = args?.sortBy as "created" | "active" | undefined;
 
   const store = getStore();
-  const result = store.query({
+  const sessions = store.listSessions({
     adapter,
     parentId,
+    role,
+    hasErrors,
     projectPath,
     scope,
     limit,
+    offset,
     timeRange,
-    sortBy
+    sortBy,
   });
 
-  const rows = result.sessions.map(s => ({
+  const rows = sessions.map((s) => ({
     id: s.id,
     adapter: s.adapter,
     title: s.title,
+    role: s.role,
     project_path: s.projectPath,
     created_at: s.createdAt,
     last_active_at: s.lastActiveAt,
-    first_prompt: s.firstPrompt,
     parent_id: s.parentId || null,
-    child_session_ids: s.childSessionIds || []
+    root_id: s.rootId || null,
+    depth: s.depth ?? 0,
+    total_turns: s.totalTurns ?? 0,
+    total_steps: s.totalSteps ?? 0,
+    artifacts: s.artifacts || [],
+    files_touched: s.filesTouched || [],
+    first_prompt: s.firstPrompt,
   }));
 
   return {
@@ -701,7 +766,7 @@ async function handleListSessions(args: any): Promise<any> {
   };
 }
 
-async function handleGetSessionRelationship(args: any): Promise<any> {
+export async function handleGetSessionRelationship(args: any): Promise<any> {
   const sessionId = args?.sessionId as string | undefined;
   if (!sessionId) {
     return {
@@ -715,7 +780,7 @@ async function handleGetSessionRelationship(args: any): Promise<any> {
     };
   }
 
-  const maxDepth = typeof args?.maxDepth === "number" ? args.maxDepth : 2;
+  const maxDepth = typeof args?.maxDepth === "number" ? args.maxDepth : 3;
   const includeAncestors = args?.includeAncestors !== false;
 
   const store = getStore();
@@ -903,43 +968,113 @@ async function handleGetStepDetails(args: any): Promise<any> {
   });
 }
 
-async function handleGetSessionArtifacts(args: any): Promise<any> {
+export async function handleGetSessionArtifacts(
+  args: any,
+  brainBaseDir?: string
+): Promise<any> {
   const sessionId = args?.sessionId as string;
-  const homedir = os.homedir();
-  const brainDir = path.join(homedir, ".gemini", "antigravity", "brain");
-  const sessionDir = path.join(brainDir, sessionId);
-
-  if (!fs.existsSync(sessionDir)) {
+  if (!sessionId) {
     return {
       content: [
         {
           type: "text",
-          text: `Artifact directory for session "${sessionId}" not found.`,
+          text: "Error: Missing required parameter 'sessionId'.",
         },
       ],
       isError: true,
     };
   }
 
-  const mdFiles = fs.readdirSync(sessionDir).filter((file: string) => file.endsWith(".md"));
-  if (mdFiles.length === 0) {
+  const includeSubtree = args?.includeSubtree === true;
+  const artifactNameFilter = args?.artifactName as string | undefined;
+  const homedir = os.homedir();
+  const brainDir =
+    brainBaseDir || path.join(homedir, ".gemini", "antigravity", "brain");
+
+  const store = getStore();
+  const descriptors = store.getArtifactDescriptors(
+    sessionId,
+    includeSubtree,
+    artifactNameFilter
+  );
+
+  // Fallback: If DB had no descriptors for current session, inspect disk
+  if (descriptors.length === 0) {
+    const sessionDir = path.join(brainDir, sessionId);
+    if (fs.existsSync(sessionDir)) {
+      try {
+        const diskFiles = fs
+          .readdirSync(sessionDir)
+          .filter((f) => f.endsWith(".md"));
+        for (const df of diskFiles) {
+          if (
+            !artifactNameFilter ||
+            df.toLowerCase().includes(artifactNameFilter.toLowerCase())
+          ) {
+            descriptors.push({ sessionId, filename: df });
+          }
+        }
+      } catch {}
+    }
+  }
+
+  if (descriptors.length === 0) {
     return {
       content: [
         {
           type: "text",
-          text: `No markdown artifacts found in session "${sessionId}".`,
+          text: `No markdown artifacts found for session "${sessionId}"${
+            includeSubtree ? " (including subtree)" : ""
+          }${artifactNameFilter ? ` matching "${artifactNameFilter}"` : ""}.`,
         },
       ],
     };
   }
 
   let md = `# Artifacts for Session: ${sessionId}\n\n`;
-  for (const file of mdFiles) {
-    const filePath = path.join(sessionDir, file);
-    const content = fs.readFileSync(filePath, "utf-8");
-    md += `## File: [${file}](file:///${filePath.replaceAll("\\", "/")})\n\n`;
-    md += `${content}\n\n`;
-    md += `--- \n\n`;
+  const MAX_ARTIFACT_BYTES = 512 * 1024; // 512 KB
+
+  for (const desc of descriptors) {
+    const targetSessionDir = path.join(brainDir, desc.sessionId);
+    const targetPath = path.resolve(targetSessionDir, desc.filename);
+
+    // Sibling directory escape & containment check
+    const rel = path.relative(targetSessionDir, targetPath);
+    const isContained =
+      !rel.startsWith("..") &&
+      !path.isAbsolute(rel) &&
+      targetPath.startsWith(targetSessionDir + path.sep);
+
+    if (!isContained) {
+      md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
+      md += `> [!WARNING]\n> Path traversal blocked for artifact "${desc.filename}".\n\n---\n\n`;
+      continue;
+    }
+
+    if (!fs.existsSync(targetPath)) {
+      md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
+      md += `> [!NOTE]\n> Artifact file not found on disk at \`${targetPath}\`.\n\n---\n\n`;
+      continue;
+    }
+
+    try {
+      const stats = fs.statSync(targetPath);
+      if (!stats.isFile()) continue;
+
+      let content = fs.readFileSync(targetPath, "utf-8");
+      if (stats.size > MAX_ARTIFACT_BYTES) {
+        content =
+          content.slice(0, MAX_ARTIFACT_BYTES) +
+          `\n\n... [Truncated: artifact exceeded ${MAX_ARTIFACT_BYTES / 1024} KB limit]`;
+      }
+
+      md += `## File: [${desc.filename}](file:///${targetPath.replaceAll("\\", "/")}) (Session: ${desc.sessionId})\n\n`;
+      md += `${content}\n\n`;
+      md += `--- \n\n`;
+    } catch (e: any) {
+      md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
+      md += `> [!WARNING]\n> Error reading artifact: ${e?.message || String(e)}\n\n---\n\n`;
+    }
   }
 
   const outputPath = args?.output as string | undefined;
@@ -993,7 +1128,7 @@ async function handleSearchSteps(args: any): Promise<any> {
   });
 }
 
-async function handleSearchHistory(args: any): Promise<any> {
+export async function handleSearchHistory(args: any): Promise<any> {
   const query = args?.query as string;
   const mode = args?.mode as "hybrid" | "semantic" | "keyword" | undefined;
   const limit = (args?.limit as number) || 5;
@@ -1020,12 +1155,13 @@ async function handleSearchHistory(args: any): Promise<any> {
   };
 }
 
-async function handleGetToolUsageStats(args: any): Promise<any> {
-  const limit = args?.limit as number | undefined;
+export async function handleGetToolUsageStats(args: any): Promise<any> {
+  const limit = typeof args?.limit === "number" ? args.limit : 30;
   const projectPath = args?.projectPath as string | undefined;
   const scope = args?.scope as ScopeType | undefined;
+  const timeRange = args?.timeRange as string | undefined;
 
-  const stats = await getToolUsageStats({ limit, projectPath, scope });
+  const stats = await getToolUsageStats({ limit, projectPath, scope, timeRange });
 
   return {
     content: [
@@ -1037,7 +1173,7 @@ async function handleGetToolUsageStats(args: any): Promise<any> {
   };
 }
 
-async function handleGetSessionBenchmarks(args: any): Promise<any> {
+export async function handleGetSessionBenchmarks(args: any): Promise<any> {
   const sessionIds = args?.sessionIds as string[];
   const groups = args?.groups as Array<{ name: string; sessionIds: string[] }> | undefined;
 
@@ -1139,6 +1275,53 @@ async function handleGetSessionBenchmarks(args: any): Promise<any> {
   return handleOutputWrite(md, outputPath, `benchmarks_${Date.now()}.md`);
 }
 
+export async function handleCallToolRequest(
+  name: string,
+  args: any,
+  reporter?: ProgressReporter
+): Promise<any> {
+  if (isAutoSyncEnabled() && name !== "sync_history") {
+    await syncHistory(false, reporter);
+  }
+
+  switch (name) {
+    case "chronicle_guide":
+      return handleChronicleGuide();
+    case "list_sessions":
+      return await handleListSessions(args);
+    case "get_session_relationship":
+      return await handleGetSessionRelationship(args);
+    case "query_transcript":
+      return await handleQueryTranscript(args);
+    case "get_session_details":
+      return await handleGetSessionDetails(args);
+    case "get_step_details":
+      return await handleGetStepDetails(args);
+    case "get_session_artifacts":
+      return await handleGetSessionArtifacts(args);
+    case "search_steps":
+      return await handleSearchSteps(args);
+    case "search_history":
+      return await handleSearchHistory(args);
+    case "get_tool_usage_stats":
+      return await handleGetToolUsageStats(args);
+    case "get_session_benchmarks":
+      return await handleGetSessionBenchmarks(args);
+    case "sync_history":
+      await syncHistory(true, reporter);
+      return {
+        content: [
+          {
+            type: "text",
+            text: "History synchronization completed successfully.",
+          },
+        ],
+      };
+    default:
+      throw new Error(`Tool "${name}" not found.`);
+  }
+}
+
 // Handle Tool Calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -1162,46 +1345,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const reporter = new ProgressReporter(progressNotify, { label: "Syncing" });
 
   try {
-    if (isAutoSyncEnabled() && name !== "sync_history") {
-      await syncHistory(false, reporter);
-    }
-
-    switch (name) {
-      case "chronicle_guide":
-        return handleChronicleGuide();
-      case "list_sessions":
-        return await handleListSessions(args);
-      case "get_session_relationship":
-        return await handleGetSessionRelationship(args);
-      case "query_transcript":
-        return await handleQueryTranscript(args);
-      case "get_session_details":
-        return await handleGetSessionDetails(args);
-      case "get_step_details":
-        return await handleGetStepDetails(args);
-      case "get_session_artifacts":
-        return await handleGetSessionArtifacts(args);
-      case "search_steps":
-        return await handleSearchSteps(args);
-      case "search_history":
-        return await handleSearchHistory(args);
-      case "get_tool_usage_stats":
-        return await handleGetToolUsageStats(args);
-      case "get_session_benchmarks":
-        return await handleGetSessionBenchmarks(args);
-      case "sync_history":
-        await syncHistory(true, reporter);
-        return {
-          content: [
-            {
-              type: "text",
-              text: "History synchronization completed successfully.",
-            },
-          ],
-        };
-      default:
-        throw new Error(`Tool "${name}" not found.`);
-    }
+    return await handleCallToolRequest(name, args, reporter);
   } catch (e: any) {
     return {
       content: [

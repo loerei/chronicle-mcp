@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { InMemoryHistoryStore, setStore, SessionEmbeddings } from "../db.js";
 import { computeSessionBenchmarks } from "../search.js";
-import { SessionData, StepData } from "../adapters/types.js";
+import { SessionData, StepData, TurnData } from "../adapters/types.js";
 
 describe("Benchmarking Logic", () => {
   it("should calculate session benchmark metrics and caching simulation correctly", async () => {
@@ -145,36 +145,64 @@ describe("Benchmarking Logic", () => {
       createdAt: 1700000000000,
       firstPrompt: "",
       secondPrompt: "",
-      chunks: [],
-      steps: [
-        {
-          stepIndex: 1,
-          type: "PLANNER_RESPONSE",
-          source: "MODEL",
-          status: "DONE",
-          toolCalls: JSON.stringify([{ name: "\"memory\"/\"read_graph\"" }, { name: "gitnexus/query" }]),
-          createdAt: 1700000001000
-        },
-        {
-          stepIndex: 2,
-          type: "PLANNER_RESPONSE",
-          source: "MODEL",
-          status: "DONE",
-          toolCalls: JSON.stringify([{ name: "gitnexus/query" }]),
-          createdAt: 1700000002000
-        }
-      ]
     };
 
-    store.save(session, { summary: [0, 0], chunks: new Map() });
+    const turns: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "run tools",
+        assistantResponse: "ran tools",
+        turnText: "run tools ran tools",
+        toolCount: 3,
+        errorCount: 0,
+      },
+    ];
+
+    const steps: StepData[] = [
+      {
+        stepIndex: 1,
+        turnIndex: 1,
+        category: "execution",
+        toolName: "read_graph",
+        serverName: "memory",
+        status: "DONE",
+        createdAt: 1700000001000,
+      },
+      {
+        stepIndex: 2,
+        turnIndex: 1,
+        category: "execution",
+        toolName: "query",
+        serverName: "gitnexus",
+        status: "DONE",
+        createdAt: 1700000002000,
+      },
+      {
+        stepIndex: 3,
+        turnIndex: 1,
+        category: "execution",
+        toolName: "query",
+        serverName: "gitnexus",
+        status: "DONE",
+        createdAt: 1700000003000,
+      },
+    ];
+
+    store.saveSession(session, turns, steps);
 
     const { getToolUsageStats } = await import("../search.js");
-    const stats = await getToolUsageStats({ limit: 5, projectPath: "stats" });
+    const report = await getToolUsageStats({ limit: 5, projectPath: "/projects/stats" });
 
-    assert.deepStrictEqual(stats, {
-      "memory/read_graph": 1,
-      "gitnexus/query": 2
-    });
+    assert.strictEqual(report.summary.totalCalls, 3);
+    assert.strictEqual(report.summary.totalErrors, 0);
+
+    const memStat = report.tools.find((t) => t.toolName === "read_graph" && t.serverName === "memory");
+    assert.ok(memStat);
+    assert.strictEqual(memStat.totalCalls, 1);
+
+    const gitStat = report.tools.find((t) => t.toolName === "query" && t.serverName === "gitnexus");
+    assert.ok(gitStat);
+    assert.strictEqual(gitStat.totalCalls, 2);
   });
 
   it("should correctly handle CHECKPOINT steps in caching simulation and peakContextSize", async () => {
