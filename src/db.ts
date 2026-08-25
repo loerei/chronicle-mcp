@@ -953,12 +953,44 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   getSession(id: string): SessionData | null {
-    const session = this.sessionsMap.get(id);
+    if (!id || typeof id !== "string") return null;
+    let session = this.sessionsMap.get(id);
+    const cleanId = id.trim().toLowerCase();
+    if (!session) {
+      session = this.sessionsMap.get(cleanId);
+    }
+    if (!session) {
+      for (const [sId, s] of this.sessionsMap.entries()) {
+        if (sId.toLowerCase() === cleanId) {
+          session = s;
+          break;
+        }
+      }
+    }
+    if (!session && cleanId.length >= 6) {
+      const matches: SessionData[] = [];
+      for (const [sId, s] of this.sessionsMap.entries()) {
+        if (sId.toLowerCase().startsWith(cleanId)) {
+          matches.push(s);
+        }
+      }
+      if (matches.length > 0) {
+        matches.sort((a, b) => {
+          const aTime = a.lastActiveAt ?? a.createdAt ?? 0;
+          const bTime = b.lastActiveAt ?? b.createdAt ?? 0;
+          if (bTime !== aTime) return bTime - aTime;
+          return (b.createdAt ?? 0) - (a.createdAt ?? 0);
+        });
+        session = matches[0];
+      }
+    }
     if (!session) return null;
+
+    const actualId = session.id;
     return {
       ...session,
-      turns: this.getTurns(id, { includeUndone: true }),
-      steps: this.getSteps(id, { includeUndone: true }),
+      turns: this.getTurns(actualId, { includeUndone: true }),
+      steps: this.getSteps(actualId, { includeUndone: true }),
     };
   }
 
@@ -1899,9 +1931,23 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   getSession(id: string): SessionData | null {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as any;
+    if (!id || typeof id !== "string") return null;
+    let row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(id) as any;
+    const cleanId = id.trim().toLowerCase();
+    if (!row) {
+      row = this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(cleanId) as any;
+    }
+    if (!row && cleanId.length >= 6) {
+      const nextPrefix = cleanId.slice(0, -1) + String.fromCharCode(cleanId.charCodeAt(cleanId.length - 1) + 1);
+      row = this.db
+        .prepare(
+          "SELECT * FROM sessions WHERE id >= ? AND id < ? ORDER BY last_active_at DESC, created_at DESC LIMIT 1"
+        )
+        .get(cleanId, nextPrefix) as any;
+    }
     if (!row) return null;
 
+    const actualId = row.id;
     return {
       id: row.id,
       adapter: row.adapter,
@@ -1922,8 +1968,8 @@ export class SqliteHistoryStore implements HistoryStore {
       metadata: row.metadata ? JSON.parse(row.metadata) : {},
       logMtime: row.log_mtime ?? undefined,
       logSize: row.log_size ?? undefined,
-      turns: this.getTurns(id, { includeUndone: true }),
-      steps: this.getSteps(id, { includeUndone: true }),
+      turns: this.getTurns(actualId, { includeUndone: true }),
+      steps: this.getSteps(actualId, { includeUndone: true }),
     };
   }
 

@@ -13,6 +13,7 @@ import {
   ToolUsageStatsOptions,
   ToolUsageReport,
 } from "./adapters/types.js";
+import { formatSearchHistoryMarkdown, projectFields } from "./presentation.js";
 import { getEncoding } from "js-tiktoken";
 
 const encoder = getEncoding("cl100k_base");
@@ -28,6 +29,12 @@ export interface SearchHistoryOptions {
   projectPath?: string;
   filter?: SearchHistoryFilter;
   limit?: number;
+  format?: "markdown" | "json";
+  detailLevel?: "compact" | "full";
+  fields?: string[] | string;
+  order?: string[] | string;
+  maxSnippetChars?: number;
+  output?: string;
 }
 
 export interface SearchHistoryResult {
@@ -133,28 +140,35 @@ export async function searchHistory(
   const options: SearchHistoryOptions = optionsOrQueryVector || {};
   const query = options.query ? options.query.trim() : "";
   if (!query) {
+    if (options.format === "markdown") {
+      return `No matching history turns found for "${query}".`;
+    }
     return [];
   }
 
   const mode = options.mode || "hybrid";
-  const limit = Math.max(
-    1,
+  const limit =
     typeof options.limit === "number" && !Number.isNaN(options.limit)
-      ? options.limit
-      : 5
-  );
+      ? Math.max(1, Math.min(Math.floor(options.limit), 100))
+      : 10;
+  const maxSnippetChars =
+    typeof options.maxSnippetChars === "number" && !Number.isNaN(options.maxSnippetChars)
+      ? Math.max(20, Math.min(Math.floor(options.maxSnippetChars), 500))
+      : 120;
   const candidateLimit = Math.max(limit * 3, 20);
   const projectPath = options.projectPath;
   const scope = options.scope;
   const filter = options.filter;
 
+  let candidates: SearchHistoryResult[] = [];
+
   if (mode === "keyword") {
-    const ftsResults = store.searchTurnsFTS(query, limit, {
+    const ftsResults = store.searchTurnsFTS(query, candidateLimit, {
       projectPath,
       scope,
       filter,
     });
-    return ftsResults.map((r, idx) => ({
+    candidates = ftsResults.map((r, idx) => ({
       sessionId: r.sessionId,
       turnIndex: r.turnIndex,
       title: r.title,
@@ -166,16 +180,14 @@ export async function searchHistory(
       createdAt: r.createdAt,
       conversationLink: `conversation://${r.sessionId}`,
     }));
-  }
-
-  if (mode === "semantic") {
+  } else if (mode === "semantic") {
     const [queryVec] = await getEmbeddingClient().embed([query]);
-    const vecResults = store.searchTurnsVector(queryVec, limit, {
+    const vecResults = store.searchTurnsVector(queryVec, candidateLimit, {
       projectPath,
       scope,
       filter,
     });
-    return vecResults.map((r) => ({
+    candidates = vecResults.map((r) => ({
       sessionId: r.sessionId,
       turnIndex: r.turnIndex,
       title: r.title,
@@ -187,64 +199,64 @@ export async function searchHistory(
       createdAt: r.createdAt,
       conversationLink: `conversation://${r.sessionId}`,
     }));
-  }
-
-  // mode === "hybrid" (Default)
-  const ftsResults = store.searchTurnsFTS(query, candidateLimit, {
-    projectPath,
-    scope,
-    filter,
-  });
-  let vecResults: any[] = [];
-  try {
-    const [queryVec] = await getEmbeddingClient().embed([query]);
-    vecResults = store.searchTurnsVector(queryVec, candidateLimit, {
+  } else {
+    // mode === "hybrid" (Default)
+    const ftsResults = store.searchTurnsFTS(query, candidateLimit, {
       projectPath,
       scope,
       filter,
     });
-  } catch (e: any) {
-    console.error(
-      "[Chronicle Search] Embedding generation fallback to keyword-only:",
-      e?.message || String(e)
+    let vecResults: any[] = [];
+    try {
+      const [queryVec] = await getEmbeddingClient().embed([query]);
+      vecResults = store.searchTurnsVector(queryVec, candidateLimit, {
+        projectPath,
+        scope,
+        filter,
+      });
+    } catch (e: any) {
+      console.error(
+        "[Chronicle Search] Embedding generation fallback to keyword-only:",
+        e?.message || String(e)
+      );
+    }
+
+    const rrfScores = new Map<string, { item: any; rrfScore: number }>();
+
+    // Reciprocal Rank Fusion: RRF(d) = sum 1 / (k + rank), k = 60
+    ftsResults.forEach((r, idx) => {
+      const key = `${r.sessionId}:${r.turnIndex}`;
+      const rank = idx + 1;
+      const score = 1 / (60 + rank);
+      rrfScores.set(key, { item: r, rrfScore: score });
+    });
+
+    vecResults.forEach((r, idx) => {
+      const key = `${r.sessionId}:${r.turnIndex}`;
+      const rank = idx + 1;
+      const score = 1 / (60 + rank);
+      if (rrfScores.has(key)) {
+        rrfScores.get(key)!.rrfScore += score;
+      } else {
+        rrfScores.set(key, { item: r, rrfScore: score });
+      }
+    });
+
+    candidates = Array.from(rrfScores.values()).map(
+      ({ item, rrfScore }) => ({
+        sessionId: item.sessionId,
+        turnIndex: item.turnIndex,
+        title: item.title,
+        role: item.role,
+        projectPath: item.projectPath,
+        score: rrfScore,
+        matchedUserPrompt: item.userPrompt,
+        matchedAssistantSnippet: item.assistantSnippet,
+        createdAt: item.createdAt,
+        conversationLink: `conversation://${item.sessionId}`,
+      })
     );
   }
-
-  const rrfScores = new Map<string, { item: any; rrfScore: number }>();
-
-  // Reciprocal Rank Fusion: RRF(d) = sum 1 / (k + rank), k = 60
-  ftsResults.forEach((r, idx) => {
-    const key = `${r.sessionId}:${r.turnIndex}`;
-    const rank = idx + 1;
-    const score = 1 / (60 + rank);
-    rrfScores.set(key, { item: r, rrfScore: score });
-  });
-
-  vecResults.forEach((r, idx) => {
-    const key = `${r.sessionId}:${r.turnIndex}`;
-    const rank = idx + 1;
-    const score = 1 / (60 + rank);
-    if (rrfScores.has(key)) {
-      rrfScores.get(key)!.rrfScore += score;
-    } else {
-      rrfScores.set(key, { item: r, rrfScore: score });
-    }
-  });
-
-  const candidates = Array.from(rrfScores.values()).map(
-    ({ item, rrfScore }) => ({
-      sessionId: item.sessionId,
-      turnIndex: item.turnIndex,
-      title: item.title,
-      role: item.role,
-      projectPath: item.projectPath,
-      score: rrfScore,
-      matchedUserPrompt: item.userPrompt,
-      matchedAssistantSnippet: item.assistantSnippet,
-      createdAt: item.createdAt,
-      conversationLink: `conversation://${item.sessionId}`,
-    })
-  );
 
   // Deterministic tie-breaking
   candidates.sort((a, b) => {
@@ -257,7 +269,27 @@ export async function searchHistory(
     return a.turnIndex - b.turnIndex;
   });
 
-  return candidates.slice(0, limit);
+  const slicedCandidates = candidates.slice(0, limit);
+
+  if (options.format === "markdown") {
+    return formatSearchHistoryMarkdown(query, slicedCandidates, mode, maxSnippetChars);
+  }
+
+  if (options.format === "json") {
+    if (options.fields || options.order) {
+      return projectFields(slicedCandidates, options.fields ?? options.order, "search");
+    }
+    if (options.detailLevel === "compact" || options.detailLevel === undefined) {
+      return projectFields(slicedCandidates, undefined, "search");
+    }
+    return slicedCandidates;
+  }
+
+  if (options.fields || options.order) {
+    return projectFields(slicedCandidates, options.fields ?? options.order, "search");
+  }
+
+  return slicedCandidates;
 }
 
 export async function queryTranscript(
@@ -266,7 +298,12 @@ export async function queryTranscript(
   const store = getStore();
 
   let targetSessionId = options.sessionId;
-  if (!targetSessionId) {
+  if (targetSessionId) {
+    const resolvedSession = store.getSession(targetSessionId);
+    if (resolvedSession) {
+      targetSessionId = resolvedSession.id;
+    }
+  } else {
     const activeProject = store.getActiveProjectPath();
     if (activeProject) {
       const recentWorkspaceSessions = store.listSessions({

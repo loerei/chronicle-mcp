@@ -23,6 +23,7 @@ import {
   handleSearchHistory,
   handleGetToolUsageStats,
   handleGetSessionBenchmarks,
+  handleOutputWrite,
 } from "../index.js";
 import { handleChronicleGuide } from "../guide.js";
 
@@ -548,5 +549,98 @@ describe("Chronicle MCP 2-Layer Tool Query Surface", () => {
       },
       { message: 'Tool "non_existent_tool" not found.' }
     );
+  });
+
+  it("11. should return compact 1-line markdown by default in handleSearchHistory with zero-match text and token savings", async () => {
+    populateSampleData();
+
+    // 1. Default format: markdown
+    const res = await handleSearchHistory({ query: "benchmark" });
+    const text = res.content[0].text;
+    assert.ok(text.startsWith('# Search Results for "benchmark"'));
+    assert.ok(text.includes('1. [root-ses:T2] (role:Architect) - "Run benchmark tests"'));
+
+    // 2. Zero-match query in keyword mode
+    const resZero = await handleSearchHistory({ query: "non_existent_keyword_xyz", mode: "keyword" });
+    assert.strictEqual(resZero.content[0].text, 'No matching history turns found for "non_existent_keyword_xyz".');
+  });
+
+  it("12. should support session prefix resolution in queryTranscript and getSession", async () => {
+    populateSampleData();
+
+    // Query transcript using prefix "root-ses" (>= 6 chars)
+    const res = await handleQueryTranscript({
+      sessionId: "root-ses",
+      turnIndex: 1,
+      detailLevel: "compact",
+    });
+    assert.ok(res.content[0].text.includes("### [Turn 1]"));
+    assert.ok(res.content[0].text.includes("Design the 2-layer storage model"));
+  });
+
+  it("13. should support JSON format, detailLevel, fields/order projection, and parameter clamping in handleSearchHistory", async () => {
+    populateSampleData();
+
+    // 1. format: json, detailLevel: compact
+    const resCompact = await handleSearchHistory({
+      query: "benchmark",
+      format: "json",
+      detailLevel: "compact",
+    });
+    const compactList = JSON.parse(resCompact.content[0].text);
+    assert.ok(Array.isArray(compactList));
+    assert.ok(compactList.length > 0);
+    assert.deepEqual(Object.keys(compactList[0]), [
+      "sessionId",
+      "turnIndex",
+      "score",
+      "snippet",
+      "role",
+      "projectPath",
+    ]);
+
+    // 2. Custom fields projection
+    const resProjected = await handleSearchHistory({
+      query: "benchmark",
+      format: "json",
+      fields: ["id", "turnIndex", "snippet"],
+      limit: 1,
+    });
+    const projList = JSON.parse(resProjected.content[0].text);
+    assert.strictEqual(projList.length, 1);
+    assert.deepEqual(Object.keys(projList[0]), ["id", "turnIndex", "snippet"]);
+
+    // 3. Zero match in JSON mode returns []
+    const resZeroJson = await handleSearchHistory({
+      query: "non_existent_zero_match",
+      mode: "keyword",
+      format: "json",
+    });
+    assert.strictEqual(resZeroJson.content[0].text, "[]");
+  });
+
+  it("14. should support output file export with path traversal containment checks and stderr audit warnings", async () => {
+    populateSampleData();
+
+    const validOutputFile = path.join(tempDir, "search_results.md");
+    const resValid = await handleSearchHistory({
+      query: "benchmark",
+      output: validOutputFile,
+    });
+    assert.ok(!resValid.isError);
+    assert.ok(fs.existsSync(validOutputFile));
+    const written = fs.readFileSync(validOutputFile, "utf-8");
+    assert.ok(written.includes('# Search Results for "benchmark"'));
+
+    // Path traversal block (e.g. C:/Windows/System32/evil.md or relative escape)
+    const dangerousPath = path.join("Z:", "unauthorized", "evil.md");
+    const resBlocked = handleOutputWrite("evil payload", dangerousPath);
+    assert.strictEqual(resBlocked.isError, true);
+    assert.ok(resBlocked.content[0].text.includes("Access denied"));
+
+    // Null byte path block
+    const nullByteRes = handleOutputWrite("null payload", "safe_name\0.md");
+    assert.strictEqual(nullByteRes.isError, true);
+    assert.ok(nullByteRes.content[0].text.includes("Invalid or dangerous"));
   });
 });

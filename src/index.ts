@@ -697,47 +697,95 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: getMcpToolDefinitions() };
 });
 
-function handleOutputWrite(
-  md: string,
+export function handleOutputWrite(
+  content: string | object,
   outputPath?: string,
   defaultFilename?: string
 ): any {
   if (!outputPath) {
+    const text = typeof content === "string" ? content : JSON.stringify(content, null, 2);
     return {
       content: [
         {
           type: "text",
-          text: md,
+          text,
+        },
+      ],
+    };
+  }
+
+  if (typeof outputPath !== "string" || !outputPath.trim() || outputPath.includes("\0")) {
+    process.stderr.write(
+      `[Chronicle MCP] [Security] Blocked path traversal attempt in output parameter: "${outputPath}" outside authorized roots.\n`
+    );
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: Invalid or dangerous output path provided: "${outputPath}"`,
         },
       ],
     };
   }
 
   try {
-    let targetPath = outputPath;
-    
-    // Check if the outputPath is a directory or doesn't look like a file
+    const resolvedPath = path.resolve(outputPath);
+    const normalizedTargetPath = resolvedPath.replaceAll("\\", "/").toLowerCase();
+
+    const authorizedRoots = [
+      process.cwd(),
+      os.tmpdir(),
+      process.env.APPDATA || "",
+      process.env.HOME || process.env.USERPROFILE || "",
+    ]
+      .filter(Boolean)
+      .map((r) => path.resolve(r).replaceAll("\\", "/").toLowerCase());
+
+    const isAuthorized = authorizedRoots.some(
+      (root) =>
+        normalizedTargetPath === root ||
+        normalizedTargetPath.startsWith(root.endsWith("/") ? root : `${root}/`)
+    );
+
+    if (!isAuthorized) {
+      process.stderr.write(
+        `[Chronicle MCP] [Security] Blocked path traversal attempt in output parameter: "${resolvedPath}" outside authorized roots.\n`
+      );
+      return {
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: `Error: Access denied. Output path "${outputPath}" is outside authorized workspace and temporary directories.`,
+          },
+        ],
+      };
+    }
+
+    let targetPath = resolvedPath;
     let isDir = false;
     try {
-      if (fs.existsSync(outputPath) && fs.statSync(outputPath).isDirectory()) {
+      if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) {
         isDir = true;
       }
     } catch {
-      // If it doesn't exist, check if it doesn't end with .md
-      if (!outputPath.toLowerCase().endsWith(".md")) {
+      const ext = path.extname(resolvedPath).toLowerCase();
+      if (![".md", ".json", ".txt", ".html"].includes(ext)) {
         isDir = true;
       }
     }
 
     if (isDir) {
-      fs.mkdirSync(outputPath, { recursive: true });
+      fs.mkdirSync(resolvedPath, { recursive: true });
       const filename = defaultFilename || `output_${Date.now()}.md`;
-      targetPath = path.join(outputPath, filename);
+      targetPath = path.join(resolvedPath, filename);
     } else {
-      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
     }
 
-    fs.writeFileSync(targetPath, md, "utf-8");
+    const payload = typeof content === "string" ? content : JSON.stringify(content, null, 2);
+    fs.writeFileSync(targetPath, payload, "utf-8");
     const filename = path.basename(targetPath);
     return {
       content: [
@@ -1177,30 +1225,80 @@ async function handleSearchSteps(args: any): Promise<any> {
 }
 
 export async function handleSearchHistory(args: any): Promise<any> {
-  const query = args?.query as string;
-  const mode = args?.mode as "hybrid" | "semantic" | "keyword" | undefined;
-  const limit = (args?.limit as number) || 5;
-  const projectPath = args?.projectPath as string | undefined;
-  const scope = args?.scope as ScopeType | undefined;
-  const filter = args?.filter;
+  try {
+    const query = args?.query as string;
+    const mode = args?.mode as "hybrid" | "semantic" | "keyword" | undefined;
+    const rawLimit = args?.limit;
+    const limit =
+      typeof rawLimit === "number" && !Number.isNaN(rawLimit)
+        ? Math.max(1, Math.min(Math.floor(rawLimit), 100))
+        : 10;
+    const projectPath = args?.projectPath as string | undefined;
+    const scope = args?.scope as ScopeType | undefined;
+    const filter = args?.filter;
+    const format = args?.format === "json" ? "json" : "markdown";
+    const detailLevel = args?.detailLevel as "compact" | "full" | undefined;
+    const fields = (args?.fields ?? args?.order) as string[] | string | undefined;
+    const rawMaxSnippetChars = args?.maxSnippetChars;
+    const maxSnippetChars =
+      typeof rawMaxSnippetChars === "number" && !Number.isNaN(rawMaxSnippetChars)
+        ? Math.max(20, Math.min(Math.floor(rawMaxSnippetChars), 500))
+        : 120;
+    const outputPath = args?.output as string | undefined;
 
-  const hits = await searchHistory({
-    query,
-    mode,
-    limit,
-    projectPath,
-    scope,
-    filter,
-  });
+    const result = await searchHistory({
+      query,
+      mode,
+      limit,
+      projectPath,
+      scope,
+      filter,
+      format,
+      detailLevel,
+      fields,
+      maxSnippetChars,
+    });
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(hits, null, 2),
-      },
-    ],
-  };
+    if (format === "json") {
+      const jsonText = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      if (outputPath) {
+        return handleOutputWrite(jsonText, outputPath, `search_${Date.now()}.json`);
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText,
+          },
+        ],
+      };
+    }
+
+    // format === "markdown"
+    const mdText = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+    if (outputPath) {
+      return handleOutputWrite(mdText, outputPath, `search_${Date.now()}.md`);
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: mdText,
+        },
+      ],
+    };
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "search_history" failed: ${e.message}\n${e.stack}\n`);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: ${e.message}`,
+        },
+      ],
+    };
+  }
 }
 
 export async function handleGetToolUsageStats(args: any): Promise<any> {
