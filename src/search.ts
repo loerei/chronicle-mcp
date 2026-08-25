@@ -279,7 +279,7 @@ export async function searchHistory(
     if (options.fields || options.order) {
       return projectFields(slicedCandidates, options.fields ?? options.order, "search");
     }
-    if (options.detailLevel === "compact" || options.detailLevel === undefined) {
+    if (options.detailLevel === "compact") {
       return projectFields(slicedCandidates, undefined, "search");
     }
     return slicedCandidates;

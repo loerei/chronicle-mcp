@@ -48,6 +48,29 @@ export function isLegacyToolsEnabled(): boolean {
   );
 }
 
+let hasLoggedKillswitchNotice = false;
+
+export function resetKillswitchState(): void {
+  hasLoggedKillswitchNotice = false;
+}
+
+export function isProgressiveDisclosureEnabled(): boolean {
+  const envVal = process.env.CHRONICLE_PROGRESSIVE_DISCLOSURE_ENABLED;
+  if (envVal !== undefined) {
+    const clean = envVal.trim().toLowerCase();
+    if (["false", "0", "off", "no"].includes(clean)) {
+      if (!hasLoggedKillswitchNotice) {
+        process.stderr.write(
+          `[Chronicle MCP] Operational kill-switch active: Progressive disclosure defaults disabled. Reverting to legacy JSON output.\n`
+        );
+        hasLoggedKillswitchNotice = true;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 export async function syncSingleSession(s: any, store: any): Promise<boolean> {
   const turns = s.turns || [];
   const steps = s.steps || [];
@@ -893,6 +916,7 @@ export function handleOutputWrite(
 
 export async function handleListSessions(args: any): Promise<any> {
   try {
+    const progressiveEnabled = isProgressiveDisclosureEnabled();
     const adapter = args?.adapter as string | undefined;
     const parentId = args?.parentId as string | undefined;
     const role = args?.role as string | undefined;
@@ -910,8 +934,8 @@ export async function handleListSessions(args: any): Promise<any> {
     const scope = args?.scope as ScopeType | undefined;
     const timeRange = args?.timeRange as string | undefined;
     const sortBy = args?.sortBy as "created" | "active" | undefined;
-    const format = args?.format === "json" ? "json" : "markdown";
-    const detailLevel = args?.detailLevel as "compact" | "full" | undefined;
+    const format = args?.format ?? (progressiveEnabled ? "markdown" : "json");
+    const detailLevel = args?.detailLevel ?? (progressiveEnabled ? "compact" : "full");
     const fields = (args?.fields ?? args?.order) as string[] | string | undefined;
     const rawMaxSnippetChars = args?.maxSnippetChars;
     const maxSnippetChars =
@@ -940,7 +964,7 @@ export async function handleListSessions(args: any): Promise<any> {
         result = [];
       } else if (fields) {
         result = projectFields(sessions, fields, "session");
-      } else if (detailLevel === "compact" || detailLevel === undefined) {
+      } else if (detailLevel === "compact") {
         result = projectFields(sessions, undefined, "session");
       } else {
         // full
@@ -1005,45 +1029,58 @@ export async function handleListSessions(args: any): Promise<any> {
 }
 
 export async function handleGetSessionRelationship(args: any): Promise<any> {
-  const sessionId = args?.sessionId as string | undefined;
-  if (!sessionId) {
+  try {
+    const sessionId = args?.sessionId as string | undefined;
+    if (!sessionId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: Missing required parameter 'sessionId'.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const maxDepth = typeof args?.maxDepth === "number" ? args.maxDepth : 3;
+    const includeAncestors = args?.includeAncestors !== false;
+
+    const store = getStore();
+    const rel = store.getSessionRelationship(sessionId, maxDepth, includeAncestors);
+
+    if (!rel) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Session '${sessionId}' not found.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
     return {
       content: [
         {
           type: "text",
-          text: "Error: Missing required parameter 'sessionId'.",
+          text: JSON.stringify(rel, null, 2),
         },
       ],
-      isError: true,
     };
-  }
-
-  const maxDepth = typeof args?.maxDepth === "number" ? args.maxDepth : 3;
-  const includeAncestors = args?.includeAncestors !== false;
-
-  const store = getStore();
-  const rel = store.getSessionRelationship(sessionId, maxDepth, includeAncestors);
-
-  if (!rel) {
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "get_session_relationship" failed: ${e.message}\n${e.stack}\n`);
     return {
+      isError: true,
       content: [
         {
           type: "text",
-          text: `Session '${sessionId}' not found.`,
+          text: `Error: ${e.message}`,
         },
       ],
-      isError: true,
     };
   }
-
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(rel, null, 2),
-      },
-    ],
-  };
 }
 
 function getStepTypeLabel(step: any, includeCallResults?: boolean): string {
@@ -1210,149 +1247,175 @@ export async function handleGetSessionArtifacts(
   args: any,
   brainBaseDir?: string
 ): Promise<any> {
-  const sessionId = args?.sessionId as string;
-  if (!sessionId) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: "Error: Missing required parameter 'sessionId'.",
-        },
-      ],
-      isError: true,
-    };
-  }
+  try {
+    const sessionId = args?.sessionId as string;
+    if (!sessionId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: Missing required parameter 'sessionId'.",
+          },
+        ],
+        isError: true,
+      };
+    }
 
-  const includeSubtree = args?.includeSubtree === true;
-  const artifactNameFilter = args?.artifactName as string | undefined;
-  const homedir = os.homedir();
-  const brainDir =
-    brainBaseDir || path.join(homedir, ".gemini", "antigravity", "brain");
+    const includeSubtree = args?.includeSubtree === true;
+    const artifactNameFilter = args?.artifactName as string | undefined;
+    const homedir = os.homedir();
+    const brainDir =
+      brainBaseDir || path.join(homedir, ".gemini", "antigravity", "brain");
 
-  const store = getStore();
-  const descriptors = store.getArtifactDescriptors(
-    sessionId,
-    includeSubtree,
-    artifactNameFilter
-  );
+    const store = getStore();
+    const descriptors = store.getArtifactDescriptors(
+      sessionId,
+      includeSubtree,
+      artifactNameFilter
+    );
 
-  // Fallback: If DB had no descriptors for current session, inspect disk
-  if (descriptors.length === 0) {
-    const sessionDir = path.join(brainDir, sessionId);
-    if (fs.existsSync(sessionDir)) {
-      try {
-        const diskFiles = fs
-          .readdirSync(sessionDir)
-          .filter((f) => f.endsWith(".md"));
-        for (const df of diskFiles) {
-          if (
-            !artifactNameFilter ||
-            df.toLowerCase().includes(artifactNameFilter.toLowerCase())
-          ) {
-            descriptors.push({ sessionId, filename: df });
+    // Fallback: If DB had no descriptors for current session, inspect disk
+    if (descriptors.length === 0) {
+      const sessionDir = path.join(brainDir, sessionId);
+      if (fs.existsSync(sessionDir)) {
+        try {
+          const diskFiles = fs
+            .readdirSync(sessionDir)
+            .filter((f) => f.endsWith(".md"));
+          for (const df of diskFiles) {
+            if (
+              !artifactNameFilter ||
+              df.toLowerCase().includes(artifactNameFilter.toLowerCase())
+            ) {
+              descriptors.push({ sessionId, filename: df });
+            }
           }
-        }
-      } catch {}
-    }
-  }
-
-  if (descriptors.length === 0) {
-    const subtreeSuffix = includeSubtree ? " (including subtree)" : "";
-    const filterSuffix = artifactNameFilter ? ` matching "${artifactNameFilter}"` : "";
-    return {
-      content: [
-        {
-          type: "text",
-          text: `No markdown artifacts found for session "${sessionId}"${subtreeSuffix}${filterSuffix}.`,
-        },
-      ],
-    };
-  }
-
-  let md = `# Artifacts for Session: ${sessionId}\n\n`;
-  const MAX_ARTIFACT_BYTES = 512 * 1024; // 512 KB
-
-  for (const desc of descriptors) {
-    const targetSessionDir = path.join(brainDir, desc.sessionId);
-    const targetPath = path.resolve(targetSessionDir, desc.filename);
-
-    // Sibling directory escape & containment check
-    const rel = path.relative(targetSessionDir, targetPath);
-    const isContained =
-      !rel.startsWith("..") &&
-      !path.isAbsolute(rel) &&
-      targetPath.startsWith(targetSessionDir + path.sep);
-
-    if (!isContained) {
-      md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
-      md += `> [!WARNING]\n> Path traversal blocked for artifact "${desc.filename}".\n\n---\n\n`;
-      continue;
+        } catch {}
+      }
     }
 
-    if (!fs.existsSync(targetPath)) {
-      md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
-      md += `> [!NOTE]\n> Artifact file not found on disk at \`${targetPath}\`.\n\n---\n\n`;
-      continue;
+    if (descriptors.length === 0) {
+      const subtreeSuffix = includeSubtree ? " (including subtree)" : "";
+      const filterSuffix = artifactNameFilter ? ` matching "${artifactNameFilter}"` : "";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `No markdown artifacts found for session "${sessionId}"${subtreeSuffix}${filterSuffix}.`,
+          },
+        ],
+      };
     }
 
-    try {
-      const stats = fs.statSync(targetPath);
-      if (!stats.isFile()) continue;
+    let md = `# Artifacts for Session: ${sessionId}\n\n`;
+    const MAX_ARTIFACT_BYTES = 512 * 1024; // 512 KB
 
-      let content = fs.readFileSync(targetPath, "utf-8");
-      if (stats.size > MAX_ARTIFACT_BYTES) {
-        content =
-          content.slice(0, MAX_ARTIFACT_BYTES) +
-          `\n\n... [Truncated: artifact exceeded ${MAX_ARTIFACT_BYTES / 1024} KB limit]`;
+    for (const desc of descriptors) {
+      const targetSessionDir = path.join(brainDir, desc.sessionId);
+      const targetPath = path.resolve(targetSessionDir, desc.filename);
+
+      // Sibling directory escape & containment check
+      const rel = path.relative(targetSessionDir, targetPath);
+      const isContained =
+        !rel.startsWith("..") &&
+        !path.isAbsolute(rel) &&
+        targetPath.startsWith(targetSessionDir + path.sep);
+
+      if (!isContained) {
+        md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
+        md += `> [!WARNING]\n> Path traversal blocked for artifact "${desc.filename}".\n\n---\n\n`;
+        continue;
       }
 
-      md += `## File: [${desc.filename}](file:///${targetPath.replaceAll("\\", "/")}) (Session: ${desc.sessionId})\n\n`;
-      md += `${content}\n\n`;
-      md += `--- \n\n`;
-    } catch (e: any) {
-      md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
-      md += `> [!WARNING]\n> Error reading artifact: ${e?.message || String(e)}\n\n---\n\n`;
-    }
-  }
+      if (!fs.existsSync(targetPath)) {
+        md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
+        md += `> [!NOTE]\n> Artifact file not found on disk at \`${targetPath}\`.\n\n---\n\n`;
+        continue;
+      }
 
-  const outputPath = args?.output as string | undefined;
-  return handleOutputWrite(md, outputPath, `artifacts_${sessionId}.md`);
+      try {
+        const stats = fs.statSync(targetPath);
+        if (!stats.isFile()) continue;
+
+        let content = fs.readFileSync(targetPath, "utf-8");
+        if (stats.size > MAX_ARTIFACT_BYTES) {
+          content =
+            content.slice(0, MAX_ARTIFACT_BYTES) +
+            `\n\n... [Truncated: artifact exceeded ${MAX_ARTIFACT_BYTES / 1024} KB limit]`;
+        }
+
+        md += `## File: [${desc.filename}](file:///${targetPath.replaceAll("\\", "/")}) (Session: ${desc.sessionId})\n\n`;
+        md += `${content}\n\n`;
+        md += `--- \n\n`;
+      } catch (e: any) {
+        md += `## File: ${desc.filename} (Session: ${desc.sessionId})\n\n`;
+        md += `> [!WARNING]\n> Error reading artifact: ${e?.message || String(e)}\n\n---\n\n`;
+      }
+    }
+
+    const outputPath = args?.output as string | undefined;
+    return handleOutputWrite(md, outputPath, `artifacts_${sessionId}.md`);
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "get_session_artifacts" failed: ${e.message}\n${e.stack}\n`);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: ${e.message}`,
+        },
+      ],
+    };
+  }
 }
 
 export async function handleQueryTranscript(args: any): Promise<any> {
-  const result = await queryTranscript({
-    sessionId: args?.sessionId,
-    turnIndex: args?.turnIndex,
-    startTurn: args?.startTurn ?? args?.startConversationStep,
-    endTurn: args?.endTurn ?? args?.endConversationStep,
-    lastTurns: args?.lastTurns,
-    detailLevel: args?.detailLevel,
-    include: args?.include,
-    filePath: args?.filePath,
-    toolFilter:
-      args?.toolFilter ??
-      (args?.toolName || args?.serverName || args?.status || args?.type
-        ? {
-            name: args?.toolName,
-            server: args?.serverName,
-            status: args?.status,
-            kind: args?.type,
-          }
-        : undefined),
-    includeSubtree: args?.includeSubtree,
-    includeUndone: args?.includeUndone,
-    maxResultChars: args?.maxResultChars,
-    output: args?.output,
-  });
+  try {
+    const result = await queryTranscript({
+      sessionId: args?.sessionId,
+      turnIndex: args?.turnIndex,
+      startTurn: args?.startTurn ?? args?.startConversationStep,
+      endTurn: args?.endTurn ?? args?.endConversationStep,
+      lastTurns: args?.lastTurns,
+      detailLevel: args?.detailLevel,
+      include: args?.include,
+      filePath: args?.filePath,
+      toolFilter:
+        args?.toolFilter ??
+        (args?.toolName || args?.serverName || args?.status || args?.type
+          ? {
+              name: args?.toolName,
+              server: args?.serverName,
+              status: args?.status,
+              kind: args?.type,
+            }
+          : undefined),
+      includeSubtree: args?.includeSubtree,
+      includeUndone: args?.includeUndone,
+      maxResultChars: args?.maxResultChars,
+      output: args?.output,
+    });
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: result.text,
-      },
-    ],
-  };
+    return {
+      content: [
+        {
+          type: "text",
+          text: result.text,
+        },
+      ],
+    };
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "query_transcript" failed: ${e.message}\n${e.stack}\n`);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: ${e.message}`,
+        },
+      ],
+    };
+  }
 }
 
 async function handleSearchSteps(args: any): Promise<any> {
@@ -1368,6 +1431,7 @@ async function handleSearchSteps(args: any): Promise<any> {
 
 export async function handleSearchHistory(args: any): Promise<any> {
   try {
+    const progressiveEnabled = isProgressiveDisclosureEnabled();
     const query = args?.query as string;
     const mode = args?.mode as "hybrid" | "semantic" | "keyword" | undefined;
     const rawLimit = args?.limit;
@@ -1378,8 +1442,8 @@ export async function handleSearchHistory(args: any): Promise<any> {
     const projectPath = args?.projectPath as string | undefined;
     const scope = args?.scope as ScopeType | undefined;
     const filter = args?.filter;
-    const format = args?.format === "json" ? "json" : "markdown";
-    const detailLevel = args?.detailLevel as "compact" | "full" | undefined;
+    const format = args?.format ?? (progressiveEnabled ? "markdown" : "json");
+    const detailLevel = args?.detailLevel ?? (progressiveEnabled ? "compact" : "full");
     const fields = (args?.fields ?? args?.order) as string[] | string | undefined;
     const rawMaxSnippetChars = args?.maxSnippetChars;
     const maxSnippetChars =
@@ -1507,105 +1571,118 @@ export async function handleGetToolUsageStats(args: any): Promise<any> {
 }
 
 export async function handleGetSessionBenchmarks(args: any): Promise<any> {
-  const sessionIds = args?.sessionIds as string[];
-  const groups = args?.groups as Array<{ name: string; sessionIds: string[] }> | undefined;
+  try {
+    const sessionIds = args?.sessionIds as string[];
+    const groups = args?.groups as Array<{ name: string; sessionIds: string[] }> | undefined;
 
-  const metrics = await computeSessionBenchmarks(sessionIds);
-  const metricsMap = new Map<string, typeof metrics[0]>();
-  for (const m of metrics) {
-    metricsMap.set(m.sessionId, m);
-  }
+    const metrics = await computeSessionBenchmarks(sessionIds);
+    const metricsMap = new Map<string, typeof metrics[0]>();
+    for (const m of metrics) {
+      metricsMap.set(m.sessionId, m);
+    }
 
-  let md = `# Session Benchmarking Report\n\n`;
+    let md = `# Session Benchmarking Report\n\n`;
 
-  if (groups && groups.length > 0) {
-    md += `## Group Comparison\n\n`;
-    md += `| Group | Avg Steps | Avg Tool Calls | Avg Duration (s) | Avg Cum. Input | Avg Cache Hit % | Avg Cost Saved % | Avg Peak Context | Total Errors |\n`;
-    md += `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
+    if (groups && groups.length > 0) {
+      md += `## Group Comparison\n\n`;
+      md += `| Group | Avg Steps | Avg Tool Calls | Avg Duration (s) | Avg Cum. Input | Avg Cache Hit % | Avg Cost Saved % | Avg Peak Context | Total Errors |\n`;
+      md += `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
 
-    for (const g of groups) {
-      let sumSteps = 0;
-      let sumToolCalls = 0;
-      let sumDurationMs = 0;
-      let durationCount = 0;
-      let sumCumulativeInput = 0;
-      let sumCacheHitTokens = 0;
-      let sumCacheMissTokens = 0;
-      let sumPeakContext = 0;
-      let sumErrors = 0;
-      let count = 0;
+      for (const g of groups) {
+        let sumSteps = 0;
+        let sumToolCalls = 0;
+        let sumDurationMs = 0;
+        let durationCount = 0;
+        let sumCumulativeInput = 0;
+        let sumCacheHitTokens = 0;
+        let sumCacheMissTokens = 0;
+        let sumPeakContext = 0;
+        let sumErrors = 0;
+        let count = 0;
 
-      for (const sid of g.sessionIds) {
-        const m = metricsMap.get(sid);
-        if (m) {
-          sumSteps += m.totalSteps;
-          sumToolCalls += m.toolCallsCount;
-          if (m.durationMs !== null) {
-            sumDurationMs += m.durationMs;
-            durationCount++;
+        for (const sid of g.sessionIds) {
+          const m = metricsMap.get(sid);
+          if (m) {
+            sumSteps += m.totalSteps;
+            sumToolCalls += m.toolCallsCount;
+            if (m.durationMs !== null) {
+              sumDurationMs += m.durationMs;
+              durationCount++;
+            }
+            sumCumulativeInput += m.cumulativeInputTokens;
+            sumCacheHitTokens += m.cacheHitTokens;
+            sumCacheMissTokens += m.cacheMissTokens;
+            sumPeakContext += m.peakContextSize;
+            sumErrors += m.errorStepsCount;
+            count++;
           }
-          sumCumulativeInput += m.cumulativeInputTokens;
-          sumCacheHitTokens += m.cacheHitTokens;
-          sumCacheMissTokens += m.cacheMissTokens;
-          sumPeakContext += m.peakContextSize;
-          sumErrors += m.errorStepsCount;
-          count++;
+        }
+
+        if (count > 0) {
+          const avgSteps = (sumSteps / count).toFixed(1);
+          const avgToolCalls = (sumToolCalls / count).toFixed(1);
+          const avgDuration = durationCount > 0 ? (sumDurationMs / durationCount / 1000).toFixed(1) : "N/A";
+          const avgCumInput = Math.round(sumCumulativeInput / count).toLocaleString();
+          const avgCacheHitRate = sumCumulativeInput > 0 ? ((sumCacheHitTokens / sumCumulativeInput) * 100).toFixed(1) : "0.0";
+          const avgCostSavings = sumCumulativeInput > 0 ? ((1 - (sumCacheMissTokens + 0.1 * sumCacheHitTokens) / sumCumulativeInput) * 100).toFixed(1) : "0.0";
+          const avgPeakContext = Math.round(sumPeakContext / count).toLocaleString();
+          md += `| **${g.name}** (${count} sessions) | ${avgSteps} | ${avgToolCalls} | ${avgDuration}s | ${avgCumInput} | ${avgCacheHitRate}% | ${avgCostSavings}% | ${avgPeakContext} | ${sumErrors} |\n`;
+        } else {
+          md += `| **${g.name}** | - | - | - | - | - | - | - | - |\n`;
         }
       }
+      md += `\n`;
+    }
 
-      if (count > 0) {
-        const avgSteps = (sumSteps / count).toFixed(1);
-        const avgToolCalls = (sumToolCalls / count).toFixed(1);
-        const avgDuration = durationCount > 0 ? (sumDurationMs / durationCount / 1000).toFixed(1) : "N/A";
-        const avgCumInput = Math.round(sumCumulativeInput / count).toLocaleString();
-        const avgCacheHitRate = sumCumulativeInput > 0 ? ((sumCacheHitTokens / sumCumulativeInput) * 100).toFixed(1) : "0.0";
-        const avgCostSavings = sumCumulativeInput > 0 ? ((1 - (sumCacheMissTokens + 0.1 * sumCacheHitTokens) / sumCumulativeInput) * 100).toFixed(1) : "0.0";
-        const avgPeakContext = Math.round(sumPeakContext / count).toLocaleString();
-        md += `| **${g.name}** (${count} sessions) | ${avgSteps} | ${avgToolCalls} | ${avgDuration}s | ${avgCumInput} | ${avgCacheHitRate}% | ${avgCostSavings}% | ${avgPeakContext} | ${sumErrors} |\n`;
-      } else {
-        md += `| **${g.name}** | - | - | - | - | - | - | - | - |\n`;
+    md += `## Individual Session Breakdown\n\n`;
+    md += `| Session / ID | Group | Steps | Tool Calls | Duration | Cum. Input | Cache Hit % | Cost Saved % | Peak Context | Output Tokens | Errors |\n`;
+    md += `| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
+
+    for (const m of metrics) {
+      let groupName = "N/A";
+      if (groups) {
+        const g = groups.find(x => x.sessionIds.includes(m.sessionId));
+        if (g) groupName = g.name;
       }
+
+      const durationText = m.durationMs === null ? "N/A" : `${(m.durationMs / 1000).toFixed(1)}s`;
+      const titleText = m.title.length > 40 ? m.title.slice(0, 37) + "..." : m.title;
+      const homedir = os.homedir();
+      const sessionLink = `[${titleText}](file:///${homedir.replaceAll("\\", "/")}/.gemini/antigravity/brain/${m.sessionId})`;
+
+      md += `| ${sessionLink}<br>\`${m.sessionId.slice(0, 8)}\` | ${groupName} | ${m.totalSteps} | ${m.toolCallsCount} | ${durationText} | ${m.cumulativeInputTokens.toLocaleString()} | ${m.cacheHitRate.toFixed(1)}% | ${m.estimatedCostSavings.toFixed(1)}% | ${m.peakContextSize.toLocaleString()} | ${m.estimatedOutputTokens.toLocaleString()} | ${m.errorStepsCount} |\n`;
     }
     md += `\n`;
-  }
 
-  md += `## Individual Session Breakdown\n\n`;
-  md += `| Session / ID | Group | Steps | Tool Calls | Duration | Cum. Input | Cache Hit % | Cost Saved % | Peak Context | Output Tokens | Errors |\n`;
-  md += `| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
-
-  for (const m of metrics) {
-    let groupName = "N/A";
-    if (groups) {
-      const g = groups.find(x => x.sessionIds.includes(m.sessionId));
-      if (g) groupName = g.name;
-    }
-
-    const durationText = m.durationMs === null ? "N/A" : `${(m.durationMs / 1000).toFixed(1)}s`;
-    const titleText = m.title.length > 40 ? m.title.slice(0, 37) + "..." : m.title;
-    const homedir = os.homedir();
-    const sessionLink = `[${titleText}](file:///${homedir.replaceAll("\\", "/")}/.gemini/antigravity/brain/${m.sessionId})`;
-
-    md += `| ${sessionLink}<br>\`${m.sessionId.slice(0, 8)}\` | ${groupName} | ${m.totalSteps} | ${m.toolCallsCount} | ${durationText} | ${m.cumulativeInputTokens.toLocaleString()} | ${m.cacheHitRate.toFixed(1)}% | ${m.estimatedCostSavings.toFixed(1)}% | ${m.peakContextSize.toLocaleString()} | ${m.estimatedOutputTokens.toLocaleString()} | ${m.errorStepsCount} |\n`;
-  }
-  md += `\n`;
-
-  const linechartPath = (args?.linechart_output || args?.linechartOutput) as string | undefined;
-  if (linechartPath && sessionIds && sessionIds.length > 0) {
-    const store = getStore();
-    for (const sid of sessionIds) {
-      const qResult = store.query({ sessionId: sid, includeSteps: true });
-      const sess = qResult.sessions[0];
-      if (sess && qResult.steps) {
-        const chartHtml = generateInteractiveContextChartHtml(sid, sess.title || sid, qResult.steps);
-        const chartResult = await handleOutputWrite(chartHtml, linechartPath, `context_chart_${sid.slice(0, 8)}.html`);
-        const writtenText = chartResult.content?.[0]?.text || "";
-        md += `> **Interactive Context Window Chart**: ${writtenText}\n\n`;
+    const linechartPath = (args?.linechart_output || args?.linechartOutput) as string | undefined;
+    if (linechartPath && sessionIds && sessionIds.length > 0) {
+      const store = getStore();
+      for (const sid of sessionIds) {
+        const qResult = store.query({ sessionId: sid, includeSteps: true });
+        const sess = qResult.sessions[0];
+        if (sess && qResult.steps) {
+          const chartHtml = generateInteractiveContextChartHtml(sid, sess.title || sid, qResult.steps);
+          const chartResult = await handleOutputWrite(chartHtml, linechartPath, `context_chart_${sid.slice(0, 8)}.html`);
+          const writtenText = chartResult.content?.[0]?.text || "";
+          md += `> **Interactive Context Window Chart**: ${writtenText}\n\n`;
+        }
       }
     }
-  }
 
-  const outputPath = args?.output as string | undefined;
-  return handleOutputWrite(md, outputPath, `benchmarks_${Date.now()}.md`);
+    const outputPath = args?.output as string | undefined;
+    return handleOutputWrite(md, outputPath, `benchmarks_${Date.now()}.md`);
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "get_session_benchmarks" failed: ${e.message}\n${e.stack}\n`);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: ${e.message}`,
+        },
+      ],
+    };
+  }
 }
 
 export async function handleCallToolRequest(
@@ -1680,6 +1757,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     return await handleCallToolRequest(name, args, reporter);
   } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "${name}" failed: ${e.message}\n${e.stack}\n`);
     return {
       content: [
         {
