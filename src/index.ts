@@ -270,10 +270,42 @@ export function getMcpToolDefinitions(): any[] {
     {
       name: "chronicle_guide",
       description:
-        "Self-guide tool providing usage patterns, tool selection matrix, and token-saving rules for chronicle-mcp.",
+        "Return version-current policy snippet, tool decision tree, and actionable workflow recipes for chronicle-mcp. Pass 'topic' (or 'topics') to retrieve targeted step-by-step workflow recipes, concrete parameter examples, and anti-patterns for specific tasks. Available topics: 'general', 'search', 'artifacts', 'subagents', 'benchmarks', 'debug_errors', 'all'.",
       inputSchema: {
         type: "object",
-        properties: {},
+        properties: {
+          topic: {
+            type: "string",
+            enum: [
+              "general",
+              "search",
+              "artifacts",
+              "subagents",
+              "benchmarks",
+              "debug_errors",
+              "all",
+            ],
+            description:
+              "Targeted workflow topic to retrieve specialized recipes and guidelines. Supports comma-delimited strings (e.g. 'search,benchmarks'). Default: 'general'.",
+          },
+          topics: {
+            type: "array",
+            items: {
+              type: "string",
+              enum: [
+                "general",
+                "search",
+                "artifacts",
+                "subagents",
+                "benchmarks",
+                "debug_errors",
+                "all",
+              ],
+            },
+            description:
+              "Optional list of topics to combine in a single guide response.",
+          },
+        },
       },
     },
     {
@@ -1690,13 +1722,13 @@ export async function handleCallToolRequest(
   args: any,
   reporter?: ProgressReporter
 ): Promise<any> {
-  if (isAutoSyncEnabled() && name !== "sync_history") {
+  if (isAutoSyncEnabled() && name !== "sync_history" && name !== "chronicle_guide") {
     await syncHistory(false, reporter);
   }
 
   switch (name) {
     case "chronicle_guide":
-      return handleChronicleGuide();
+      return handleChronicleGuide(args);
     case "list_sessions":
       return await handleListSessions(args);
     case "get_session_relationship":

@@ -11,7 +11,14 @@
 
 ### 2. Mandatory Chronicle MCP Tool Usage
 When asked to read, query, summarize, or search past conversations, sessions, tool executions, or errors, you MUST use the registered `chronicle-mcp` tools:
-- **`chronicle_guide`**: Call first when starting history exploration to review token-saving rules, decision tree, and parameter guidelines.
+- **`chronicle_guide`**: Call first when starting history exploration to review targeted recipes and parameter guidelines. Specify `topic` (or `topics`) for specialized workflows:
+  - `topic: "general"` (default): Decision router flowchart, tool selection matrix, and token conservation rules.
+  - `topic: "search"`: Precision turn search, hybrid vs keyword modes, turn slicing (`lastTurns`, `turnIndex: -1`, `startTurn`/`endTurn`), and field projection.
+  - `topic: "artifacts"`: Artifact discovery, shallow/subtree extraction, and zero-token direct disk export via `output: "<path>"`.
+  - `topic: "subagents"`: Swarm topology, delegation trees, and aggregated multi-agent chronological timelines.
+  - `topic: "benchmarks"`: Multi-variant A/B/C performance comparison, token metrics dictionary, and interactive context chart export.
+  - `topic: "debug_errors"`: Tool failure analytics, error rate tracking, and loop thrashing diagnosis (`serverName::toolName`).
+  - `topic: "all"`: Full comprehensive reference manual.
 - **`sync_history`**: Call `sync_history(force=true)` before querying recent history to ensure all un-indexed log entries from disk are indexed into the database.
 - **`query_transcript`**: Primary tool to read, query, filter, slice, or export transcript entries (`detailLevel: 'compact' | 'full' | 'summary'`). Supports session ID prefix lookup (>= 6 chars).
 - **`list_sessions`**: Retrieve history metadata and session IDs. Defaults to compact 1-line markdown list (saving 80–90% tokens). Supports `format: "json"`, `detailLevel: "compact" | "full"`, `fields` projection, and `limit: 1–100`.

@@ -1,7 +1,98 @@
-export function handleChronicleGuide(): any {
-  const guideContent = {
-    version: "2.0.0",
-    content: `## chronicle-mcp (v2.0.0)
+export interface ChronicleGuideArgs {
+  topic?: string | string[];
+  topics?: string | string[];
+}
+
+export type ChronicleGuideTopic =
+  | "general"
+  | "search"
+  | "artifacts"
+  | "subagents"
+  | "benchmarks"
+  | "debug_errors";
+
+export interface NormalizedTopicResult {
+  validTopics: ChronicleGuideTopic[];
+  invalidTopics: string[];
+}
+
+export const CANONICAL_TOPICS: ChronicleGuideTopic[] = [
+  "general",
+  "search",
+  "artifacts",
+  "subagents",
+  "benchmarks",
+  "debug_errors",
+];
+
+const DISCOVERABILITY_FOOTER =
+  "---\n*Topic Catalog: `general` (Router & Overview) | `search` (Search & Slicing) | `artifacts` (Plans & Direct Export) | `subagents` (Swarm Topology) | `benchmarks` (Token Metrics & Charts) | `debug_errors` (Failures & Thrashing) | `all` (Full Manual)*";
+
+export function normalizeTopics(args?: ChronicleGuideArgs): NormalizedTopicResult {
+  const rawTokens: string[] = [];
+
+  const extractTokens = (val: unknown) => {
+    if (typeof val === "string") {
+      rawTokens.push(...val.split(","));
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        if (typeof item === "string") {
+          rawTokens.push(...item.split(","));
+        }
+      }
+    }
+  };
+
+  if (args) {
+    extractTokens(args.topic);
+    extractTokens(args.topics);
+  }
+
+  const sanitizedTokens = rawTokens
+    .map((t) => t.trim().toLowerCase())
+    .filter((t) => t.length > 0);
+
+  // Expand "all" keyword
+  const expandedTokens: string[] = [];
+  for (const token of sanitizedTokens) {
+    if (token === "all") {
+      expandedTokens.push(...CANONICAL_TOPICS);
+    } else {
+      expandedTokens.push(token);
+    }
+  }
+
+  const validTopics: ChronicleGuideTopic[] = [];
+  const invalidTopics: string[] = [];
+  const seenValid = new Set<ChronicleGuideTopic>();
+  const seenInvalid = new Set<string>();
+
+  for (const token of expandedTokens) {
+    if ((CANONICAL_TOPICS as string[]).includes(token)) {
+      const topic = token as ChronicleGuideTopic;
+      if (!seenValid.has(topic)) {
+        seenValid.add(topic);
+        validTopics.push(topic);
+      }
+    } else {
+      if (!seenInvalid.has(token)) {
+        seenInvalid.add(token);
+        invalidTopics.push(token);
+      }
+    }
+  }
+
+  if (validTopics.length === 0) {
+    validTopics.push("general");
+  }
+
+  return { validTopics, invalidTopics };
+}
+
+export function renderGeneralGuide(): string {
+  return `## Topic: General Quickstart & Decision Router
+
+### chronicle-mcp (v2.0.0)
 
 Local conversation history, 2-layer turn & step exploration, progressive disclosure, hybrid vector/keyword search, prompt benchmarking, and subagent hierarchy companion.
 
@@ -81,14 +172,238 @@ flowchart TD
 
 ### Critical Directives
 * **NEVER** use file reading tools on raw log files (\`transcript.jsonl\`, \`state.vscdb\`). ALWAYS use \`chronicle-mcp\` tools.
-* **ALWAYS** delegate file writing to server via \`output\` parameter when processing large log outputs.`
+* **ALWAYS** delegate file writing to server via \`output\` parameter when processing large log outputs.`;
+}
+
+export function renderSearchGuide(): string {
+  return `## Topic: Historical Search & Turn Slicing
+
+### Precision Search Recipes
+1. **Find Past Solution by Natural Language**:
+   \`\`\`json
+   {
+     "query": "how did we resolve SonarCloud duplication in schema",
+     "scope": "workspace",
+     "mode": "hybrid",
+     "limit": 5
+   }
+   \`\`\`
+   - Returns 1-line compact hits: \`1. [105081dd:T12] (workspace) - "Extracted conversationStepParams schema..."\`
+2. **Inspect Discovered Turn Dialogue**:
+   \`\`\`json
+   {
+     "sessionId": "105081dd",
+     "turnIndex": 12,
+     "detailLevel": "compact"
+   }
+   \`\`\`
+
+### Search Modes
+- \`mode: "hybrid"\` (Default): Combines FTS5 full-text keyword ranking with vector BLOB cosine similarity using Reciprocal Rank Fusion (RRF). Best for natural language questions and multi-term topics.
+- \`mode: "keyword"\`: Pure FTS5 exact token matching. Best for exact function names, error codes, identifiers, or exact filepaths (e.g. \`"searchHistory"\`, \`"SQLITE_BUSY"\`).
+- \`mode: "semantic"\`: Pure embedding vector similarity. Best for conceptual similarity where exact keywords may differ.
+
+### Slicing & Detail Level Control
+- **Negative Turn Slicing**:
+  - \`turnIndex: -1\`: Slices the very latest conversation turn.
+  - \`turnIndex: -2\`: Slices the penultimate turn.
+- **Turn Ranges**:
+  - \`startTurn: 5, endTurn: 10\`: Slices turns 5 through 10 (inclusive).
+  - \`lastTurns: 3\`: Slices the last 3 conversation turns.
+- **Detail Levels in \`query_transcript\`**:
+  - \`detailLevel: "compact"\` (Default): Shows turn sequence, user prompt, and assistant summary text. Consumes minimal context.
+  - \`detailLevel: "summary"\`: High-level synopsis of conversation turns.
+  - \`detailLevel: "full"\`: Unabridged tool arguments, execution outputs, thinking blocks, and file modifications. Use for deep debugging of specific steps.
+
+### Field Projection & JSON Mode
+When structured JSON output is required:
+\`\`\`json
+{
+  "format": "json",
+  "detailLevel": "compact",
+  "fields": ["id", "title", "totalTurns", "errorCount"]
+}
+\`\`\``;
+}
+
+export function renderArtifactsGuide(): string {
+  return `## Topic: Artifact Discovery & Direct Disk Export
+
+### Artifact Retrieval Recipes
+1. **List Artifacts in Root Session**:
+   \`\`\`json
+   {
+     "sessionId": "105081dd"
+   }
+   \`\`\`
+2. **Retrieve Artifacts Across Full Subagent Swarm**:
+   \`\`\`json
+   {
+     "sessionId": "105081dd",
+     "includeSubtree": true,
+     "artifactName": "PRD"
+   }
+   \`\`\`
+
+### Direct Disk Export & Path Traversal Security
+When exporting large markdown summaries, full benchmark dumps, or multi-turn transcripts, use the \`output\` parameter:
+\`\`\`json
+{
+  "sessionId": "105081dd",
+  "detailLevel": "full",
+  "output": "C:/Users/sayus/.gemini/antigravity/brain/105081dd/full_transcript.md"
+}
+\`\`\`
+- **Zero Context Pollution**: Writes output directly to disk and returns a markdown link.
+- **Path Security**: Validates containment within authorized roots (workspace root, OS temp directory, AppData directory, Home/UserProfile). Traversal attempts (\`../\`) outside authorized roots are rejected.`;
+}
+
+export function renderSubagentsGuide(): string {
+  return `## Topic: Subagent Swarms & Multi-Agent Timelines
+
+### Swarm Tracing Recipes
+1. **Inspect Swarm Hierarchy & Topology**:
+   \`\`\`json
+   {
+     "sessionId": "105081dd",
+     "maxDepth": 3
+   }
+   \`\`\`
+   - Returns root ID, parent ID, subagent roles, conversation IDs, initial prompts, and final synthesized outputs.
+2. **Aggregated Multi-Agent Chronological Timeline**:
+   \`\`\`json
+   {
+     "sessionId": "105081dd",
+     "includeSubtree": true,
+     "detailLevel": "compact"
+   }
+   \`\`\`
+   - Merges turns from parent and all child subagents chronologically with sender attribution tags (\`[Parent]\`, \`[Subagent: Reviewer #1]\`).
+
+### Subagent Hierarchy Topology
+- **Parent ID**: Identifies the direct delegating session.
+- **Root ID**: Identifies the top-level root session of the entire swarm.
+- **Depth Level**: 0 for root, 1 for direct child subagents, 2 for nested subagents.
+- **Initial Prompt & Final Output**: Captures delegation intent and final outcome without loading intermediate step logs.`;
+}
+
+export function renderBenchmarksGuide(): string {
+  return `## Topic: Performance & Token Benchmarking
+
+### Multi-Variant A/B/C Benchmarking Recipes
+1. **Compare Specific Sessions**:
+   \`\`\`json
+   {
+     "sessionIds": ["faf17406", "a65e04da", "f4c86ed6"]
+   }
+   \`\`\`
+2. **Grouped A/B/C Multi-Variant Comparison**:
+   \`\`\`json
+   {
+     "sessionIds": ["faf17406", "a65e04da", "f4c86ed6"],
+     "groups": [
+       { "name": "Variant A (MCP v2.0)", "sessionIds": ["faf17406"] },
+       { "name": "Variant B (Custom Scripts)", "sessionIds": ["a65e04da"] },
+       { "name": "Variant C (Markdown Only)", "sessionIds": ["f4c86ed6"] }
+     ],
+     "linechart_output": "C:/path/to/benchmark_chart.html"
+   }
+   \`\`\`
+
+### Metrics Dictionary
+- **Steps**: Total planner and execution steps taken by the agent.
+- **Tool Calls**: Count of discrete tool executions.
+- **Duration (s)**: Wall-clock execution time in seconds.
+- **Cumulative Input Tokens**: Sum of all prompt input tokens across every turn.
+- **Cache Hit %**: Prompt prefix caching efficiency (higher is better).
+- **Cost Saved %**: Estimated dollar savings from prompt caching.
+- **Peak Context Window**: Maximum token size reached by conversation context.
+- **Output Tokens**: Total tokens generated in responses and tool calls.`;
+}
+
+export function renderDebugErrorsGuide(): string {
+  return `## Topic: Error Diagnosis & Thrashing Detection
+
+### Tool Error Diagnosis Recipes
+1. **Global Tool Health & Thrashing Audit**:
+   \`\`\`json
+   {
+     "format": "markdown",
+     "limit": 30
+   }
+   \`\`\`
+   - Tool: \`get_tool_usage_stats\`
+   - Renders failure rates, error counts, average duration, and identifies active loop thrashing.
+2. **Filter Sessions with Errors**:
+   \`\`\`json
+   {
+     "scope": "workspace",
+     "hasErrors": true,
+     "limit": 10
+   }
+   \`\`\`
+   - Tool: \`list_sessions\`
+3. **Deep-Dive Failed Step Executions**:
+   \`\`\`json
+   {
+     "sessionId": "105081dd",
+     "toolFilter": { "status": "ERROR" },
+     "include": ["executions"]
+   }
+   \`\`\`
+   - Tool: \`query_transcript\`
+   - Returns only the failed tool executions and error stack traces.
+
+### Thrashing Loop Detection
+- **Composite Key**: Monitored via \`\${serverName}::\${toolName}\`.
+- **Thrashing Threshold**: $\\ge 3$ consecutive errors or repeated identical failures trigger thrashing alerts in \`get_tool_usage_stats\`.
+- **Structured Stderr Observability**: Unhandled tool exceptions log structured JSON error records with stack traces to \`process.stderr\`.`;
+}
+
+export function handleChronicleGuide(args?: ChronicleGuideArgs): any {
+  const { validTopics, invalidTopics } = normalizeTopics(args);
+
+  const topicRenderers: Record<ChronicleGuideTopic, () => string> = {
+    general: renderGeneralGuide,
+    search: renderSearchGuide,
+    artifacts: renderArtifactsGuide,
+    subagents: renderSubagentsGuide,
+    benchmarks: renderBenchmarksGuide,
+    debug_errors: renderDebugErrorsGuide,
+  };
+
+  const renderedSections = validTopics.map((topic) => topicRenderers[topic]());
+  let fullContent = renderedSections.join("\n\n---\n\n");
+
+  // Prepend diagnostic note banner if invalid topics were supplied
+  if (invalidTopics.length > 0) {
+    const invalidList = invalidTopics.join(", ");
+    const isSingleGeneralDefault =
+      validTopics.length === 1 &&
+      validTopics[0] === "general" &&
+      !JSON.stringify(args || "").includes("general");
+
+    if (isSingleGeneralDefault) {
+      fullContent = `> [!NOTE]\n> Unrecognized topic(s): "${invalidList}". Defaulting to "general" overview. Available topics: general, search, artifacts, subagents, benchmarks, debug_errors, all.\n\n${fullContent}`;
+    } else {
+      const validList = validTopics.join(", ");
+      fullContent = `> [!NOTE]\n> Unrecognized topic(s): "${invalidList}". Showing requested valid topic(s): "${validList}". Available topics: general, search, artifacts, subagents, benchmarks, debug_errors, all.\n\n${fullContent}`;
+    }
+  }
+
+  // Append discoverability footer
+  fullContent = `${fullContent}\n\n${DISCOVERABILITY_FOOTER}`;
+
+  const guideResponse = {
+    version: "2.0.0",
+    content: fullContent,
   };
 
   return {
     content: [
       {
         type: "text",
-        text: JSON.stringify(guideContent, null, 2),
+        text: JSON.stringify(guideResponse, null, 2),
       },
     ],
   };
