@@ -45,6 +45,3 @@ In Variant B, the agent spent most of its time writing throwaway Python scripts 
 
 ### 2. Chronicle MCP Just Returns Clean Answers
 In Variant A, the agent asked `chronicle_guide` for the search recipe, ran two targeted queries with `search_history`, and inspected the matching turns with `query_transcript`. It finished in under 2 minutes (119 seconds) with zero custom code written.
-
-### 3. Context Window Stays Clean
-Because Chronicle returns 1-line markdown summaries by default instead of dumping megabytes of raw JSON, the agent never choked its context window, finishing the full cross-repo audit in 85 steps.
