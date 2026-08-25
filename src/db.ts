@@ -1075,7 +1075,10 @@ export class InMemoryHistoryStore implements HistoryStore {
       sessions = sessions.slice(0, limit);
     }
 
-    return sessions.map((s) => ({ ...s }));
+    return sessions.map((s) => ({
+      ...s,
+      errorCount: (this.turnsMap.get(s.id) || []).reduce((acc, t) => acc + (t.errorCount || 0), 0),
+    }));
   }
 
   getTurns(sessionId: string, options: GetTurnsOptions = {}): TurnData[] {
@@ -1974,26 +1977,26 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   listSessions(options: ListSessionsOptions = {}): SessionData[] {
-    let sql = `SELECT * FROM sessions`;
+    let sql = `SELECT s.*, (SELECT COALESCE(SUM(error_count), 0) FROM transcript_turns WHERE session_id = s.id) as error_count FROM sessions s`;
     const where: string[] = [];
     const params: any[] = [];
 
     if (options.adapter !== undefined) {
-      where.push("adapter = ?");
+      where.push("s.adapter = ?");
       params.push(options.adapter);
     }
 
     if (options.parentId !== undefined) {
       if (options.parentId === "root" || options.parentId === "null") {
-        where.push("parent_id IS NULL");
+        where.push("s.parent_id IS NULL");
       } else {
-        where.push("parent_id = ?");
+        where.push("s.parent_id = ?");
         params.push(options.parentId);
       }
     }
 
     if (options.role !== undefined) {
-      where.push("role = ?");
+      where.push("s.role = ?");
       params.push(options.role);
     }
 
@@ -2003,17 +2006,17 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     if (resolvedProjectPath !== undefined) {
-      where.push("LOWER(project_path) LIKE ?");
+      where.push("LOWER(s.project_path) LIKE ?");
       params.push(`%${resolvedProjectPath.toLowerCase()}%`);
     }
 
     if (options.hasErrors === true) {
       where.push(
-        "EXISTS (SELECT 1 FROM transcript_turns WHERE session_id = sessions.id AND error_count > 0)"
+        "EXISTS (SELECT 1 FROM transcript_turns WHERE session_id = s.id AND error_count > 0)"
       );
     } else if (options.hasErrors === false) {
       where.push(
-        "NOT EXISTS (SELECT 1 FROM transcript_turns WHERE session_id = sessions.id AND error_count > 0)"
+        "NOT EXISTS (SELECT 1 FROM transcript_turns WHERE session_id = s.id AND error_count > 0)"
       );
     }
 
@@ -2021,11 +2024,11 @@ export class SqliteHistoryStore implements HistoryStore {
       const range = parseTimeRange(options.timeRange);
       if (range) {
         if (range.start !== null) {
-          where.push("last_active_at >= ?");
+          where.push("s.last_active_at >= ?");
           params.push(range.start);
         }
         if (range.end !== null) {
-          where.push("last_active_at <= ?");
+          where.push("s.last_active_at <= ?");
           params.push(range.end);
         }
       }
@@ -2036,7 +2039,7 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     const sortBy = options.sortBy || "active";
-    sql += sortBy === "created" ? " ORDER BY created_at DESC" : " ORDER BY last_active_at DESC";
+    sql += sortBy === "created" ? " ORDER BY s.created_at DESC" : " ORDER BY s.last_active_at DESC";
 
     let limit: number | undefined;
     if (typeof options.limit === "number" && Number.isFinite(options.limit)) {
@@ -2075,6 +2078,7 @@ export class SqliteHistoryStore implements HistoryStore {
       totalTurns: r.total_turns,
       totalSteps: r.total_steps,
       totalTokens: r.total_tokens,
+      errorCount: Number(r.error_count || 0),
       artifacts: r.artifacts ? JSON.parse(r.artifacts) : [],
       filesTouched: r.files_touched ? JSON.parse(r.files_touched) : [],
       firstPrompt: r.first_prompt,

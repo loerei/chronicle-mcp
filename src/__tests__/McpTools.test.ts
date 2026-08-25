@@ -284,35 +284,35 @@ describe("Chronicle MCP 2-Layer Tool Query Surface", () => {
     populateSampleData();
 
     // Filter by adapter
-    const resAntigravity = await handleListSessions({ adapter: "antigravity" });
+    const resAntigravity = await handleListSessions({ adapter: "antigravity", format: "json" });
     const rowsAntigravity = JSON.parse(resAntigravity.content[0].text);
     assert.strictEqual(rowsAntigravity.length, 2);
 
     // Filter by parentId='root'
-    const resRoot = await handleListSessions({ parentId: "root" });
+    const resRoot = await handleListSessions({ parentId: "root", format: "json" });
     const rowsRoot = JSON.parse(resRoot.content[0].text);
     assert.strictEqual(rowsRoot.length, 2);
     assert.ok(rowsRoot.some((r: any) => r.id === "root-sess-1"));
     assert.ok(rowsRoot.some((r: any) => r.id === "clean-sess-1"));
 
     // Filter by hasErrors=false (error-free sessions)
-    const resClean = await handleListSessions({ hasErrors: false });
+    const resClean = await handleListSessions({ hasErrors: false, format: "json" });
     const rowsClean = JSON.parse(resClean.content[0].text);
     assert.strictEqual(rowsClean.length, 2);
     assert.ok(!rowsClean.some((r: any) => r.id === "root-sess-1"));
 
     // Filter by hasErrors=true
-    const resError = await handleListSessions({ hasErrors: true });
+    const resError = await handleListSessions({ hasErrors: true, format: "json" });
     const rowsError = JSON.parse(resError.content[0].text);
     assert.strictEqual(rowsError.length, 1);
     assert.strictEqual(rowsError[0].id, "root-sess-1");
 
     // Pagination limit & offset
-    const resPage1 = await handleListSessions({ limit: 1, offset: 0 });
+    const resPage1 = await handleListSessions({ limit: 1, offset: 0, format: "json" });
     const rowsPage1 = JSON.parse(resPage1.content[0].text);
     assert.strictEqual(rowsPage1.length, 1);
 
-    const resPage2 = await handleListSessions({ limit: 1, offset: 1 });
+    const resPage2 = await handleListSessions({ limit: 1, offset: 1, format: "json" });
     const rowsPage2 = JSON.parse(resPage2.content[0].text);
     assert.strictEqual(rowsPage2.length, 1);
     assert.notStrictEqual(rowsPage1[0].id, rowsPage2[0].id);
@@ -642,5 +642,84 @@ describe("Chronicle MCP 2-Layer Tool Query Surface", () => {
     const nullByteRes = handleOutputWrite("null payload", "safe_name\0.md");
     assert.strictEqual(nullByteRes.isError, true);
     assert.ok(nullByteRes.content[0].text.includes("Invalid or dangerous"));
+  });
+
+  it("15. should support list_sessions progressive disclosure with default 1-line markdown, error badges, JSON projection, and disk export", async () => {
+    populateSampleData();
+
+    // 1. Default markdown format
+    const resMd = await handleListSessions({});
+    const mdText = resMd.content[0].text;
+    assert.ok(mdText.startsWith("# Indexed Sessions"));
+    assert.ok(mdText.includes('[root-ses] (my-app) - "Root Architecture Session" (3 turns, 4 steps, 1 error)'));
+    assert.ok(mdText.includes('[clean-se] (docs) - "Clean Documentation Session" (1 turns, 1 steps)'));
+
+    // 2. JSON compact format by default
+    const resJson = await handleListSessions({ format: "json" });
+    const jsonList = JSON.parse(resJson.content[0].text);
+    assert.strictEqual(jsonList.length, 3);
+    assert.deepEqual(Object.keys(jsonList[0]), [
+      "id",
+      "title",
+      "project_path",
+      "total_turns",
+      "total_steps",
+      "role",
+    ]);
+
+    // 3. Custom fields projection in JSON
+    const resProj = await handleListSessions({ format: "json", fields: ["id", "title", "totalTurns"] });
+    const projList = JSON.parse(resProj.content[0].text);
+    assert.deepEqual(Object.keys(projList[0]), ["id", "title", "totalTurns"]);
+
+    // 4. Output direct write to disk
+    const exportFile = path.join(tempDir, "sessions_export.md");
+    const resDisk = await handleListSessions({ output: exportFile });
+    assert.ok(!resDisk.isError);
+    assert.ok(fs.existsSync(exportFile));
+    assert.ok(fs.readFileSync(exportFile, "utf-8").includes("# Indexed Sessions"));
+
+    // 5. Empty sessions
+    const resEmptyMd = await handleListSessions({ projectPath: "non_existent_folder_xyz" });
+    assert.strictEqual(resEmptyMd.content[0].text, "No indexed sessions found.");
+
+    const resEmptyJson = await handleListSessions({ projectPath: "non_existent_folder_xyz", format: "json" });
+    assert.strictEqual(resEmptyJson.content[0].text, "[]");
+  });
+
+  it("16. should support get_tool_usage_stats markdown format, structured empty JSON state, and disk export", async () => {
+    populateSampleData();
+
+    // 1. Markdown table format
+    const resMd = await handleGetToolUsageStats({ projectPath: "d:/projects/my-app", format: "markdown" });
+    const mdText = resMd.content[0].text;
+    assert.ok(mdText.includes("# Tool Usage & Execution Statistics"));
+    assert.ok(mdText.includes("| Tool Name | Server | Calls | Failures | Error Rate (%) | Avg Duration (ms) | Thrashing Loop |"));
+    assert.ok(mdText.includes("write_to_file"));
+
+    // 2. Default JSON format
+    const resJson = await handleGetToolUsageStats({ projectPath: "d:/projects/my-app" });
+    const jsonStats = JSON.parse(resJson.content[0].text);
+    assert.ok(jsonStats.summary);
+    assert.ok(jsonStats.tools.length > 0);
+
+    // 3. Empty stats in markdown and JSON
+    const resEmptyMd = await handleGetToolUsageStats({ projectPath: "non_existent_path_xyz", format: "markdown" });
+    assert.strictEqual(resEmptyMd.content[0].text, "No tool usage data recorded.");
+
+    const resEmptyJson = await handleGetToolUsageStats({ projectPath: "non_existent_path_xyz", format: "json" });
+    const emptyObj = JSON.parse(resEmptyJson.content[0].text);
+    assert.deepEqual(emptyObj, {
+      summary: { totalCalls: 0, totalErrors: 0, overallFailureRate: 0 },
+      tools: [],
+      thrashingTools: [],
+    });
+
+    // 4. Output write to disk
+    const exportStatsFile = path.join(tempDir, "stats_export.md");
+    const resDisk = await handleGetToolUsageStats({ projectPath: "d:/projects/my-app", format: "markdown", output: exportStatsFile });
+    assert.ok(!resDisk.isError);
+    assert.ok(fs.existsSync(exportStatsFile));
+    assert.ok(fs.readFileSync(exportStatsFile, "utf-8").includes("# Tool Usage & Execution Statistics"));
   });
 });

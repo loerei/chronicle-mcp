@@ -14,6 +14,7 @@ export interface SessionData {
   totalTurns?: number;
   totalSteps?: number;
   totalTokens?: number;
+  errorCount?: number;
   artifacts?: string[];
   filesTouched?: string[];
   firstPrompt: string;

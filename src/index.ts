@@ -20,6 +20,11 @@ import {
   getToolUsageStats,
   generateInteractiveContextChartHtml,
 } from "./search.js";
+import {
+  formatListSessionsMarkdown,
+  formatToolUsageStatsMarkdown,
+  projectFields,
+} from "./presentation.js";
 import { ProgressReporter, ProgressNotify } from "./progress.js";
 import { handleChronicleGuide } from "./guide.js";
 
@@ -304,6 +309,39 @@ export function getMcpToolDefinitions(): any[] {
               "Sort sessions by: 'created' for creation time; 'active' for latest activity time.",
             default: "active",
           },
+          format: {
+            type: "string",
+            enum: ["markdown", "json"],
+            description:
+              "Output format: 'markdown' (default compact 1-line numbered list) or 'json' (structured JSON).",
+            default: "markdown",
+          },
+          detailLevel: {
+            type: "string",
+            enum: ["compact", "full"],
+            description:
+              "Level of detail for JSON output: 'compact' (default essential fields) or 'full'.",
+            default: "compact",
+          },
+          fields: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description:
+              "Optional array or comma-separated list of field names to project in JSON output mode.",
+          },
+          maxSnippetChars: {
+            type: "number",
+            description:
+              "Maximum character length for session titles in markdown mode (clamped between 20 and 500).",
+            default: 120,
+          },
+          output: {
+            type: "string",
+            description:
+              "Path to write output file directly (.md or .json). If a directory is specified, a default timestamped filename will be generated.",
+          },
         },
       },
     },
@@ -531,6 +569,39 @@ export function getMcpToolDefinitions(): any[] {
             },
             description: "Database-level filter predicates.",
           },
+          format: {
+            type: "string",
+            enum: ["markdown", "json"],
+            description:
+              "Output format: 'markdown' (default compact 1-line numbered list) or 'json' (structured JSON).",
+            default: "markdown",
+          },
+          detailLevel: {
+            type: "string",
+            enum: ["compact", "full"],
+            description:
+              "Level of detail for JSON output: 'compact' (default essential fields) or 'full'.",
+            default: "compact",
+          },
+          fields: {
+            oneOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } },
+            ],
+            description:
+              "Optional array or comma-separated list of field names to project in JSON output mode.",
+          },
+          maxSnippetChars: {
+            type: "number",
+            description:
+              "Maximum character length for snippets in markdown mode (clamped between 20 and 500).",
+            default: 120,
+          },
+          output: {
+            type: "string",
+            description:
+              "Path to write output file directly (.md or .json). If a directory is specified, a default timestamped filename will be generated.",
+          },
         },
         required: ["query"],
       },
@@ -561,6 +632,18 @@ export function getMcpToolDefinitions(): any[] {
           timeRange: {
             type: "string",
             description: "Analyze sessions within a time range ('start:end').",
+          },
+          format: {
+            type: "string",
+            enum: ["markdown", "json"],
+            description:
+              "Output format: 'markdown' (standardized markdown summary table) or 'json' (structured report).",
+            default: "json",
+          },
+          output: {
+            type: "string",
+            description:
+              "Path to write output file directly (.md or .json). If a directory is specified, a default timestamped filename will be generated.",
           },
         },
       },
@@ -809,57 +892,116 @@ export function handleOutputWrite(
 }
 
 export async function handleListSessions(args: any): Promise<any> {
-  const adapter = args?.adapter as string | undefined;
-  const parentId = args?.parentId as string | undefined;
-  const role = args?.role as string | undefined;
-  const hasErrors = typeof args?.hasErrors === "boolean" ? args.hasErrors : undefined;
-  const limit = typeof args?.limit === "number" ? args.limit : 10;
-  const offset = typeof args?.offset === "number" ? args.offset : undefined;
-  const projectPath = args?.projectPath as string | undefined;
-  const scope = args?.scope as ScopeType | undefined;
-  const timeRange = args?.timeRange as string | undefined;
-  const sortBy = args?.sortBy as "created" | "active" | undefined;
+  try {
+    const adapter = args?.adapter as string | undefined;
+    const parentId = args?.parentId as string | undefined;
+    const role = args?.role as string | undefined;
+    const hasErrors = typeof args?.hasErrors === "boolean" ? args.hasErrors : undefined;
+    const rawLimit = args?.limit;
+    const limit =
+      typeof rawLimit === "number" && !Number.isNaN(rawLimit)
+        ? Math.max(1, Math.min(Math.floor(rawLimit), 100))
+        : 10;
+    const offset =
+      typeof args?.offset === "number" && !Number.isNaN(args.offset)
+        ? Math.max(0, Math.floor(args.offset))
+        : undefined;
+    const projectPath = args?.projectPath as string | undefined;
+    const scope = args?.scope as ScopeType | undefined;
+    const timeRange = args?.timeRange as string | undefined;
+    const sortBy = args?.sortBy as "created" | "active" | undefined;
+    const format = args?.format === "json" ? "json" : "markdown";
+    const detailLevel = args?.detailLevel as "compact" | "full" | undefined;
+    const fields = (args?.fields ?? args?.order) as string[] | string | undefined;
+    const rawMaxSnippetChars = args?.maxSnippetChars;
+    const maxSnippetChars =
+      typeof rawMaxSnippetChars === "number" && !Number.isNaN(rawMaxSnippetChars)
+        ? Math.max(20, Math.min(Math.floor(rawMaxSnippetChars), 500))
+        : 120;
+    const outputPath = args?.output as string | undefined;
 
-  const store = getStore();
-  const sessions = store.listSessions({
-    adapter,
-    parentId,
-    role,
-    hasErrors,
-    projectPath,
-    scope,
-    limit,
-    offset,
-    timeRange,
-    sortBy,
-  });
+    const store = getStore();
+    const sessions = store.listSessions({
+      adapter,
+      parentId,
+      role,
+      hasErrors,
+      projectPath,
+      scope,
+      limit,
+      offset,
+      timeRange,
+      sortBy,
+    });
 
-  const rows = sessions.map((s) => ({
-    id: s.id,
-    adapter: s.adapter,
-    title: s.title,
-    role: s.role,
-    project_path: s.projectPath,
-    created_at: s.createdAt,
-    last_active_at: s.lastActiveAt,
-    parent_id: s.parentId || null,
-    root_id: s.rootId || null,
-    depth: s.depth ?? 0,
-    total_turns: s.totalTurns ?? 0,
-    total_steps: s.totalSteps ?? 0,
-    artifacts: s.artifacts || [],
-    files_touched: s.filesTouched || [],
-    first_prompt: s.firstPrompt,
-  }));
+    if (format === "json") {
+      let result: any[];
+      if (sessions.length === 0) {
+        result = [];
+      } else if (fields) {
+        result = projectFields(sessions, fields, "session");
+      } else if (detailLevel === "compact" || detailLevel === undefined) {
+        result = projectFields(sessions, undefined, "session");
+      } else {
+        // full
+        result = sessions.map((s) => ({
+          id: s.id,
+          adapter: s.adapter,
+          title: s.title,
+          role: s.role,
+          project_path: s.projectPath,
+          created_at: s.createdAt,
+          last_active_at: s.lastActiveAt,
+          parent_id: s.parentId || null,
+          root_id: s.rootId || null,
+          depth: s.depth ?? 0,
+          total_turns: s.totalTurns ?? 0,
+          total_steps: s.totalSteps ?? 0,
+          artifacts: s.artifacts || [],
+          files_touched: s.filesTouched || [],
+          first_prompt: s.firstPrompt,
+        }));
+      }
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(rows, null, 2),
-      },
-    ],
-  };
+      const jsonText = JSON.stringify(result, null, 2);
+      if (outputPath) {
+        return handleOutputWrite(jsonText, outputPath, `sessions_${Date.now()}.json`);
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: jsonText,
+          },
+        ],
+      };
+    }
+
+    // format === "markdown"
+    const md = formatListSessionsMarkdown(sessions, scope || "all", maxSnippetChars);
+    if (outputPath) {
+      return handleOutputWrite(md, outputPath, `sessions_${Date.now()}.md`);
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: md,
+        },
+      ],
+    };
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "list_sessions" failed: ${e.message}\n${e.stack}\n`);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: ${e.message}`,
+        },
+      ],
+    };
+  }
 }
 
 export async function handleGetSessionRelationship(args: any): Promise<any> {
@@ -1302,21 +1444,66 @@ export async function handleSearchHistory(args: any): Promise<any> {
 }
 
 export async function handleGetToolUsageStats(args: any): Promise<any> {
-  const limit = typeof args?.limit === "number" ? args.limit : 30;
-  const projectPath = args?.projectPath as string | undefined;
-  const scope = args?.scope as ScopeType | undefined;
-  const timeRange = args?.timeRange as string | undefined;
+  try {
+    const rawLimit = args?.limit;
+    const limit =
+      typeof rawLimit === "number" && !Number.isNaN(rawLimit)
+        ? Math.max(1, Math.min(Math.floor(rawLimit), 100))
+        : 30;
+    const projectPath = args?.projectPath as string | undefined;
+    const scope = args?.scope as ScopeType | undefined;
+    const timeRange = args?.timeRange as string | undefined;
+    const format = args?.format as "markdown" | "json" | undefined;
+    const outputPath = args?.output as string | undefined;
 
-  const stats = await getToolUsageStats({ limit, projectPath, scope, timeRange });
+    const stats = await getToolUsageStats({ limit, projectPath, scope, timeRange });
 
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(stats, null, 2),
-      },
-    ],
-  };
+    const normalizedStats = stats && stats.summary ? stats : {
+      summary: { totalCalls: 0, totalErrors: 0, overallFailureRate: 0 },
+      tools: [],
+      thrashingTools: [],
+    };
+
+    if (format === "markdown") {
+      const md = formatToolUsageStatsMarkdown(normalizedStats);
+      if (outputPath) {
+        return handleOutputWrite(md, outputPath, `tool_stats_${Date.now()}.md`);
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: md,
+          },
+        ],
+      };
+    }
+
+    // Default or format === "json"
+    const jsonText = JSON.stringify(normalizedStats, null, 2);
+    if (outputPath) {
+      return handleOutputWrite(jsonText, outputPath, `tool_stats_${Date.now()}.json`);
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: jsonText,
+        },
+      ],
+    };
+  } catch (e: any) {
+    process.stderr.write(`[Chronicle MCP] Tool "get_tool_usage_stats" failed: ${e.message}\n${e.stack}\n`);
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text",
+          text: `Error: ${e.message}`,
+        },
+      ],
+    };
+  }
 }
 
 export async function handleGetSessionBenchmarks(args: any): Promise<any> {
