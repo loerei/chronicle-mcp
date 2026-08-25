@@ -57,7 +57,7 @@ ax2.text(0.5, 0.85, "-33.6% Steps", transform=ax2.transAxes, ha='center', color=
 # Plot 3: Output Tokens Consumed
 tokens_out = [9097, 25424]
 bars3 = ax3.bar(categories, tokens_out, color=[color_a, color_b], width=0.5)
-ax3.set_title("Output Tokens (Code Writing Cost) - Lower is Better", fontsize=11, color='#b0b0b0', pad=10)
+ax3.set_title("Output Tokens - Lower is Better", fontsize=11, color='#b0b0b0', pad=10)
 ax3.set_ylabel("Tokens", fontsize=10, color='#b0b0b0')
 ax3.grid(True, linestyle='--', alpha=0.2, color='#444444', axis='y')
 ax3.tick_params(colors='#b0b0b0')
@@ -65,7 +65,7 @@ ax3.set_ylim(0, 30000)
 for bar in bars3:
     yval = bar.get_height()
     ax3.text(bar.get_x() + bar.get_width()/2.0, yval + 800, f"{int(yval):,}", ha='center', va='bottom', color='#e0e0e0', fontweight='bold')
-ax3.text(0.5, 0.85, "2.79x Less Output Code", transform=ax3.transAxes, ha='center', color='#69f0ae', fontsize=12, fontweight='bold')
+ax3.text(0.5, 0.85, "2.79x Less Output Tokens", transform=ax3.transAxes, ha='center', color='#69f0ae', fontsize=12, fontweight='bold')
 
 plt.tight_layout()
 output_dir = os.path.dirname(os.path.abspath(__file__))

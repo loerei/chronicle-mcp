@@ -65,7 +65,7 @@ This compiles the metrics and saves `prd-tickets-benchmark-chart.png` into the `
 * **Custom Scripts (Variant B)** took **259.0s** (~4.31 minutes).
 * *Observation:* Variant A was **2.18x faster** (saving 140 seconds). Having structured query endpoints like `search_history` and `query_transcript` removes the entire trial-and-error cycle of writing a script, running it, fixing syntax errors, and re-running it.
 
-### 2. The Hidden Code-Writing Tax (Output Tokens)
+### 2. Output Tokens Consumption
 * **Variant A** consumed **9,097 output tokens**.
 * **Variant B** burned **25,424 output tokens** (2.79x more).
 * *Observation:* When an agent has to write its own inspection scripts, output token consumption skyrockets. Output generation is the slowest and most computationally expensive part of an LLM turn. Offloading data extraction to dedicated tools cuts down on token waste.

@@ -26,7 +26,7 @@ We compared two approaches on the exact same task:
 | **Agent Steps** | 85 | 128 | **-33.6%** |
 | **Tool Calls** | 38 | 56 | **-32.1%** |
 | **Execution Time** | 119.0s (1.98 min) | 259.0s (4.31 min) | **-54.1% (2.18x faster)** |
-| **Output Tokens Generated** | 9,097 | 25,424 | **-64.2% (2.79x less code)** |
+| **Output Tokens** | 9,097 | 25,424 | **-64.2% (2.79x fewer tokens)** |
 | **Cumulative Input Tokens** | 3,392,996 | 3,388,776 | +0.1% |
 | **Peak Context Window** | 82,503 | 62,246 | +32.5% |
 | **Prompt Cache Hit %** | 97.7% | 98.8% | -1.1% |
