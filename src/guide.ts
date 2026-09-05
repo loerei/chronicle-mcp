@@ -163,7 +163,7 @@ flowchart TD
 | \`search_history\` | Zero-copy turn-level hybrid (FTS5 + Vector BLOB RRF), semantic, or keyword search across sessions (default: compact markdown). | Searching within an already known single session turn (use \`query_transcript\`). |
 | \`list_sessions\` | Finding sessions by \`scope\`, \`adapter\`, \`parentId\` ('root'|'<id>'), \`role\`, \`hasErrors\`, or \`sortBy='active'\` (default: compact markdown). | Reading transcript dialogue or steps (use \`query_transcript\`). |
 | \`query_transcript\` | Reading dialogue, turn slicing (\`turnIndex\`, \`lastTurns\`, \`startTurn\`/\`endTurn\`), \`detailLevel\` ('compact'|'full'|'summary'), \`toolFilter\`, or \`includeSubtree\`. | Searching across all sessions with natural language query (use \`search_history\`). |
-| \`get_session_relationship\` | Exploring parent, ancestors, child subagents hierarchy, \`initialPrompt\`, and \`finalOutput\`. | Querying step content or tool execution results (use \`query_transcript\`). |
+| \`get_session_relationship\` | Exploring parent, ancestors, child subagents hierarchy, with optional \`includeMandate\`. | Querying step content or tool execution results (use \`query_transcript\`). |
 | \`get_tool_usage_stats\` | Retrieving per-tool execution counts, failure rates, average durations, and thrash loops across sessions (\`format='markdown'\` or \`'json'\`). | Inspecting individual tool arguments or results (use \`query_transcript\`). |
 | \`get_session_artifacts\` | Retrieving generated markdown artifacts (walkthroughs, implementation plans, notes) with optional subtree discovery. | Reading raw step logs or tool execution details (use \`query_transcript\`). |
 | \`get_session_benchmarks\` | Comparing token usage, duration, cache hit rates, and peak context size across sessions. | Retrieving actual conversation text or code artifacts. |
@@ -269,7 +269,7 @@ export function renderSubagentsGuide(): string {
      "maxDepth": 3
    }
    \`\`\`
-   - Returns root ID, parent ID, subagent roles, conversation IDs, initial prompts, and final synthesized outputs.
+   - Returns root ID, parent ID, subagent roles, conversation IDs, and deduplicated child hierarchy (use \`includeMandate: true\` if initial prompt mandate is needed).
 2. **Aggregated Multi-Agent Chronological Timeline**:
    \`\`\`json
    {

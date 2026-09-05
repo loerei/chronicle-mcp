@@ -9,6 +9,8 @@ import {
   ChunkData,
   SessionRelationshipNode,
   SessionRelationshipResult,
+  SessionLifecycle,
+  SessionInbox,
   ArtifactDescriptor,
   ToolUsageStatsOptions,
   ToolUsageReport,
@@ -21,6 +23,7 @@ import {
   cosineSimilarityFloat32,
   EMBEDDING_DIMENSION,
 } from "./embeddings.js";
+import { getAntigravityAdapter } from "./adapters/Antigravity.js";
 
 // ============================================================
 // 1. Interfaces & Option Contracts
@@ -178,7 +181,8 @@ export interface HistoryStore {
   getSessionRelationship(
     sessionId: string,
     maxDepth?: number,
-    includeAncestors?: boolean
+    includeAncestors?: boolean,
+    includeMandate?: boolean
   ): SessionRelationshipResult | null;
   getArtifactDescriptors(
     sessionId: string,
@@ -639,7 +643,11 @@ export function initDatabaseSchema(db: DatabaseSync): void {
       first_prompt TEXT,
       metadata TEXT,
       log_mtime INTEGER,
-      log_size INTEGER
+      log_size INTEGER,
+      lifecycle_status TEXT,
+      has_turn_completion INTEGER DEFAULT 1,
+      last_step_index INTEGER,
+      last_tool_executed TEXT
     );
   `);
 
@@ -658,6 +666,10 @@ export function initDatabaseSchema(db: DatabaseSync): void {
       metadata: "TEXT",
       log_mtime: "INTEGER",
       log_size: "INTEGER",
+      lifecycle_status: "TEXT",
+      has_turn_completion: "INTEGER DEFAULT 1",
+      last_step_index: "INTEGER",
+      last_tool_executed: "TEXT",
     };
 
     for (const [colName, colDef] of Object.entries(requiredColumns)) {
@@ -790,8 +802,14 @@ export class InMemoryHistoryStore implements HistoryStore {
     const safeSteps = steps || session.steps || [];
     const existing = this.sessionsMap.get(session.id);
 
-    let effectiveParentId = session.parentId || existing?.parentId || null;
-    if (effectiveParentId === session.id) {
+    let effectiveParentId = session.parentId || null;
+    if (!effectiveParentId && existing?.parentId) {
+      const pCheck = this.sessionsMap.get(existing.parentId);
+      if (pCheck && pCheck.createdAt <= (session.createdAt ?? Date.now())) {
+        effectiveParentId = existing.parentId;
+      }
+    }
+    if (effectiveParentId === session.id || session.rootId === session.id) {
       effectiveParentId = null;
     }
 
@@ -863,6 +881,7 @@ export class InMemoryHistoryStore implements HistoryStore {
       metadata: { ...effectiveMetadata },
       logMtime: effectiveLogMtime,
       logSize: effectiveLogSize,
+      lifecycle: session.lifecycle ?? existing?.lifecycle,
       turns: effectiveTurns,
       steps: effectiveSteps,
     };
@@ -1081,8 +1100,21 @@ export class InMemoryHistoryStore implements HistoryStore {
     }));
   }
 
+  private resolveActualSessionId(id: string): string {
+    if (!id || typeof id !== "string") return id;
+    if (this.sessionsMap.has(id)) return id;
+    const cleanId = id.trim().toLowerCase();
+    for (const sid of this.sessionsMap.keys()) {
+      if (sid.toLowerCase() === cleanId || (cleanId.length >= 6 && sid.toLowerCase().startsWith(cleanId))) {
+        return sid;
+      }
+    }
+    return id;
+  }
+
   getTurns(sessionId: string, options: GetTurnsOptions = {}): TurnData[] {
-    let turns = (this.turnsMap.get(sessionId) || []).map((t) => ({ ...t }));
+    const resolvedSessionId = this.resolveActualSessionId(sessionId);
+    let turns = (this.turnsMap.get(resolvedSessionId) || []).map((t) => ({ ...t }));
 
     if (!options.includeUndone) {
       turns = turns.filter((t) => !t.isUndone);
@@ -1133,14 +1165,15 @@ export class InMemoryHistoryStore implements HistoryStore {
   }
 
   getSteps(sessionId: string, options: GetStepsOptions = {}): StepData[] {
-    let steps = (this.stepsMap.get(sessionId) || []).map((s) => ({ ...s }));
+    const resolvedSessionId = this.resolveActualSessionId(sessionId);
+    let steps = (this.stepsMap.get(resolvedSessionId) || []).map((s) => ({ ...s }));
 
     if (!options.includeUndone) {
       steps = steps.filter((s) => !s.isUndone);
     }
 
     if (options.turnIndex !== undefined) {
-      const turns = this.turnsMap.get(sessionId) || [];
+      const turns = this.turnsMap.get(resolvedSessionId) || [];
       const maxTurn = turns.length > 0 ? Math.max(...turns.map((t) => t.turnIndex)) : 0;
       const resolvedTurn =
         options.turnIndex < 0 ? maxTurn + 1 + options.turnIndex : options.turnIndex;
@@ -1234,7 +1267,8 @@ export class InMemoryHistoryStore implements HistoryStore {
   getSessionRelationship(
     sessionId: string,
     maxDepth = 3,
-    includeAncestors = true
+    includeAncestors = true,
+    includeMandate = false
   ): SessionRelationshipResult | null {
     const currentSession = this.sessionsMap.get(sessionId);
     if (!currentSession) return null;
@@ -1259,9 +1293,13 @@ export class InMemoryHistoryStore implements HistoryStore {
         rootId: s.rootId,
         depth: currentDepth,
         totalTurns: turns.length,
-        mandate: s.firstPrompt,
+        ...(includeMandate && s.firstPrompt ? { mandate: s.firstPrompt } : {}),
         artifacts: s.artifacts ? [...s.artifacts] : [],
+        lifecycle: s.lifecycle || { status: "completed", hasTurnCompletion: true },
       };
+      if (s.adapter === "antigravity") {
+        node.inbox = getAntigravityAdapter().getInbox(s.id);
+      }
 
       if (currentDepth < effectiveMaxDepth) {
         const directChildren = Array.from(this.sessionsMap.values()).filter(
@@ -1300,8 +1338,10 @@ export class InMemoryHistoryStore implements HistoryStore {
           parentId: pSession.parentId,
           rootId: pSession.rootId,
           depth: depthCounter,
-          mandate: pSession.firstPrompt,
+          ...(includeMandate && pSession.firstPrompt ? { mandate: pSession.firstPrompt } : {}),
           artifacts: pSession.artifacts ? [...pSession.artifacts] : [],
+          lifecycle: pSession.lifecycle || { status: "completed", hasTurnCompletion: true },
+          inbox: pSession.adapter === "antigravity" ? getAntigravityAdapter().getInbox(pSession.id) : undefined,
         });
         rootSessionId = pSession.id;
         curParentId = pSession.parentId;
@@ -1330,12 +1370,15 @@ export class InMemoryHistoryStore implements HistoryStore {
           .map((s) => buildNode(s, 0, new Set([s.id])))
       : [];
 
+    const currentNode = buildNode(currentSession, 0, visitedRoot);
+    delete currentNode.children;
+
     return {
       sessionId: currentSession.id,
       rootSessionId,
       parent: parentNode,
       ancestors,
-      current: buildNode(currentSession, 0, visitedRoot),
+      current: currentNode,
       children: childrenNodes,
       siblings,
     };
@@ -1688,8 +1731,14 @@ export class SqliteHistoryStore implements HistoryStore {
       const metadataJson = session.metadata && Object.keys(session.metadata).length > 0 ? JSON.stringify(session.metadata) : null;
 
       const existing = db.prepare("SELECT parent_id, root_id, depth, title FROM sessions WHERE id = ?").get(session.id) as any;
-      let effectiveParentId = session.parentId || existing?.parent_id || null;
-      if (effectiveParentId === session.id) {
+      let effectiveParentId = session.parentId || null;
+      if (!effectiveParentId && existing?.parent_id) {
+        const pCheck = db.prepare("SELECT created_at FROM sessions WHERE id = ?").get(existing.parent_id) as any;
+        if (pCheck && pCheck.created_at <= (session.createdAt ?? Date.now())) {
+          effectiveParentId = existing.parent_id;
+        }
+      }
+      if (effectiveParentId === session.id || session.rootId === session.id) {
         effectiveParentId = null;
       }
 
@@ -1726,14 +1775,19 @@ export class SqliteHistoryStore implements HistoryStore {
 
       const totalTurns = turns ? turns.length : session.totalTurns ?? 0;
       const totalSteps = steps ? steps.length : session.totalSteps ?? safeSteps.length;
+      const lifecycleStatus = session.lifecycle?.status ?? "completed";
+      const hasTurnCompletion = session.lifecycle?.hasTurnCompletion !== false ? 1 : 0;
+      const lastStepIndex = session.lifecycle?.lastStepIndex ?? null;
+      const lastToolExecuted = session.lifecycle?.lastToolExecuted ?? null;
 
       // 2. Primary session upsert
       db.prepare(`
         INSERT INTO sessions (
           id, adapter, title, role, project_path, created_at, last_active_at,
           parent_id, root_id, depth, total_turns, total_steps, total_tokens,
-          artifacts, files_touched, first_prompt, metadata, log_mtime, log_size
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          artifacts, files_touched, first_prompt, metadata, log_mtime, log_size,
+          lifecycle_status, has_turn_completion, last_step_index, last_tool_executed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           adapter = excluded.adapter,
           title = CASE
@@ -1774,7 +1828,11 @@ export class SqliteHistoryStore implements HistoryStore {
             ELSE metadata
           END,
           log_mtime = COALESCE(excluded.log_mtime, log_mtime),
-          log_size = COALESCE(excluded.log_size, log_size);
+          log_size = COALESCE(excluded.log_size, log_size),
+          lifecycle_status = excluded.lifecycle_status,
+          has_turn_completion = excluded.has_turn_completion,
+          last_step_index = excluded.last_step_index,
+          last_tool_executed = excluded.last_tool_executed;
       `).run(
         session.id,
         session.adapter ?? "unknown",
@@ -1794,7 +1852,11 @@ export class SqliteHistoryStore implements HistoryStore {
         session.firstPrompt ?? "",
         metadataJson,
         session.logMtime ?? null,
-        session.logSize ?? null
+        session.logSize ?? null,
+        lifecycleStatus,
+        hasTurnCompletion,
+        lastStepIndex,
+        lastToolExecuted
       );
 
       // 3. Pre-insert child stubs AND resolve backward linkage strictly before transcript_steps
@@ -1804,10 +1866,10 @@ export class SqliteHistoryStore implements HistoryStore {
       `);
       const updateChildLinkStmt = db.prepare(`
         UPDATE sessions
-        SET parent_id = COALESCE(parent_id, ?),
-            root_id = COALESCE(root_id, ?),
+        SET parent_id = ?,
+            root_id = ?,
             depth = CASE WHEN depth = 0 AND ? > 0 THEN ? ELSE depth END
-        WHERE id = ?
+        WHERE id = ? AND (created_at >= ? OR created_at IS NULL)
       `);
       const referencedChildIds = new Set<string>([
         ...(Array.isArray(session.subagentIds) ? session.subagentIds : []),
@@ -1816,7 +1878,7 @@ export class SqliteHistoryStore implements HistoryStore {
       for (const childId of referencedChildIds) {
         if (childId && childId !== session.id) {
           childStubStmt.run(childId, session.adapter || "unknown", session.createdAt || Date.now(), session.lastActiveAt || Date.now(), session.id, resolvedRootId || session.id, resolvedDepth + 1);
-          updateChildLinkStmt.run(session.id, resolvedRootId || session.id, resolvedDepth + 1, resolvedDepth + 1, childId);
+          updateChildLinkStmt.run(session.id, resolvedRootId || session.id, resolvedDepth + 1, resolvedDepth + 1, childId, session.createdAt || 0);
         }
       }
 
@@ -1971,6 +2033,12 @@ export class SqliteHistoryStore implements HistoryStore {
       metadata: row.metadata ? JSON.parse(row.metadata) : {},
       logMtime: row.log_mtime ?? undefined,
       logSize: row.log_size ?? undefined,
+      lifecycle: {
+        status: row.lifecycle_status || "completed",
+        hasTurnCompletion: row.has_turn_completion !== 0,
+        lastStepIndex: row.last_step_index ?? undefined,
+        lastToolExecuted: row.last_tool_executed ?? undefined,
+      },
       turns: this.getTurns(actualId, { includeUndone: true }),
       steps: this.getSteps(actualId, { includeUndone: true }),
     };
@@ -2085,13 +2153,35 @@ export class SqliteHistoryStore implements HistoryStore {
       metadata: r.metadata ? JSON.parse(r.metadata) : {},
       logMtime: r.log_mtime ?? undefined,
       logSize: r.log_size ?? undefined,
+      lifecycle: {
+        status: r.lifecycle_status || "completed",
+        hasTurnCompletion: r.has_turn_completion !== 0,
+        lastStepIndex: r.last_step_index ?? undefined,
+        lastToolExecuted: r.last_tool_executed ?? undefined,
+      },
     }));
   }
 
+  private resolveActualSessionId(id: string): string {
+    if (!id || typeof id !== "string") return id;
+    const cleanId = id.trim().toLowerCase();
+    if (cleanId.length >= 6 && cleanId.length < 36) {
+      const nextPrefix = cleanId.slice(0, -1) + String.fromCharCode(cleanId.charCodeAt(cleanId.length - 1) + 1);
+      const row = this.db
+        .prepare(
+          "SELECT id FROM sessions WHERE id = ? OR (id >= ? AND id < ?) ORDER BY last_active_at DESC LIMIT 1"
+        )
+        .get(cleanId, cleanId, nextPrefix) as { id: string } | undefined;
+      if (row?.id) return row.id;
+    }
+    return id;
+  }
+
   getTurns(sessionId: string, options: GetTurnsOptions = {}): TurnData[] {
+    const resolvedSessionId = this.resolveActualSessionId(sessionId);
     const maxRow = this.db
       .prepare("SELECT MAX(turn_index) as max_idx FROM transcript_turns WHERE session_id = ?")
-      .get(sessionId) as { max_idx: number | null } | undefined;
+      .get(resolvedSessionId) as { max_idx: number | null } | undefined;
     const maxTurnIndex = maxRow?.max_idx ?? 0;
 
     let targetTurn = options.turnIndex;
@@ -2110,7 +2200,7 @@ export class SqliteHistoryStore implements HistoryStore {
     }
 
     let sql = `SELECT * FROM transcript_turns WHERE session_id = ?`;
-    const params: any[] = [sessionId];
+    const params: any[] = [resolvedSessionId];
 
     if (!options.includeUndone) {
       sql += ` AND is_undone = 0`;
@@ -2143,7 +2233,7 @@ export class SqliteHistoryStore implements HistoryStore {
         ORDER BY turn_index ASC
       `;
       params.length = 0;
-      params.push(sessionId, options.lastTurns);
+      params.push(resolvedSessionId, options.lastTurns);
     } else if (options.limit !== undefined) {
       sql += " LIMIT ?";
       params.push(options.limit);
@@ -2169,8 +2259,9 @@ export class SqliteHistoryStore implements HistoryStore {
   }
 
   getSteps(sessionId: string, options: GetStepsOptions = {}): StepData[] {
+    const resolvedSessionId = this.resolveActualSessionId(sessionId);
     let sql = `SELECT * FROM transcript_steps WHERE session_id = ?`;
-    const params: any[] = [sessionId];
+    const params: any[] = [resolvedSessionId];
 
     if (!options.includeUndone) {
       sql += ` AND is_undone = 0`;
@@ -2179,7 +2270,7 @@ export class SqliteHistoryStore implements HistoryStore {
     if (options.turnIndex !== undefined) {
       const maxRow = this.db
         .prepare("SELECT MAX(turn_index) as max_idx FROM transcript_turns WHERE session_id = ?")
-        .get(sessionId) as { max_idx: number | null } | undefined;
+        .get(resolvedSessionId) as { max_idx: number | null } | undefined;
       const maxTurn = maxRow?.max_idx ?? 0;
       const resolvedTurn =
         options.turnIndex < 0 ? maxTurn + 1 + options.turnIndex : options.turnIndex;
@@ -2263,12 +2354,46 @@ export class SqliteHistoryStore implements HistoryStore {
   getSessionRelationship(
     sessionId: string,
     maxDepth = 3,
-    includeAncestors = true
+    includeAncestors = true,
+    includeMandate = false
   ): SessionRelationshipResult | null {
     const current = this.getSession(sessionId);
     if (!current) return null;
 
     const effectiveMaxDepth = Math.min(Math.max(1, maxDepth || 3), 10);
+
+    const buildSqliteNode = (
+      row: any,
+      depth: number
+    ): SessionRelationshipNode => {
+      const node: SessionRelationshipNode = {
+        id: row.id,
+        adapter: row.adapter,
+        title: row.title,
+        role: row.role ?? undefined,
+        projectPath: row.project_path,
+        createdAt: row.created_at,
+        lastActiveAt: row.last_active_at,
+        parentId: row.parent_id,
+        rootId: row.root_id,
+        depth,
+        totalTurns: row.total_turns,
+        artifacts: row.artifacts ? (typeof row.artifacts === "string" ? JSON.parse(row.artifacts) : row.artifacts) : [],
+        lifecycle: {
+          status: row.lifecycle_status || "completed",
+          hasTurnCompletion: row.has_turn_completion !== 0,
+          lastStepIndex: row.last_step_index ?? undefined,
+          lastToolExecuted: row.last_tool_executed ?? undefined,
+        },
+      };
+      if (includeMandate && row.first_prompt) {
+        node.mandate = row.first_prompt;
+      }
+      if (row.adapter === "antigravity") {
+        node.inbox = getAntigravityAdapter().getInbox(row.id);
+      }
+      return node;
+    };
 
     const ancestors: SessionRelationshipNode[] = [];
     let rootSessionId = current.id;
@@ -2290,21 +2415,7 @@ export class SqliteHistoryStore implements HistoryStore {
       `;
       const ancRows = this.db.prepare(ancestorSql).all(current.parentId, current.id) as any[];
       for (const row of ancRows) {
-        ancestors.push({
-          id: row.id,
-          adapter: row.adapter,
-          title: row.title,
-          role: row.role ?? undefined,
-          projectPath: row.project_path,
-          createdAt: row.created_at,
-          lastActiveAt: row.last_active_at,
-          parentId: row.parent_id,
-          rootId: row.root_id,
-          depth: row.depth,
-          totalTurns: row.total_turns,
-          mandate: row.first_prompt,
-          artifacts: row.artifacts ? JSON.parse(row.artifacts) : [],
-        });
+        ancestors.push(buildSqliteNode(row, row.depth));
       }
       if (ancestors.length > 0) {
         rootSessionId = ancestors[0].id;
@@ -2356,22 +2467,7 @@ export class SqliteHistoryStore implements HistoryStore {
         const branchVisited = new Set(visited);
         branchVisited.add(r.id);
 
-        const childNode: SessionRelationshipNode = {
-          id: r.id,
-          adapter: r.adapter,
-          title: r.title,
-          role: r.role ?? undefined,
-          projectPath: r.project_path,
-          createdAt: r.created_at,
-          lastActiveAt: r.last_active_at,
-          parentId: r.parent_id,
-          rootId: r.root_id,
-          depth: r.tree_depth ?? currentDepth,
-          totalTurns: r.total_turns,
-          mandate: r.first_prompt,
-          artifacts: r.artifacts ? JSON.parse(r.artifacts) : [],
-        };
-
+        const childNode = buildSqliteNode(r, r.tree_depth ?? currentDepth);
         const subChildren = buildChildrenTree(r.id, currentDepth + 1, branchVisited);
         if (subChildren.length > 0) {
           childNode.children = subChildren;
@@ -2390,21 +2486,7 @@ export class SqliteHistoryStore implements HistoryStore {
       const sibRows = this.db
         .prepare("SELECT * FROM sessions WHERE parent_id = ? AND id != ?")
         .all(current.parentId, current.id) as any[];
-      siblings = sibRows.map((r) => ({
-        id: r.id,
-        adapter: r.adapter,
-        title: r.title,
-        role: r.role ?? undefined,
-        projectPath: r.project_path,
-        createdAt: r.created_at,
-        lastActiveAt: r.last_active_at,
-        parentId: r.parent_id,
-        rootId: r.root_id,
-        depth: 0,
-        totalTurns: r.total_turns,
-        mandate: r.first_prompt,
-        artifacts: r.artifacts ? JSON.parse(r.artifacts) : [],
-      }));
+      siblings = sibRows.map((r) => buildSqliteNode(r, 0));
     }
 
     const currentNode: SessionRelationshipNode = {
@@ -2419,9 +2501,10 @@ export class SqliteHistoryStore implements HistoryStore {
       rootId: current.rootId,
       depth: 0,
       totalTurns: current.totalTurns,
-      mandate: current.firstPrompt,
+      ...(includeMandate && current.firstPrompt ? { mandate: current.firstPrompt } : {}),
       artifacts: current.artifacts,
-      children: childrenNodes,
+      lifecycle: current.lifecycle || { status: "completed", hasTurnCompletion: true },
+      inbox: current.adapter === "antigravity" ? getAntigravityAdapter().getInbox(current.id) : undefined,
     };
 
     return {

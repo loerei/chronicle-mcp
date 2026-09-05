@@ -28,6 +28,7 @@ import {
   resetKillswitchState,
 } from "../index.js";
 import { handleChronicleGuide } from "../guide.js";
+import { AntigravityAdapter, setAntigravityAdapter } from "../adapters/Antigravity.js";
 
 describe("Chronicle MCP 2-Layer Tool Query Surface", () => {
   let tempDir: string;
@@ -43,9 +44,11 @@ describe("Chronicle MCP 2-Layer Tool Query Surface", () => {
 
     store = new SqliteHistoryStore(dbPath);
     setStore(store);
+    setAntigravityAdapter(new AntigravityAdapter(brainDir));
   });
 
   afterEach(() => {
+    setAntigravityAdapter(null);
     store.close();
     setStore(null as any);
     try {
@@ -858,5 +861,91 @@ describe("Chronicle MCP 2-Layer Tool Query Surface", () => {
       reductionRate >= 0.75,
       `Expected >= 75% size/token reduction, but got ${(reductionRate * 100).toFixed(1)}% (Full: ${fullSize} bytes, Compact: ${compactSize} bytes)`
     );
+  });
+
+  it("16. should report session lifecycle health and send_message delivery verification", async () => {
+    populateSampleData();
+
+    // 1. Setup child session with interrupted lifecycle and undelivered message
+    const childId = "child-sess-1";
+    const undeliveredDir = path.join(brainDir, childId, ".system_generated", "messages", "undelivered");
+    const messagesDir = path.join(brainDir, childId, ".system_generated", "messages");
+    fs.mkdirSync(undeliveredDir, { recursive: true });
+
+    const msgUuid = "msg-123-abc";
+    fs.writeFileSync(path.join(undeliveredDir, msgUuid), "");
+    fs.writeFileSync(
+      path.join(messagesDir, `${msgUuid}.json`),
+      JSON.stringify({
+        id: msgUuid,
+        sender: "root-sess-1",
+        message: "Verify worker state",
+        timestamp: "2026-09-05T12:00:00.000Z",
+      })
+    );
+
+    // Update child session lifecycle in database
+    store.saveSession({
+      id: childId,
+      adapter: "antigravity",
+      title: "Subagent Test Runner",
+      role: "Tester",
+      parentId: "root-sess-1",
+      rootId: "root-sess-1",
+      depth: 1,
+      createdAt: 2000,
+      lastActiveAt: 4000,
+      firstPrompt: "Execute unit tests in isolation",
+      lifecycle: {
+        status: "interrupted_mid_turn",
+        hasTurnCompletion: false,
+        lastStepIndex: 3,
+        lastToolExecuted: "find_by_name",
+      },
+    });
+
+    // 2. Verify handleGetSessionRelationship reports lifecycle and inbox
+    const relRes = await handleGetSessionRelationship({ sessionId: "root-sess-1" });
+    const rel = JSON.parse(relRes.content[0].text);
+    assert.strictEqual(rel.children.length, 1);
+    const child = rel.children[0];
+    assert.deepStrictEqual(child.lifecycle, {
+      status: "interrupted_mid_turn",
+      hasTurnCompletion: false,
+      lastStepIndex: 3,
+      lastToolExecuted: "find_by_name",
+    });
+    assert.strictEqual(child.inbox?.pendingCount, 1);
+    assert.strictEqual(child.inbox?.undelivered[0].id, msgUuid);
+
+    // 3. Add send_message step to root-sess-1 turn 2
+    const rootSession = store.getSession("root-sess-1")!;
+    const rootTurns = store.getTurns("root-sess-1");
+    const existingSteps = store.getSteps("root-sess-1");
+    const sendMsgStep: StepData = {
+      stepIndex: 10,
+      turnIndex: 2,
+      category: "execution",
+      kind: "native",
+      toolName: "send_message",
+      serverName: "default_api",
+      toolArgs: JSON.stringify({ Recipient: childId, Message: "Verify worker state" }),
+      toolResult: `Message sent to ${childId}`,
+      status: "DONE",
+      createdAt: 3500,
+    };
+    store.saveSession(rootSession, rootTurns, [...existingSteps, sendMsgStep]);
+
+    // 4. Query transcript with full detail
+    const transcriptRes = await handleQueryTranscript({
+      sessionId: "root-sess-1",
+      turnIndex: 2,
+      detailLevel: "full",
+    });
+    const text = transcriptRes.content[0].text;
+    assert.ok(text.includes("Delivery Verification"));
+    assert.ok(text.includes("UNDELIVERED (1 message(s) pending in inbox)"));
+    assert.ok(text.includes("**Recipient State**: `INTERRUPTED_MID_TURN`"));
+    assert.ok(text.includes("last tool: find_by_name"));
   });
 });

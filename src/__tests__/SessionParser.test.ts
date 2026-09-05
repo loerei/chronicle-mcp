@@ -372,7 +372,7 @@ Always write clean code
       assert.strictEqual(survivingTurn.isUndone, false);
     });
 
-    it("should extract subagent topology, ignoring send_message to parent", () => {
+    it("should extract subagent topology from invoke_subagent results, ignoring send_message", () => {
       const sessionId = "session-subagent-parent";
       const jsonl = [
         JSON.stringify({
@@ -384,18 +384,29 @@ Always write clean code
         JSON.stringify({
           type: "PLANNER_RESPONSE",
           step_index: 1,
-          content: "Messaging parent and child",
+          content: "Invoking and messaging",
           tool_calls: [
+            {
+              name: "invoke_subagent",
+              arguments: { Subagents: [{ Role: "Worker", Prompt: "Task" }] },
+            },
             {
               name: "send_message",
               arguments: { Recipient: "parent", Message: "Done" },
             },
             {
               name: "send_message",
-              arguments: { Recipient: "child-subagent-uuid-1", Message: "Analyze" },
+              arguments: { Recipient: "other-agent-uuid", Message: "Analyze" },
             },
           ],
           created_at: "2026-08-20T10:00:01.000Z",
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          source: "MODEL",
+          step_index: 2,
+          content: 'Created the following subagents:\n{\n  "conversationId": "child-subagent-uuid-1"\n}',
+          created_at: "2026-08-20T10:00:02.000Z",
         }),
       ].join("\n");
 
@@ -444,6 +455,103 @@ Always write clean code
       assert.ok(session.filesTouched?.includes("d:/Projects/app/src/main.ts"));
       assert.strictEqual(session.filesTouched?.includes("d:/Projects/app"), false); // Cwd excluded
     });
+
+    it("should compute SessionLifecycle as completed when ending with assistant message", () => {
+      const sessionId = "session-lifecycle-completed";
+      const jsonl = [
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "Hello",
+          created_at: "2026-08-20T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "I have finished the work.",
+          created_at: "2026-08-20T10:00:02.000Z",
+        }),
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      assert.deepStrictEqual(session.lifecycle, {
+        status: "completed",
+        hasTurnCompletion: true,
+        lastStepIndex: 1,
+      });
+    });
+
+    it("should compute SessionLifecycle as interrupted_mid_turn when ending on execution result", () => {
+      const sessionId = "session-lifecycle-interrupted";
+      const jsonl = [
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "Run find",
+          created_at: "2026-08-20T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "",
+          tool_calls: [{ name: "find_by_name", arguments: { Pattern: "*.ts" } }],
+          created_at: "2026-08-20T10:00:01.000Z",
+        }),
+        JSON.stringify({
+          type: "GENERIC",
+          step_index: 2,
+          status: "DONE",
+          content: "Found 12 files",
+          created_at: "2026-08-20T10:00:03.000Z",
+        }),
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      assert.deepStrictEqual(session.lifecycle, {
+        status: "interrupted_mid_turn",
+        hasTurnCompletion: false,
+        lastStepIndex: 2,
+        lastToolExecuted: "find_by_name",
+      });
+    });
+
+    it("should stably sort raw events by step_index ASC when logs flush out-of-order", () => {
+      const sessionId = "session-out-of-order";
+      // step 2 appears before step 1 in raw JSONL lines due to async flush
+      const jsonl = [
+        JSON.stringify({
+          type: "USER_INPUT",
+          step_index: 0,
+          content: "Read a file",
+          created_at: "2026-08-20T10:00:00.000Z",
+        }),
+        JSON.stringify({
+          type: "MCP_TOOL",
+          step_index: 2,
+          status: "DONE",
+          content: "File contents here",
+          created_at: "2026-08-20T10:00:03.000Z",
+        }),
+        JSON.stringify({
+          type: "PLANNER_RESPONSE",
+          step_index: 1,
+          content: "",
+          tool_calls: [{ name: "view_file", arguments: { AbsolutePath: "d:/file.ts" } }],
+          created_at: "2026-08-20T10:00:01.000Z",
+        }),
+      ].join("\n");
+
+      const session = SessionParser.parseAntigravity(sessionId, jsonl);
+      assert.ok(session);
+      const turn = session.turns![0];
+      const execStep = turn.steps?.find(s => s.category === "execution");
+      assert.ok(execStep);
+      assert.strictEqual(execStep.toolName, "view_file");
+      assert.strictEqual(execStep.status, "DONE");
+      assert.strictEqual(execStep.toolResult, "File contents here");
+    });
   });
 
   describe("AntigravityAdapter & discoverBrainArtifacts", () => {
@@ -478,25 +586,41 @@ Always write clean code
         fs.mkdirSync(dirA, { recursive: true });
         fs.mkdirSync(dirB, { recursive: true });
 
-        // Session A calls Session B
+        // Session A invokes Session B
         const jsonlA = [
-          JSON.stringify({ type: "USER_INPUT", step_index: 0, content: "Start A" }),
+          JSON.stringify({ type: "USER_INPUT", step_index: 0, content: "Start A", created_at: "2026-08-20T10:00:00.000Z" }),
           JSON.stringify({
             type: "PLANNER_RESPONSE",
             step_index: 1,
             content: "Call B",
-            tool_calls: [{ name: "send_message", arguments: { Recipient: sidB } }],
+            tool_calls: [{ name: "invoke_subagent", arguments: { Subagents: [{ Role: "Worker", Prompt: "Task" }] } }],
+            created_at: "2026-08-20T10:00:01.000Z",
+          }),
+          JSON.stringify({
+            type: "GENERIC",
+            source: "MODEL",
+            step_index: 2,
+            content: `Created the following subagents:\n{\n  "conversationId": "${sidB}"\n}`,
+            created_at: "2026-08-20T10:00:02.000Z",
           }),
         ].join("\n");
 
-        // Session B calls Session A (Cycle simulation)
+        // Session B invokes Session A (Cycle simulation)
         const jsonlB = [
-          JSON.stringify({ type: "USER_INPUT", step_index: 0, content: "Start B" }),
+          JSON.stringify({ type: "USER_INPUT", step_index: 0, content: "Start B", created_at: "2026-08-20T10:00:00.000Z" }),
           JSON.stringify({
             type: "PLANNER_RESPONSE",
             step_index: 1,
             content: "Call A",
-            tool_calls: [{ name: "send_message", arguments: { Recipient: sidA } }],
+            tool_calls: [{ name: "invoke_subagent", arguments: { Subagents: [{ Role: "Worker", Prompt: "Task" }] } }],
+            created_at: "2026-08-20T10:00:01.000Z",
+          }),
+          JSON.stringify({
+            type: "GENERIC",
+            source: "MODEL",
+            step_index: 2,
+            content: `Created the following subagents:\n{\n  "conversationId": "${sidA}"\n}`,
+            created_at: "2026-08-20T10:00:02.000Z",
           }),
         ].join("\n");
 
@@ -512,6 +636,53 @@ Always write clean code
           assert.ok(s.rootId);
           assert.ok(typeof s.depth === "number");
         }
+      } finally {
+        fs.rmSync(tempBrain, { recursive: true, force: true });
+      }
+    });
+
+    it("should inspect Antigravity inbox markers and return pending count with details", () => {
+      const tempBrain = fs.mkdtempSync(path.join(os.tmpdir(), "chronicle-brain-inbox-"));
+      try {
+        const sid = "sess-inbox-test";
+        const undeliveredDir = path.join(tempBrain, sid, ".system_generated", "messages", "undelivered");
+        const messagesDir = path.join(tempBrain, sid, ".system_generated", "messages");
+        fs.mkdirSync(undeliveredDir, { recursive: true });
+
+        // Marker 1 has corresponding json payload
+        const msgId1 = "msg-uuid-1";
+        fs.writeFileSync(path.join(undeliveredDir, msgId1), "");
+        fs.writeFileSync(
+          path.join(messagesDir, `${msgId1}.json`),
+          JSON.stringify({
+            id: msgId1,
+            sender: "parent-agent",
+            timestamp: "2026-09-05T10:00:00.000Z",
+            message: "Please proceed with task 1",
+          })
+        );
+
+        // Marker 2 has no json payload (only marker)
+        const msgId2 = "msg-uuid-2";
+        fs.writeFileSync(path.join(undeliveredDir, msgId2), "");
+
+        const adapter = new AntigravityAdapter(tempBrain);
+        const inbox = adapter.getInbox(sid);
+
+        assert.strictEqual(inbox.pendingCount, 2);
+        assert.strictEqual(inbox.undelivered.length, 2);
+        assert.strictEqual(inbox.undelivered[0].id, msgId1);
+        assert.strictEqual(inbox.undelivered[0].sender, "parent-agent");
+        assert.strictEqual(inbox.undelivered[0].content, "Please proceed with task 1");
+        assert.strictEqual(inbox.undelivered[1].id, msgId2);
+
+        // Test checkMessageDelivery
+        const delivery1 = adapter.checkMessageDelivery(sid, msgId1);
+        assert.strictEqual(delivery1.pendingCount, 2);
+        assert.strictEqual(delivery1.isDelivered, false);
+
+        const deliveryUnknown = adapter.checkMessageDelivery(sid, "non-existent-msg");
+        assert.strictEqual(deliveryUnknown.isDelivered, true);
       } finally {
         fs.rmSync(tempBrain, { recursive: true, force: true });
       }

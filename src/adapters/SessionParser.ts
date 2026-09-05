@@ -1,5 +1,5 @@
 import { getEncoding, type Tiktoken } from "js-tiktoken";
-import { SessionData, TurnData, StepData, ChunkData } from "./types.js";
+import { SessionData, TurnData, StepData, ChunkData, SessionLifecycle } from "./types.js";
 
 // Top-level pre-compiled regular expressions for prompt sanitization
 const RE_ADDITIONAL_METADATA = /<ADDITIONAL_METADATA\b[^>]*>[\s\S]*?<\/ADDITIONAL_METADATA>/gi;
@@ -311,14 +311,12 @@ export class SessionParser {
     if (toolName === "invoke_subagent" || toolName === "spawn_subagent") {
       if (Array.isArray(args.Subagents)) {
         for (const sub of args.Subagents) {
-          if (sub?.conversationId) subagentIds.push(sub.conversationId);
-        }
-      }
-    } else if (toolName === "send_message") {
-      const recipient = args.Recipient || args.recipient;
-      if (recipient && typeof recipient === "string") {
-        if (recipient.toLowerCase() !== "parent" && recipient !== parentId && recipient !== currentSessionId) {
-          subagentIds.push(recipient);
+          if (sub?.conversationId) {
+            const cleanId = String(sub.conversationId).replace(/^["']|["']$/g, "").trim();
+            if (cleanId && cleanId !== currentSessionId) {
+              subagentIds.push(cleanId);
+            }
+          }
         }
       }
     }
@@ -339,6 +337,9 @@ export class SessionParser {
     if (rawEvents.length === 0) {
       return null;
     }
+
+    // Stable sort by step_index ASC to handle asynchronous log flush ordering
+    rawEvents.sort((a, b) => (a.step_index ?? a.stepIndex ?? 0) - (b.step_index ?? b.stepIndex ?? 0));
 
     let projectPath: string | null = null;
     let sessionCreatedAt = 0;
@@ -424,6 +425,8 @@ export class SessionParser {
           turnIndex: turnCounter,
           stepOrder: newTurn.stepOrderCounter++,
           category: "user",
+          type: stepType || "USER_INPUT",
+          source: stepSource || "USER_EXPLICIT",
           status: "DONE",
           content: cleanedPrompt,
           createdAt: rawCreatedAt,
@@ -465,6 +468,24 @@ export class SessionParser {
         }
       }
 
+      // Handle CHECKPOINT explicitly as a system event
+      if (stepType === "CHECKPOINT" || (raw.content && typeof raw.content === "string" && raw.content.startsWith("{{ CHECKPOINT"))) {
+        activeTurn.steps.push({
+          stepIndex,
+          turnIndex: activeTurn.turnIndex,
+          stepOrder: activeTurn.stepOrderCounter++,
+          category: "system",
+          type: "CHECKPOINT",
+          source: stepSource || "SYSTEM",
+          status: "DONE",
+          content: normalizePayload(raw.content),
+          createdAt: rawCreatedAt,
+          isUndone: false,
+        });
+        activeStack.push({ stepIndex, turnIndex: activeTurn.turnIndex, isUndone: false });
+        continue;
+      }
+
       // Handle PLANNER_RESPONSE (agent thoughts / dialogue & tool calls)
       if (stepType === "PLANNER_RESPONSE") {
         const content = raw.content || "";
@@ -498,11 +519,32 @@ export class SessionParser {
             turnIndex: activeTurn.turnIndex,
             stepOrder: activeTurn.stepOrderCounter++,
             category: "agent",
+            type: stepType || "PLANNER_RESPONSE",
+            source: stepSource || "MODEL",
             status: "DONE",
             content: content || undefined,
             thinking: thinking || undefined,
             createdAt: rawCreatedAt,
             isUndone: false,
+          });
+        }
+
+        // Flush any orphaned pending calls from earlier response as PENDING execution steps
+        while (activeTurn.pendingCalls.length > 0) {
+          const pending = activeTurn.pendingCalls.shift()!;
+          activeTurn.steps.push({
+            stepIndex: pending.stepIndex,
+            turnIndex: activeTurn.turnIndex,
+            stepOrder: activeTurn.stepOrderCounter++,
+            category: "execution",
+            kind: pending.kind,
+            status: "PENDING",
+            toolName: pending.toolName,
+            serverName: pending.serverName,
+            filePath: pending.filePath,
+            toolArgs: pending.toolArgs,
+            createdAt: pending.createdAt,
+            isUndone: pending.isUndone || false,
           });
         }
 
@@ -526,7 +568,13 @@ export class SessionParser {
       }
 
       // Handle tool execution outputs / error steps (MCP_TOOL, COMMAND, INVOKE_SUBAGENT, etc.)
-      const isExecutionEvent = stepType === "MCP_TOOL" || stepType === "COMMAND" || stepType === "INVOKE_SUBAGENT" || stepType === "TOOL_RESULT" || (stepSource === "SYSTEM" && raw.content);
+      const isExecutionEvent =
+        stepType === "MCP_TOOL" ||
+        stepType === "COMMAND" ||
+        stepType === "INVOKE_SUBAGENT" ||
+        stepType === "TOOL_RESULT" ||
+        (activeTurn.pendingCalls.length > 0 && (stepType === "GENERIC" || !stepType) && raw.content && stepType !== "CHECKPOINT" && stepType !== "SYSTEM_MESSAGE") ||
+        (stepSource === "SYSTEM" && raw.content && stepType !== "CHECKPOINT" && stepType !== "SYSTEM_MESSAGE");
 
       if (isExecutionEvent) {
         let matchedCall: PendingToolCall | undefined = undefined;
@@ -543,6 +591,25 @@ export class SessionParser {
           matchIdx = activeTurn.pendingCalls.findIndex(c => c.kind === "mcp" || c.kind === "native");
         } else if (stepType === "INVOKE_SUBAGENT") {
           matchIdx = activeTurn.pendingCalls.findIndex(c => c.kind === "subagent");
+        } else if (stepType === "GENERIC" || !stepType) {
+          // Heuristic matching based on content signatures for GENERIC events
+          if (raw.content && typeof raw.content === "string") {
+            if (raw.content.includes("File Path:")) {
+              const fileIdx = activeTurn.pendingCalls.findIndex(c => c.filePath && raw.content.includes(c.filePath));
+              matchIdx = fileIdx >= 0 ? fileIdx : activeTurn.pendingCalls.findIndex(c => c.toolName === "view_file" || c.toolName === "write_to_file" || c.toolName === "replace_file_content");
+            } else if (raw.content.includes("Message sent to")) {
+              matchIdx = activeTurn.pendingCalls.findIndex(c => c.toolName === "send_message");
+            } else if (raw.content.includes("Tool is running as a background task") || raw.content.includes("Timer:")) {
+              matchIdx = activeTurn.pendingCalls.findIndex(c => c.toolName === "schedule" || c.kind === "command");
+            } else if (raw.content.includes("active subagent(s)")) {
+              matchIdx = activeTurn.pendingCalls.findIndex(c => c.toolName === "manage_subagents");
+            } else if (raw.content.includes("Empty directory") || raw.content.includes("Total lines:") || raw.content.includes("Found ")) {
+              matchIdx = activeTurn.pendingCalls.findIndex(c => c.toolName === "list_dir" || c.toolName === "find_by_name" || c.toolName === "grep_search");
+            }
+          }
+          if (matchIdx < 0 && activeTurn.pendingCalls.length > 0) {
+            matchIdx = 0;
+          }
         }
 
         if (matchIdx >= 0) {
@@ -565,10 +632,14 @@ export class SessionParser {
 
         let subagentSessionId: string | undefined = undefined;
         if (raw.content && typeof raw.content === "string") {
-          const match = /"conversationId"\s*:\s*"([a-fA-F0-9-]+)"/.exec(raw.content);
-          if (match) {
-            subagentSessionId = match[1];
-            subagentIds.push(match[1]);
+          const regex = /"conversationId"\s*:\s*"([^"]+)"/g;
+          let match: RegExpExecArray | null;
+          while ((match = regex.exec(raw.content)) !== null) {
+            const cleanId = match[1].replace(/^["']|["']$/g, "").trim();
+            if (cleanId && cleanId !== sessionId) {
+              subagentSessionId = cleanId;
+              subagentIds.push(cleanId);
+            }
           }
         }
 
@@ -588,6 +659,8 @@ export class SessionParser {
           turnIndex: activeTurn.turnIndex,
           stepOrder: activeTurn.stepOrderCounter++,
           category: "execution",
+          type: stepType || (kind === "command" ? "COMMAND" : "MCP_TOOL"),
+          source: stepSource || "SYSTEM",
           kind,
           status: stepStatus === "ERROR" || exitCode !== 0 ? "ERROR" : "DONE",
           toolName,
@@ -613,6 +686,8 @@ export class SessionParser {
         turnIndex: activeTurn.turnIndex,
         stepOrder: activeTurn.stepOrderCounter++,
         category: "system",
+        type: stepType || "SYSTEM_MESSAGE",
+        source: stepSource || "SYSTEM",
         status: stepStatus,
         content: normalizePayload(raw.content),
         createdAt: rawCreatedAt,
@@ -710,6 +785,35 @@ export class SessionParser {
     const allTimestamps = allStepsFlat.map(s => s.createdAt).filter((ts): ts is number => typeof ts === "number" && !Number.isNaN(ts));
     const lastActiveAt = allTimestamps.length > 0 ? Math.max(...allTimestamps) : (sessionCreatedAt || Date.now());
 
+    // Determine session lifecycle state
+    let lifecycle: SessionLifecycle = {
+      status: "completed",
+      hasTurnCompletion: true,
+      lastStepIndex: allStepsFlat.length > 0 ? allStepsFlat[allStepsFlat.length - 1].stepIndex : undefined,
+    };
+
+    if (allStepsFlat.length > 0) {
+      const lastStep = allStepsFlat[allStepsFlat.length - 1];
+      const lastTurn = finalTurns[finalTurns.length - 1];
+      const hasDialogue = Boolean(lastTurn?.assistantResponse && lastTurn.assistantResponse.trim());
+
+      if (lastStep.category === "execution") {
+        lifecycle = {
+          status: "interrupted_mid_turn",
+          hasTurnCompletion: false,
+          lastStepIndex: lastStep.stepIndex,
+          lastToolExecuted: lastStep.toolName,
+        };
+      } else if (lastStep.category === "user" || !hasDialogue) {
+        lifecycle = {
+          status: "interrupted_mid_turn",
+          hasTurnCompletion: false,
+          lastStepIndex: lastStep.stepIndex,
+          lastToolExecuted: lastStep.toolName,
+        };
+      }
+    }
+
     return {
       id: sessionId,
       adapter: "antigravity",
@@ -728,6 +832,7 @@ export class SessionParser {
       steps: allStepsFlat,
       chunks,
       subagentIds: Array.from(new Set(subagentIds)),
+      lifecycle,
     };
   }
 
@@ -763,6 +868,8 @@ export class SessionParser {
           turnIndex: turnCounter,
           stepOrder: 1,
           category: "user",
+          type: "USER_INPUT",
+          source: "USER_EXPLICIT",
           status: "DONE",
           content: userText,
           createdAt,
@@ -789,6 +896,8 @@ export class SessionParser {
                 turnIndex: turnCounter,
                 stepOrder: stepOrderCounter++,
                 category: "agent",
+                type: "PLANNER_RESPONSE",
+                source: "MODEL",
                 status: "DONE",
                 content: assistantText || undefined,
                 thinking: assistantThinking || undefined,
@@ -816,6 +925,8 @@ export class SessionParser {
                 turnIndex: turnCounter,
                 stepOrder: stepOrderCounter++,
                 category: "execution",
+                type: isCommand ? "COMMAND" : "MCP_TOOL",
+                source: "SYSTEM",
                 kind,
                 status,
                 toolName,
@@ -897,6 +1008,10 @@ export class SessionParser {
       turns,
       steps: allSteps,
       chunks,
+      lifecycle: {
+        status: "completed",
+        hasTurnCompletion: true,
+      },
     };
   }
 }

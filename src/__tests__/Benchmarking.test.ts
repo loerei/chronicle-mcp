@@ -602,4 +602,100 @@ describe("Benchmarking Logic", () => {
     assert.ok(html.includes(`Total Output`), "Total Output badge must be present");
     assert.ok(html.includes(finalOutput.toLocaleString()), `Total Output badge should show ${finalOutput.toLocaleString()}`);
   });
+
+  it("should accurately benchmark and chart 2-layer session steps with system CHECKPOINT and category metadata", async () => {
+    const { generateInteractiveContextChartHtml, computeSessionBenchmarks } = await import("../search.js");
+    setStore(sqliteStore);
+
+    const sessionId = "2layer-ckpt-benchmark-session";
+    const steps: StepData[] = [
+      { stepIndex: 0, turnIndex: 1, stepOrder: 1, category: "user", status: "DONE", content: "Implement feature X with 50 tokens" },
+      { stepIndex: 1, turnIndex: 1, stepOrder: 2, category: "agent", status: "DONE", content: "I will call the search tool", thinking: "Planning tool execution" },
+      { stepIndex: 2, turnIndex: 1, stepOrder: 3, category: "execution", kind: "native", toolName: "find_by_name", toolArgs: '{"Pattern":"*.ts"}', status: "DONE", toolResult: "file1.ts\nfile2.ts\nfile3.ts" },
+      { stepIndex: 3, turnIndex: 1, stepOrder: 4, category: "agent", status: "DONE", content: "Here are the files found in workspace" },
+      { stepIndex: 4, turnIndex: 2, stepOrder: 1, category: "system", status: "DONE", content: "{{ CHECKPOINT 1 }}\n **The earlier parts of this conversation have been truncated" },
+      { stepIndex: 5, turnIndex: 2, stepOrder: 2, category: "user", status: "DONE", content: "Continue next step" },
+      { stepIndex: 6, turnIndex: 2, stepOrder: 3, category: "agent", status: "DONE", content: "Done with feature implementation" },
+    ];
+
+    const turns: TurnData[] = [
+      {
+        turnIndex: 1,
+        userPrompt: "Implement feature X with 50 tokens",
+        assistantResponse: "Here are the files found in workspace",
+        turnSummary: "Implement feature X with 50 tokens",
+        turnText: "Implement feature X with 50 tokens Here are the files found in workspace",
+        inputTokens: 10,
+        outputTokens: 20,
+        thinkingTokens: 10,
+        toolCount: 1,
+        errorCount: 0,
+        durationMs: 1000,
+        isUndone: false,
+        createdAt: 1000,
+      },
+      {
+        turnIndex: 2,
+        userPrompt: "Continue next step",
+        assistantResponse: "Done with feature implementation",
+        turnSummary: "Continue next step",
+        turnText: "Continue next step Done with feature implementation",
+        inputTokens: 5,
+        outputTokens: 15,
+        thinkingTokens: 0,
+        toolCount: 0,
+        errorCount: 0,
+        durationMs: 500,
+        isUndone: false,
+        createdAt: 2000,
+      }
+    ];
+
+    const session: SessionData = {
+      id: sessionId,
+      adapter: "antigravity",
+      title: "2-Layer Checkpoint Test",
+      projectPath: "/projects/test",
+      createdAt: 1000,
+      firstPrompt: "Implement feature X",
+    };
+
+    sqliteStore.saveSession(session, turns, steps);
+
+    const benchmarks = await computeSessionBenchmarks([sessionId]);
+    assert.strictEqual(benchmarks.length, 1);
+    const m = benchmarks[0];
+
+    // Checkpoint should bound peak context and cumulative input
+    assert.ok(m.cumulativeInputTokens > 0);
+    assert.ok(m.peakContextSize > 0);
+    assert.ok(m.currentContextSize > 0);
+    assert.ok(m.currentContextSize <= m.peakContextSize);
+    assert.strictEqual(m.checkpointsCount, 1, "Should count exactly 1 checkpoint in 2-layer session");
+    assert.ok(m.peakContextSize <= m.cumulativeInputTokens);
+    assert.ok(m.estimatedOutputTokens > 0);
+
+    // Chart HTML verification
+    const html = generateInteractiveContextChartHtml(sessionId, session.title, steps);
+    assert.ok(html.includes("Checkpoints: <strong>1</strong>"), "Chart should report 1 checkpoint detected");
+    assert.ok(html.includes("CHECKPOINT 1"), "Chart should render CHECKPOINT marker");
+
+    const b64Match = html.match(/const pointsDataB64 = "([^"]+)"/);
+    assert.ok(b64Match);
+    const pointsData = JSON.parse(Buffer.from(b64Match[1], "base64").toString("utf-8"));
+
+    assert.strictEqual(pointsData.length, 7);
+    assert.strictEqual(pointsData[4].isCkpt, true, "Step 4 must be flagged as checkpoint");
+    assert.strictEqual(pointsData[0].isConv, true, "Step 0 must be flagged as conversational");
+    assert.strictEqual(pointsData[5].isConv, true, "Step 5 must be flagged as conversational");
+    assert.ok(pointsData[4].context < pointsData[3].context, "Context window must drop after checkpoint");
+    assert.ok(pointsData[6].outputContext > 0, "Cumulative output must be non-zero");
+
+    // Prefix-lookup verification for computeSessionBenchmarks
+    const prefixBenchmarks = await computeSessionBenchmarks([sessionId.slice(0, 8)]);
+    assert.strictEqual(prefixBenchmarks.length, 1);
+    assert.strictEqual(prefixBenchmarks[0].sessionId, sessionId);
+    assert.strictEqual(prefixBenchmarks[0].totalSteps, 7);
+    assert.ok(prefixBenchmarks[0].cumulativeInputTokens > 0);
+  });
 });

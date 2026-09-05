@@ -15,6 +15,7 @@ import {
 } from "./adapters/types.js";
 import { formatSearchHistoryMarkdown, projectFields } from "./presentation.js";
 import { getEncoding } from "js-tiktoken";
+import { getAntigravityAdapter } from "./adapters/Antigravity.js";
 
 const encoder = getEncoding("cl100k_base");
 
@@ -614,6 +615,30 @@ export async function queryTranscript(
         if (step.toolResult) {
           outputSections.push(`**Result**:\n\`\`\`\n${tryFormatPayload(step.toolResult, maxResultChars)}\n\`\`\``);
         }
+        if (step.toolName === "send_message" && step.toolArgs) {
+          let recipientId = "";
+          try {
+            const parsedArgs = typeof step.toolArgs === "string" ? JSON.parse(step.toolArgs) : step.toolArgs;
+            recipientId = parsedArgs.Recipient || parsedArgs.recipient || "";
+            recipientId = String(recipientId).replace(/^["']|["']$/g, "").trim();
+          } catch {}
+
+          if (recipientId) {
+            const delivery = getAntigravityAdapter().checkMessageDelivery(recipientId);
+            const deliveryBadge = delivery.isDelivered
+              ? "DELIVERED (consumed by recipient)"
+              : `UNDELIVERED (${delivery.pendingCount} message(s) pending in inbox)`;
+
+            let recipientDetails = "";
+            const recipientSession = store.getSession(recipientId);
+            if (recipientSession?.lifecycle) {
+              const lc = recipientSession.lifecycle;
+              recipientDetails = `\n- **Recipient State**: \`${lc.status.toUpperCase()}\` (turns: ${recipientSession.totalTurns ?? 0}${lc.lastToolExecuted ? `, last tool: ${lc.lastToolExecuted}` : ""}${!lc.hasTurnCompletion ? ", incomplete turn" : ""})`;
+            }
+
+            outputSections.push(`**Delivery Verification**:\n- **Status**: \`${deliveryBadge}\`${recipientDetails}`);
+          }
+        }
         if (step.errorMessage) {
           outputSections.push(`**Error**: ${step.errorMessage}`);
         }
@@ -859,6 +884,8 @@ interface CachingMetrics {
   estimatedOutputTokens: number;
   lastModelCallIndex: number;
   peakContextSize: number;
+  currentContextSize: number;
+  checkpointsCount: number;
 }
 
 function sumTokens(tokens: number[], start: number, end: number): number {
@@ -867,6 +894,25 @@ function sumTokens(tokens: number[], start: number, end: number): number {
     sum += tokens[i];
   }
   return sum;
+}
+
+export function isCheckpointStep(step: StepData): boolean {
+  if (step.type === "CHECKPOINT") return true;
+  if (step.category === "system" && step.content && (step.content.startsWith("{{ CHECKPOINT") || step.content.includes("CHECKPOINT"))) return true;
+  return false;
+}
+
+export function isConversationalStep(step: StepData): boolean {
+  if (step.category === "user") return true;
+  if (step.source === "USER_EXPLICIT" || step.type === "USER_INPUT") return true;
+  return false;
+}
+
+export function isPlannerResponseStep(step: StepData): boolean {
+  if (step.category === "agent") return true;
+  if (step.type === "PLANNER_RESPONSE") return true;
+  if (step.source === "MODEL" && !step.category && (!step.type || step.type === "PLANNER_RESPONSE")) return true;
+  return false;
 }
 
 function isPlannerModelCall(step: StepData, index: number, steps: StepData[]): boolean {
@@ -891,11 +937,13 @@ function simulateCaching(steps: StepData[], stepContextTokens: number[], stepThi
   let peakContextSize = 0;
   let lastModelCallIndex = -1;
   let activeStartIndex = 0;
+  let checkpointsCount = 0;
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    if (step.type === "CHECKPOINT") {
+    if (isCheckpointStep(step)) {
       activeStartIndex = i;
+      checkpointsCount++;
       continue;
     }
 
@@ -927,7 +975,9 @@ function simulateCaching(steps: StepData[], stepContextTokens: number[], stepThi
     lastModelCallIndex = i;
   }
 
-  return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex, peakContextSize };
+  const currentContextSize = sumTokens(stepContextTokens, activeStartIndex, steps.length);
+
+  return { cumulativeInputTokens, cacheHitTokens, cacheMissTokens, estimatedOutputTokens, lastModelCallIndex, peakContextSize, currentContextSize, checkpointsCount };
 }
 
 function computeSingleSessionMetrics(sessionId: string, session: any, steps: StepData[]): SessionBenchmarkMetrics {
@@ -942,6 +992,8 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
   let cacheHitRate = 0;
   let estimatedCostSavings = 0;
   let peakContextSize = 0;
+  let currentContextSize = 0;
+  let checkpointsCount = 0;
   let estimatedOutputTokens = 0;
   let errorStepsCount = 0;
 
@@ -957,6 +1009,8 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
     cacheMissTokens = cache.cacheMissTokens;
     estimatedOutputTokens = cache.estimatedOutputTokens;
     peakContextSize = cache.peakContextSize;
+    currentContextSize = cache.currentContextSize;
+    checkpointsCount = cache.checkpointsCount;
     const lastModelCallIndex = cache.lastModelCallIndex;
 
     if (lastModelCallIndex === -1) {
@@ -964,6 +1018,7 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
       cacheMissTokens = total;
       cumulativeInputTokens = total;
       peakContextSize = total;
+      currentContextSize = total;
     }
 
     if (cumulativeInputTokens > 0) {
@@ -989,6 +1044,7 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
       estimatedOutputTokens = Math.ceil(total * 0.4);
       cumulativeInputTokens = cacheMissTokens;
       peakContextSize = total;
+      currentContextSize = total;
     }
   }
 
@@ -1004,6 +1060,8 @@ function computeSingleSessionMetrics(sessionId: string, session: any, steps: Ste
     cacheHitRate,
     estimatedCostSavings,
     peakContextSize,
+    currentContextSize,
+    checkpointsCount,
     estimatedOutputTokens,
     errorStepsCount,
     hasDetailedSteps
@@ -1022,10 +1080,10 @@ export async function computeSessionBenchmarks(
       continue;
     }
 
-    const turns = store.getTurns(sessionId, { includeUndone: false });
-    const steps = store.getSteps(sessionId, { includeUndone: false });
+    const turns = store.getTurns(session.id, { includeUndone: false });
+    const steps = store.getSteps(session.id, { includeUndone: false });
 
-    const metrics = computeSingleSessionMetrics(sessionId, session, steps);
+    const metrics = computeSingleSessionMetrics(session.id, session, steps);
     if (turns.length > 0) {
       metrics.totalTurns = turns.length;
       let cumOutput = 0;
@@ -1050,6 +1108,7 @@ export async function computeSessionBenchmarks(
         if (cumInput > 0) {
           metrics.cumulativeInputTokens = cumInput;
           metrics.peakContextSize = cumInput;
+          metrics.currentContextSize = cumInput;
           metrics.cacheHitTokens = Math.max(0, cumInput - (turns[0].inputTokens ?? 0));
           metrics.cacheMissTokens = cumInput - metrics.cacheHitTokens;
           metrics.cacheHitRate = (metrics.cacheHitTokens / cumInput) * 100;
@@ -1136,9 +1195,9 @@ export function generateInteractiveContextChartHtml(
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const tokens = stepContextTokens[i] || 0;
-    const isCheckpoint = step.type === "CHECKPOINT";
-    const isConversational = step.source === "USER_EXPLICIT" || step.type === "USER_INPUT";
-    const isPlannerResponse = step.type === "PLANNER_RESPONSE";
+    const isCheckpoint = isCheckpointStep(step);
+    const isConversational = isConversationalStep(step);
+    const isPlannerResponse = isPlannerResponseStep(step);
 
     if (isCheckpoint) {
       activeStartIndex = i;
@@ -1156,13 +1215,18 @@ export function generateInteractiveContextChartHtml(
       peakContextSize = currentContextSize;
     }
 
-    const contentRaw = step.content || step.thinking || "";
+    const contentRaw = step.content || step.thinking || step.toolResult || step.toolArgs || "";
     const previewStr = contentRaw.slice(0, 150).replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+
+    let tag = step.category ? step.category.toUpperCase() : (step.type || "STEP");
+    if (isCheckpoint) tag = "CHECKPOINT";
+    if (isConversational) tag = "USER";
+    if (step.category === "execution" && step.toolName) tag = `TOOL (${step.toolName})`;
 
     points.push({
       stepIndex: step.stepIndex ?? i,
-      type: step.type,
-      source: step.source || "",
+      type: tag,
+      source: step.source || step.category || "N/A",
       tokens,
       cumulativeContextSize: currentContextSize,
       cumulativeOutputTokens: runningOutputTokens,

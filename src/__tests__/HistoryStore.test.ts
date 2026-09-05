@@ -385,6 +385,12 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
         depth: 1,
         createdAt: 2500,
         firstPrompt: "Implement SQLite 2-layer DDL",
+        lifecycle: {
+          status: "interrupted_mid_turn",
+          hasTurnCompletion: false,
+          lastStepIndex: 12,
+          lastToolExecuted: "run_command",
+        },
       };
 
       const grandchild: SessionData = {
@@ -413,6 +419,23 @@ function runTestSuite(name: string, storeFactory: () => HistoryStore) {
       assert.strictEqual(relChild2?.siblings[0].id, "child-1");
       assert.strictEqual(relChild2?.children.length, 1);
       assert.strictEqual(relChild2?.children[0].id, "grandchild-1");
+      // Verify mandate is omitted by default and current.children is not duplicated
+      assert.strictEqual(relChild2?.current.mandate, undefined);
+      assert.strictEqual(relChild2?.children[0].mandate, undefined);
+      assert.strictEqual(relChild2?.current.children, undefined);
+      assert.deepStrictEqual(relChild2?.current.lifecycle, {
+        status: "interrupted_mid_turn",
+        hasTurnCompletion: false,
+        lastStepIndex: 12,
+        lastToolExecuted: "run_command",
+      });
+
+      // Verify includeMandate: true restores mandate
+      const relChild2WithMandate = store.getSessionRelationship("child-2", 3, true, true);
+      assert.strictEqual(relChild2WithMandate?.current.mandate, "Implement SQLite 2-layer DDL");
+      assert.strictEqual(relChild2WithMandate?.children[0].mandate, "Setup FTS5 triggers and ranking");
+      assert.strictEqual(relChild2WithMandate?.parent?.mandate, "Coordinate tickets 1 to 6");
+      assert.strictEqual(relChild2WithMandate?.current.children, undefined);
 
       // Query relationship for grandchild
       const relGrand = store.getSessionRelationship("grandchild-1");

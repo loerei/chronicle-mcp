@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { SessionData, HistoryAdapter, DiscoverSessionsOptions } from "./types.js";
+import { SessionData, HistoryAdapter, DiscoverSessionsOptions, SessionInbox, SessionInboxItem } from "./types.js";
 import { ProgressReporter } from "../progress.js";
 import { SessionParser } from "./SessionParser.js";
 
@@ -162,10 +162,17 @@ export class AntigravityAdapter implements HistoryAdapter {
     // Link subagent parent IDs
     for (const session of sessions) {
       if (Array.isArray(session.subagentIds)) {
-        for (const childId of session.subagentIds) {
-          const child = sessionMap.get(childId);
+        for (const rawChildId of session.subagentIds) {
+          const cleanChildId = (typeof rawChildId === "string" ? rawChildId : "")
+            .replace(/^["']|["']$/g, "")
+            .trim();
+          if (!cleanChildId || cleanChildId === session.id) continue;
+          const child = sessionMap.get(cleanChildId);
           if (child && !child.parentId) {
-            child.parentId = session.id;
+            // Temporal causality guard: parent cannot be created after child
+            if (session.createdAt <= child.createdAt) {
+              child.parentId = session.id;
+            }
           }
         }
       }
@@ -208,4 +215,68 @@ export class AntigravityAdapter implements HistoryAdapter {
 
     return sessions;
   }
+
+  getInbox(sessionId: string): SessionInbox {
+    const cleanId = String(sessionId).replace(/^["']|["']$/g, "").trim();
+    const uDir = path.join(this.brainDir, cleanId, ".system_generated", "messages", "undelivered");
+    if (!fs.existsSync(uDir)) {
+      return { pendingCount: 0, undelivered: [] };
+    }
+    try {
+      const files = fs.readdirSync(uDir);
+      const items: SessionInboxItem[] = [];
+      const mDir = path.join(this.brainDir, cleanId, ".system_generated", "messages");
+      for (const f of files) {
+        const jsonPath = path.join(mDir, `${f}.json`);
+        if (fs.existsSync(jsonPath)) {
+          try {
+            const raw = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+            const msgText = typeof raw.content === "string" ? raw.content : typeof raw.message === "string" ? raw.message : undefined;
+            items.push({
+              id: f,
+              sender: raw.sender,
+              timestamp: raw.timestamp,
+              content: msgText ? msgText.slice(0, 100) : undefined,
+            });
+          } catch {
+            items.push({ id: f });
+          }
+        } else {
+          items.push({ id: f });
+        }
+      }
+      return { pendingCount: files.length, undelivered: items };
+    } catch {
+      return { pendingCount: 0, undelivered: [] };
+    }
+  }
+
+  checkMessageDelivery(recipientId: string, messageId?: string, senderId?: string): { isDelivered: boolean; pendingCount: number } {
+    const inbox = this.getInbox(recipientId);
+    let isDelivered = true;
+    if (messageId) {
+      isDelivered = !inbox.undelivered.some(item => item.id === messageId);
+    } else if (senderId) {
+      isDelivered = !inbox.undelivered.some(item => item.sender === senderId);
+    } else {
+      isDelivered = inbox.pendingCount === 0;
+    }
+    return {
+      isDelivered,
+      pendingCount: inbox.pendingCount,
+    };
+  }
 }
+
+let defaultAntigravityAdapter: AntigravityAdapter | null = null;
+export function getAntigravityAdapter(): AntigravityAdapter {
+  if (!defaultAntigravityAdapter) {
+    defaultAntigravityAdapter = new AntigravityAdapter();
+  }
+  return defaultAntigravityAdapter;
+}
+
+export function setAntigravityAdapter(adapter: AntigravityAdapter | null): void {
+  defaultAntigravityAdapter = adapter;
+}
+

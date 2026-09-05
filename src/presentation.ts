@@ -1,4 +1,4 @@
-﻿import type { SearchHistoryResult } from "./search.js";
+import type { SearchHistoryResult } from "./search.js";
 import type { SessionData, ToolUsageReport } from "./adapters/types.js";
 
 const FORBIDDEN_PROPERTIES = new Set(["__proto__", "constructor", "prototype"]);
@@ -166,7 +166,14 @@ export function formatListSessionsMarkdown(
       errorBadge = errorCount === 1 ? ", 1 error" : `, ${errorCount} errors`;
     }
 
-    markdown += `${i + 1}. [${shortId}] (${scopeLabel}) - "${title}" (${totalTurns} turns, ${totalSteps} steps${errorBadge})\n`;
+    let statusBadge = "";
+    if (sess.lifecycle?.status === "interrupted_mid_turn") {
+      statusBadge = ", interrupted";
+    } else if (sess.lifecycle?.status === "orphaned") {
+      statusBadge = ", orphaned";
+    }
+
+    markdown += `${i + 1}. [${shortId}] (${scopeLabel}) - "${title}" (${totalTurns} turns, ${totalSteps} steps${errorBadge}${statusBadge})\n`;
   }
 
   return markdown;

@@ -21,6 +21,7 @@ export interface SessionData {
   metadata?: Record<string, any>;
   logMtime?: number;
   logSize?: number;
+  lifecycle?: SessionLifecycle;
   turns?: TurnData[];
 
   /** Transitional property for legacy module compatibility during S1 */
@@ -167,6 +168,25 @@ export interface GetSessionArtifactsOptions {
   output?: string;
 }
 
+export interface SessionLifecycle {
+  status: "completed" | "interrupted_mid_turn" | "in_flight" | "orphaned";
+  hasTurnCompletion: boolean;
+  lastStepIndex?: number;
+  lastToolExecuted?: string;
+}
+
+export interface SessionInboxItem {
+  id: string;
+  sender?: string;
+  timestamp?: string;
+  content?: string;
+}
+
+export interface SessionInbox {
+  pendingCount: number;
+  undelivered: SessionInboxItem[];
+}
+
 export interface SessionRelationshipNode {
   id: string;
   adapter: string;
@@ -182,11 +202,8 @@ export interface SessionRelationshipNode {
   mandate?: string;
   artifacts?: string[];
   children?: SessionRelationshipNode[];
-
-  /** @deprecated Transitional property */
-  initialPrompt?: string;
-  /** @deprecated Transitional property */
-  finalOutput?: string;
+  lifecycle?: SessionLifecycle;
+  inbox?: SessionInbox;
 }
 
 export interface SessionRelationshipResult {
@@ -223,6 +240,8 @@ export interface SessionBenchmarkMetrics {
   cacheHitRate: number;
   estimatedCostSavings: number;
   peakContextSize: number;
+  currentContextSize: number;
+  checkpointsCount: number;
   estimatedOutputTokens: number;
   errorStepsCount: number;
   hasDetailedSteps: boolean;

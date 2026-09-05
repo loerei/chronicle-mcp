@@ -113,8 +113,9 @@ export async function syncSingleSession(s: any, store: any): Promise<boolean> {
       const stepsCountChanged = steps.length !== existingSteps.length;
       const promptChanged = existingSession.firstPrompt !== s.firstPrompt;
       const titleChanged = existingSession.title !== s.title;
+      const lifecycleChanged = existingSession.lifecycle?.status !== s.lifecycle?.status;
 
-      if (!turnsCountChanged && !stepsCountChanged && !promptChanged && !titleChanged) {
+      if (!turnsCountChanged && !stepsCountChanged && !promptChanged && !titleChanged && !lifecycleChanged) {
         return false;
       }
     }
@@ -423,6 +424,12 @@ export function getMcpToolDefinitions(): any[] {
             default: 3,
             minimum: 1,
             maximum: 10,
+          },
+          includeMandate: {
+            type: "boolean",
+            description:
+              "Include raw initial prompt mandate for nodes (default: false to save tokens).",
+            default: false,
           },
         },
         required: ["sessionId"],
@@ -1077,9 +1084,15 @@ export async function handleGetSessionRelationship(args: any): Promise<any> {
 
     const maxDepth = typeof args?.maxDepth === "number" ? args.maxDepth : 3;
     const includeAncestors = args?.includeAncestors !== false;
+    const includeMandate = args?.includeMandate === true;
 
     const store = getStore();
-    const rel = store.getSessionRelationship(sessionId, maxDepth, includeAncestors);
+    const rel = store.getSessionRelationship(
+      sessionId,
+      maxDepth,
+      includeAncestors,
+      includeMandate
+    );
 
     if (!rel) {
       return {
@@ -1617,8 +1630,8 @@ export async function handleGetSessionBenchmarks(args: any): Promise<any> {
 
     if (groups && groups.length > 0) {
       md += `## Group Comparison\n\n`;
-      md += `| Group | Avg Steps | Avg Tool Calls | Avg Duration (s) | Avg Cum. Input | Avg Cache Hit % | Avg Cost Saved % | Avg Peak Context | Total Errors |\n`;
-      md += `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
+      md += `| Group | Avg Steps | Avg Tool Calls | Avg Duration (s) | Avg Cum. Input | Avg Cache Hit % | Avg Cost Saved % | Avg Peak Context | Avg Curr. Context | Total Ckpts | Total Errors |\n`;
+      md += `| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
 
       for (const g of groups) {
         let sumSteps = 0;
@@ -1629,6 +1642,8 @@ export async function handleGetSessionBenchmarks(args: any): Promise<any> {
         let sumCacheHitTokens = 0;
         let sumCacheMissTokens = 0;
         let sumPeakContext = 0;
+        let sumCurrentContext = 0;
+        let sumCheckpoints = 0;
         let sumErrors = 0;
         let count = 0;
 
@@ -1645,6 +1660,8 @@ export async function handleGetSessionBenchmarks(args: any): Promise<any> {
             sumCacheHitTokens += m.cacheHitTokens;
             sumCacheMissTokens += m.cacheMissTokens;
             sumPeakContext += m.peakContextSize;
+            sumCurrentContext += m.currentContextSize;
+            sumCheckpoints += (m.checkpointsCount ?? 0);
             sumErrors += m.errorStepsCount;
             count++;
           }
@@ -1658,17 +1675,18 @@ export async function handleGetSessionBenchmarks(args: any): Promise<any> {
           const avgCacheHitRate = sumCumulativeInput > 0 ? ((sumCacheHitTokens / sumCumulativeInput) * 100).toFixed(1) : "0.0";
           const avgCostSavings = sumCumulativeInput > 0 ? ((1 - (sumCacheMissTokens + 0.1 * sumCacheHitTokens) / sumCumulativeInput) * 100).toFixed(1) : "0.0";
           const avgPeakContext = Math.round(sumPeakContext / count).toLocaleString();
-          md += `| **${g.name}** (${count} sessions) | ${avgSteps} | ${avgToolCalls} | ${avgDuration}s | ${avgCumInput} | ${avgCacheHitRate}% | ${avgCostSavings}% | ${avgPeakContext} | ${sumErrors} |\n`;
+          const avgCurrContext = Math.round(sumCurrentContext / count).toLocaleString();
+          md += `| **${g.name}** (${count} sessions) | ${avgSteps} | ${avgToolCalls} | ${avgDuration}s | ${avgCumInput} | ${avgCacheHitRate}% | ${avgCostSavings}% | ${avgPeakContext} | ${avgCurrContext} | ${sumCheckpoints} | ${sumErrors} |\n`;
         } else {
-          md += `| **${g.name}** | - | - | - | - | - | - | - | - |\n`;
+          md += `| **${g.name}** | - | - | - | - | - | - | - | - | - | - |\n`;
         }
       }
       md += `\n`;
     }
 
     md += `## Individual Session Breakdown\n\n`;
-    md += `| Session / ID | Group | Steps | Tool Calls | Duration | Cum. Input | Cache Hit % | Cost Saved % | Peak Context | Output Tokens | Errors |\n`;
-    md += `| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
+    md += `| Session / ID | Group | Steps | Tool Calls | Duration | Cum. Input | Cache Hit % | Cost Saved % | Peak Context | Curr. Context | Output Tokens | Checkpoint Count | Errors |\n`;
+    md += `| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n`;
 
     for (const m of metrics) {
       let groupName = "N/A";
@@ -1682,7 +1700,7 @@ export async function handleGetSessionBenchmarks(args: any): Promise<any> {
       const homedir = os.homedir();
       const sessionLink = `[${titleText}](file:///${homedir.replaceAll("\\", "/")}/.gemini/antigravity/brain/${m.sessionId})`;
 
-      md += `| ${sessionLink}<br>\`${m.sessionId.slice(0, 8)}\` | ${groupName} | ${m.totalSteps} | ${m.toolCallsCount} | ${durationText} | ${m.cumulativeInputTokens.toLocaleString()} | ${m.cacheHitRate.toFixed(1)}% | ${m.estimatedCostSavings.toFixed(1)}% | ${m.peakContextSize.toLocaleString()} | ${m.estimatedOutputTokens.toLocaleString()} | ${m.errorStepsCount} |\n`;
+      md += `| ${sessionLink}<br>\`${m.sessionId.slice(0, 8)}\` | ${groupName} | ${m.totalSteps} | ${m.toolCallsCount} | ${durationText} | ${m.cumulativeInputTokens.toLocaleString()} | ${m.cacheHitRate.toFixed(1)}% | ${m.estimatedCostSavings.toFixed(1)}% | ${m.peakContextSize.toLocaleString()} | ${m.currentContextSize.toLocaleString()} | ${m.estimatedOutputTokens.toLocaleString()} | ${m.checkpointsCount ?? 0} | ${m.errorStepsCount} |\n`;
     }
     md += `\n`;
 
@@ -1690,11 +1708,11 @@ export async function handleGetSessionBenchmarks(args: any): Promise<any> {
     if (linechartPath && sessionIds && sessionIds.length > 0) {
       const store = getStore();
       for (const sid of sessionIds) {
-        const qResult = store.query({ sessionId: sid, includeSteps: true });
-        const sess = qResult.sessions[0];
-        if (sess && qResult.steps) {
-          const chartHtml = generateInteractiveContextChartHtml(sid, sess.title || sid, qResult.steps);
-          const chartResult = await handleOutputWrite(chartHtml, linechartPath, `context_chart_${sid.slice(0, 8)}.html`);
+        const sess = store.getSession(sid);
+        if (sess) {
+          const steps = store.getSteps(sess.id, { includeUndone: false });
+          const chartHtml = generateInteractiveContextChartHtml(sess.id, sess.title || sess.id, steps);
+          const chartResult = await handleOutputWrite(chartHtml, linechartPath, `context_chart_${sess.id.slice(0, 8)}.html`);
           const writtenText = chartResult.content?.[0]?.text || "";
           md += `> **Interactive Context Window Chart**: ${writtenText}\n\n`;
         }
